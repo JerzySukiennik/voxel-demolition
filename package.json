@@ -1,0 +1,16 @@
+{
+  "name": "voxel-demolition",
+  "private": true,
+  "version": "0.6.0",
+  "description": "Voxel Demolition - Teardown-inspired voxel destruction sandbox with LAN co-op",
+  "type": "module",
+  "scripts": {
+    "start": "node server/server.js",
+    "serve": "npx serve -l 8080 ."
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "0.12.0",
+    "three": "0.160.0",
+    "ws": "^8"
+  }
+}

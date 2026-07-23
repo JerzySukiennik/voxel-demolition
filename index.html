@@ -1,0 +1,191 @@
+<!-- Voxel Demolition - entry: importmap, canvas, lobby (nick/avatar/map), in-game ESC menu, click-to-enter gesture -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voxel Demolition</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #8fb7e0; }
+  #app { position: fixed; inset: 0; display: block; }
+  #tool-label {
+    position: fixed; left: 24px; bottom: 24px; z-index: 5;
+    display: flex; align-items: center; gap: 8px;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    opacity: 0; transition: opacity 0.35s ease; pointer-events: none;
+  }
+  #tool-label-num {
+    min-width: 18px; height: 18px; line-height: 18px; text-align: center;
+    background: rgba(255,255,255,0.16); border-radius: 3px;
+    color: #fff; font-size: 11px; font-weight: 600;
+  }
+  #tool-label-name { color: #fff; font-size: 13px; letter-spacing: 0.3px;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+  #crosshair {
+    position: fixed; left: 50%; top: 50%; width: 4px; height: 4px;
+    margin: -2px 0 0 -2px; z-index: 5; border-radius: 50%;
+    background: #fff; box-shadow: 0 0 2px rgba(0,0,0,0.8); pointer-events: none;
+  }
+  #map-label {
+    position: fixed; right: 16px; top: 14px; z-index: 5;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; font-size: 12px;
+    color: #fff; opacity: 0.7; letter-spacing: 0.4px; pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+  }
+  #overlay-map { margin-top: 12px; font-size: 12px; opacity: 0.55; }
+  #vehicle-menu {
+    position: fixed; inset: 0; z-index: 8; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(12, 16, 22, 0.72); color: #f4f6f8;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; user-select: none;
+  }
+  #vehicle-menu .vm-panel {
+    background: rgba(20, 26, 34, 0.9); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px; padding: 22px 24px; box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+  }
+  #vehicle-menu .vm-header { font-size: 15px; font-weight: 600; letter-spacing: 0.4px; margin: 0 0 16px; }
+  #vehicle-menu .vm-header span { opacity: 0.85; font-weight: 500; }
+  #vehicle-menu .vm-grid { display: grid; grid-template-columns: repeat(4, 96px); gap: 12px; }
+  #vehicle-menu .vm-tile {
+    display: flex; flex-direction: column; align-items: center; gap: 6px; cursor: pointer;
+    padding: 6px; border-radius: 8px; border: 2px solid transparent;
+  }
+  #vehicle-menu .vm-tile.vm-selected { border-color: #fff; }
+  #vehicle-menu .vm-swatch {
+    width: 72px; height: 72px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-size: 30px; font-weight: 700; color: rgba(0,0,0,0.55); text-shadow: 0 1px 1px rgba(255,255,255,0.25);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
+  }
+  #vehicle-menu .vm-label { font-size: 11px; text-align: center; opacity: 0.85; line-height: 1.15; max-width: 84px; }
+  #vehicle-menu .vm-hint { margin-top: 16px; font-size: 12px; opacity: 0.55; text-align: center; }
+
+  /* --- Lobby (shares the vm-panel visual language) --- */
+  #lobby {
+    position: fixed; inset: 0; z-index: 10; display: none;
+    align-items: center; justify-content: center; overflow: auto;
+    background: rgba(12, 16, 22, 0.72); color: #f4f6f8;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; user-select: none;
+  }
+  #lobby .lb-panel {
+    background: rgba(20, 26, 34, 0.9); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px; padding: 22px 24px; box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    width: min(900px, calc(100vw - 32px)); box-sizing: border-box; margin: 16px;
+  }
+  #lobby .lb-title { font-size: 20px; font-weight: 600; letter-spacing: 0.6px; margin: 0 0 16px; }
+  #lobby .lb-body { display: flex; gap: 24px; align-items: flex-start; }
+  #lobby .lb-left { flex: 0 0 auto; }
+  #lobby #lb-preview {
+    width: 260px; height: 340px; border-radius: 10px; display: block;
+    background: rgba(10,14,20,0.6); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+  }
+  #lobby .lb-right { flex: 1 1 auto; min-width: 0; }
+  #lobby .lb-field { display: flex; flex-direction: column; gap: 6px; margin: 0 0 16px; }
+  #lobby .lb-field > span { font-size: 12px; opacity: 0.6; letter-spacing: 0.3px; }
+  #lobby #lb-nick {
+    width: 100%; box-sizing: border-box; font: inherit; font-size: 15px;
+    padding: 9px 12px; border-radius: 8px; color: #f4f6f8;
+    background: rgba(10,14,20,0.6); border: 1px solid rgba(255,255,255,0.14); outline: none;
+  }
+  #lobby #lb-nick:focus { border-color: rgba(255,255,255,0.4); }
+  #lobby .lb-row { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
+  #lobby .lb-row-label { flex: 0 0 64px; font-size: 12px; opacity: 0.6; }
+  #lobby .lb-swatch {
+    width: 24px; height: 24px; border-radius: 6px; cursor: pointer; padding: 0;
+    border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
+  }
+  #lobby .lb-swatch.lb-sel { border-color: #fff; }
+  #lobby .lb-shape {
+    font: inherit; font-size: 12px; color: #f4f6f8; cursor: pointer;
+    padding: 6px 12px; border-radius: 7px; background: rgba(255,255,255,0.06);
+    border: 2px solid transparent;
+  }
+  #lobby .lb-shape.lb-sel { border-color: #fff; }
+  #lobby .lb-maps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0 18px; }
+  #lobby .lb-card {
+    cursor: pointer; padding: 8px; border-radius: 9px; border: 2px solid transparent;
+    background: rgba(255,255,255,0.04);
+  }
+  #lobby .lb-card.lb-card-sel { border-color: #fff; }
+  #lobby .lb-card-swatch { width: 100%; height: 52px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.2); }
+  #lobby .lb-card-name { font-size: 12px; font-weight: 600; margin: 8px 0 2px; line-height: 1.2; }
+  #lobby .lb-card-sub { font-size: 11px; opacity: 0.55; line-height: 1.25; }
+  #lobby .lb-play {
+    display: block; width: 100%; box-sizing: border-box; font: inherit; font-size: 16px; font-weight: 600;
+    letter-spacing: 0.5px; color: #10161e; cursor: pointer; padding: 12px; border-radius: 9px;
+    border: none; background: #f4f6f8;
+  }
+  #lobby .lb-play:disabled { opacity: 0.6; cursor: default; }
+
+  /* --- Post-load pointer-lock gesture --- */
+  #enter-overlay {
+    position: fixed; inset: 0; z-index: 9; display: none;
+    align-items: center; justify-content: center; cursor: pointer;
+    background: rgba(12, 16, 22, 0.55); color: #f4f6f8;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; user-select: none;
+  }
+  #enter-overlay .eo-msg { font-size: 18px; letter-spacing: 0.4px; text-shadow: 0 1px 3px rgba(0,0,0,0.6); }
+
+  /* --- In-game ESC menu --- */
+  #game-menu {
+    position: fixed; inset: 0; z-index: 8; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(12, 16, 22, 0.72); color: #f4f6f8;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif; user-select: none;
+  }
+  #game-menu .gm-panel {
+    background: rgba(20, 26, 34, 0.9); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 12px; padding: 22px 24px; box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    width: 240px; text-align: center;
+  }
+  #game-menu .gm-title { font-size: 15px; font-weight: 600; letter-spacing: 0.4px; margin: 0 0 16px; }
+  #game-menu .gm-btn {
+    display: block; width: 100%; box-sizing: border-box; font: inherit; font-size: 14px;
+    color: #f4f6f8; cursor: pointer; padding: 10px; margin: 0 0 10px; border-radius: 8px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+  }
+  #game-menu .gm-btn:hover { background: rgba(255,255,255,0.12); }
+  #game-menu .gm-hint { font-size: 12px; color: #ffcf8f; opacity: 0; min-height: 15px; margin-top: 4px; }
+  #game-menu .gm-flash { font-size: 12px; opacity: 0; transition: opacity 0.15s ease; min-height: 15px; }
+</style>
+<canvas id="app"></canvas>
+<div id="crosshair"></div>
+<div id="map-label"></div>
+<div id="tool-label"><span id="tool-label-num"></span><span id="tool-label-name"></span></div>
+<div id="vehicle-menu">
+  <div class="vm-panel">
+    <div class="vm-header">Select vehicle &mdash; <span id="vm-selected">Hatchback</span></div>
+    <div class="vm-grid" id="vm-grid"></div>
+    <div class="vm-hint">WASD / Arrows move &middot; Enter / Space spawn &middot; Tab close</div>
+  </div>
+</div>
+<div id="lobby">
+  <div class="lb-panel">
+    <div class="lb-title">VOXEL DEMOLITION</div>
+    <div class="lb-body">
+      <div class="lb-left"><canvas id="lb-preview"></canvas></div>
+      <div class="lb-right">
+        <label class="lb-field"><span>Name</span>
+          <input id="lb-nick" maxlength="16" placeholder="Player" autocomplete="off" spellcheck="false"></label>
+        <div id="lb-avatar"></div>
+      </div>
+    </div>
+    <div id="lb-maps"></div>
+    <button id="lb-play" class="lb-play">PLAY</button>
+  </div>
+</div>
+<div id="enter-overlay"><div class="eo-msg">Click to enter</div></div>
+<div id="game-menu">
+  <div class="gm-panel">
+    <div class="gm-title">Paused</div>
+    <button id="gm-resume" class="gm-btn">Resume</button>
+    <button id="gm-reset" class="gm-btn">Reset map</button>
+    <button id="gm-lobby" class="gm-btn">Back to lobby</button>
+    <div id="gm-hint" class="gm-hint"></div>
+    <div id="gm-flash" class="gm-flash"></div>
+  </div>
+</div>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@dimforge/rapier3d-compat": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.12.0/rapier.es.js"
+} }
+</script>
+<script type="module" src="./src/main.js"></script>
