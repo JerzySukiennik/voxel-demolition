@@ -2,7 +2,17 @@
 import * as THREE from "three";
 import { CONFIG } from "./config.js";
 import { decodeModel, meshModelPart } from "./voxel.js";
+import { mulberry32 } from "./sim/rng.js";
 import toolModels from "../assets/models/tools.js";
+
+// Build a centered voxel geometry for an in-world projectile from a tool model's "main" part.
+function centeredGeo(model) {
+  const dec = decodeModel(model);
+  const geo = meshModelPart(dec, "main");
+  const s = model.parts[0].size, vs = model.voxelSize;
+  geo.translate(-(s[0] * vs) / 2, -(s[1] * vs) / 2, -(s[2] * vs) / 2);
+  return geo;
+}
 
 const W = CONFIG.weapons;
 const VM = W.viewmodel;
@@ -114,6 +124,37 @@ export class Weapons {
     }
     this._trailIdx = 0;
 
+    // --- Phase 7 batch A: throwables / launchers shared resources ----------------------------
+    // Pipe bomb = real dynamic Rapier body (bounces/rolls), grey voxel geo.
+    this._pipeGeo = centeredGeo(toolModels.pipebomb);
+    this.pipeBombs = [];
+    // Demolition wire = C4-style placed charges (own list) + pooled sagging wire line segments.
+    this.wireCharges = [];
+    this._wireGeo = new THREE.BoxGeometry(1, 1, 1);
+    this._wireMat = new THREE.MeshBasicMaterial({ color: 0x1c1d1f });
+    this._wireSegs = [];
+    for (let i = 0; i < W.demoWire.maxCharges * 2 + 4; i++) {
+      const m = new THREE.Mesh(this._wireGeo, this._wireMat);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._wireSegs.push(m);
+    }
+    // Sticky bombs = ray-stepped projectiles that stick (reuse the C4 brick geo).
+    this.stickies = [];
+    // Cluster projectiles: parent shell + pooled bomblet meshes (shared clusterBomb voxel ball).
+    this._clusterGeo = centeredGeo(toolModels.clusterBomb);
+    this.clusters = [];
+    this._bombletPool = [];
+    for (let i = 0; i < W.cluster.maxLive * W.cluster.bombletCount; i++) {
+      const m = new THREE.Mesh(this._clusterGeo, this.materials);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      m.scale.setScalar(0.55);
+      scene.add(m);
+      this._bombletPool.push({ mesh: m, used: false });
+    }
+    this._sawTimer = 0;
+    this._sawShake = 0;
+
     // Label DOM.
     this._label = document.getElementById("tool-label");
     this._labelNum = document.getElementById("tool-label-num");
@@ -122,12 +163,21 @@ export class Weapons {
   }
 
   _buildItems() {
+    // Cycle order per category matches the Phase 7 layout table. Melee/Explosives/Launchers now hold
+    // multiple items (first real multi-item cycling); Firearms stays single. Keys 5-9 arrive in later batches.
     const defs = [
       { num: 1, catLabel: "Melee", id: "sledgehammer", name: "Sledgehammer", kind: "melee", model: toolModels.sledgehammer, base: VM.sledgeOffset },
+      { num: 1, catLabel: "Melee", id: "crowbar", name: "Crowbar", kind: "crowbar", model: toolModels.crowbar, base: VM.crowbarOffset },
+      { num: 1, catLabel: "Melee", id: "chainsaw", name: "Chainsaw", kind: "chainsaw", model: toolModels.chainsaw, base: VM.chainsawOffset },
       { num: 2, catLabel: "Explosives", id: "c4", name: "C4 Charge", kind: "c4", model: toolModels.c4, base: VM.baseOffset },
+      { num: 2, catLabel: "Explosives", id: "pipeBomb", name: "Pipe Bomb", kind: "pipebomb", model: toolModels.pipebomb, base: VM.baseOffset },
+      { num: 2, catLabel: "Explosives", id: "demoWire", name: "Demolition Wire", kind: "demowire", model: toolModels.demowire, base: VM.baseOffset },
       { num: 3, catLabel: "Firearms", id: "shotgun", name: "Shotgun", kind: "shotgun", model: toolModels.shotgun, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "rocketLauncher", name: "Rocket Launcher", kind: "rocket", model: toolModels.rocketLauncher, base: VM.baseOffset },
+      { num: 4, catLabel: "Launchers", id: "stickyLauncher", name: "Sticky Bomb Launcher", kind: "sticky", model: toolModels.stickylauncher, base: VM.baseOffset },
+      { num: 4, catLabel: "Launchers", id: "clusterLauncher", name: "Cluster Bomb Launcher", kind: "cluster", model: toolModels.clusterlauncher, base: VM.baseOffset },
     ];
+    const meleeKinds = new Set(["melee", "crowbar", "chainsaw"]);
     this.categories = [];
     this._allItems = [];
     for (const d of defs) {
@@ -142,9 +192,11 @@ export class Weapons {
       mesh.visible = false;
       this.viewmodel.add(mesh);
       const muzzleLen = d.model.parts[0].size[2] * d.model.voxelSize - piv[2];
-      const armsOffset = d.id === "sledgehammer" ? VM.armsOffsetSledge : VM.armsOffset;
+      const armsOffset = meleeKinds.has(d.kind) ? VM.armsOffsetSledge : VM.armsOffset;
       const item = { id: d.id, name: d.name, kind: d.kind, num: d.num, mesh, baseOffset: d.base, muzzleLen, armsOffset, state: { lastUse: -1e9 } };
-      this.categories.push({ num: d.num, label: d.catLabel, items: [item] });
+      let cat = this.categories.find((c) => c.num === d.num);
+      if (!cat) { cat = { num: d.num, label: d.catLabel, items: [] }; this.categories.push(cat); }
+      cat.items.push(item);
       this._allItems.push(item);
     }
   }
@@ -215,11 +267,16 @@ export class Weapons {
     this._tickSwing(dt);
     this._tickRockets(dt);
     this._tickRemoteRockets(dt);
+    this._tickPipeBombs(dt);
+    this._tickStickies(dt);
+    this._tickClusters(dt);
     this._tickTrail(dt);
     this._tickFlash(dt);
     this._tickTracers(dt);
     this._decayAnim(dt);
     this._blinkCharges();
+    // Shared fuse hiss loop is on whenever a fused throwable is live (survives tool-switch / driving).
+    this.audio.fuse(this.pipeBombs.length + this.stickies.length > 0);
 
     const driving = mode !== "walk";
     if (driving) {
@@ -227,6 +284,7 @@ export class Weapons {
       this.viewmodel.visible = false;
       this._armsMesh.visible = false;
       this.player.setArmsHidden(false);
+      this.audio.chainsaw(false, false);
       // Drain edges so nothing fires on exit; RMB is ignored while driving.
       this.input.consumeDigits();
       this.input.consumeLMB();
@@ -242,6 +300,11 @@ export class Weapons {
     if (this.activeCat >= 0) this._handleFire(lmb, rmb);
 
     const equipped = this.activeCat >= 0;
+    // Chainsaw continuous hold-fire + looping audio (also keeps the loops silenced for every other tool).
+    this._tickChainsaw(dt, equipped);
+    // Demolition-wire line visuals follow their (possibly vehicle-parented) charges every frame.
+    if (this.wireCharges.length) this._rebuildWireLines();
+
     this.viewmodel.visible = equipped;
     this._armsMesh.visible = equipped;
     this.player.setArmsHidden(equipped);
@@ -289,17 +352,26 @@ export class Weapons {
     const item = this._activeItem();
     switch (item.kind) {
       case "melee": if (lmb) this._startSwing(item); break;
+      case "crowbar": if (lmb) this._startSwing(item); break;
+      case "chainsaw": break; // continuous hold-fire handled in _tickChainsaw
       case "c4": if (lmb) this._placeC4(item); if (rmb) this._detonate(); break;
+      case "pipebomb": if (lmb) this._throwPipeBomb(item); break;
+      case "demowire": if (lmb) this._placeWire(item); if (rmb) this._detonateWire(); break;
       case "shotgun": if (lmb) this._fireShotgun(item); break;
       case "rocket": if (lmb) this._fireRocket(item); break;
+      case "sticky": if (lmb) this._fireSticky(item); break;
+      case "cluster": if (lmb) this._fireCluster(item); break;
     }
   }
 
-  // --- Melee ---
+  // --- Melee (sledgehammer + crowbar; both use the swing state machine, crowbar with its own tuning) ---
   _startSwing(item) {
     if (this._swingT >= 0) return;
-    if (this._time - item.state.lastUse < W.melee.cooldown) return;
+    const cfg = item.kind === "crowbar" ? W.crowbar : W.melee;
+    if (this._time - item.state.lastUse < cfg.cooldown) return;
     item.state.lastUse = this._time;
+    this._swingCfg = cfg;
+    this._swingIsCrowbar = item.kind === "crowbar";
     this._swingT = 0;
     this._swingHitDone = false;
     this.audio.swing();
@@ -308,28 +380,64 @@ export class Weapons {
 
   _tickSwing(dt) {
     if (this._swingT < 0) return;
+    const cfg = this._swingCfg || W.melee;
     this._swingT += dt;
-    if (!this._swingHitDone && this._swingT >= W.melee.hitDelay) {
+    if (!this._swingHitDone && this._swingT >= cfg.hitDelay) {
       this._swingHitDone = true;
       this._doMeleeHit();
     }
-    if (this._swingT >= W.melee.swingDuration) this._swingT = -1;
+    if (this._swingT >= cfg.swingDuration) this._swingT = -1;
   }
 
   _doMeleeHit() {
+    const cfg = this._swingCfg || W.melee;
+    const isCrowbar = this._swingIsCrowbar;
     const origin = this._camPos();
     const dir = this._aimDir();
     const ray = new this.RAPIER.Ray(origin, dir);
-    const hit = this.world.castRay(ray, W.melee.range, true, undefined, undefined, undefined, this.player.body);
+    const hit = this.world.castRay(ray, cfg.range, true, undefined, undefined, undefined, this.player.body);
     if (!hit) return;
     if (this.destruction.hasChunk(hit.collider.handle)) {
-      // In MP the replica destruction forwards this as a `dmg point` intent (no local detach).
-      const broke = this.destruction.applyPointDamage(hit.collider.handle, origin, W.melee.force);
-      this.audio.clang(broke);
+      // In MP the replica destruction forwards this as a `dmg point` intent (with the material mult) — no local detach.
+      const opts = cfg.mult ? { mult: cfg.mult } : undefined;
+      const broke = this.destruction.applyPointDamage(hit.collider.handle, origin, cfg.force, opts);
+      if (isCrowbar) this.audio.crowbarHit(broke); else this.audio.clang(broke);
       if (this.net) this.net.sendFx("clang", origin.clone().addScaledVector(dir, hit.toi));
     } else {
-      this.audio.clang(false);
+      if (isCrowbar) this.audio.crowbarHit(false); else this.audio.clang(false);
     }
+  }
+
+  // --- Chainsaw: hold LMB for continuous point-damage ticks; material mult does the flavor work. ---
+  _tickChainsaw(dt, equipped) {
+    const item = equipped ? this._activeItem() : null;
+    if (!item || item.kind !== "chainsaw") { this.audio.chainsaw(false, false); this._sawShake = 0; this._sawTimer = 0; return; }
+    const cs = W.chainsaw;
+    let cutting = false;
+    if (this.input.lmbDown) {
+      this._sawTimer += dt;
+      const origin = this._camPos();
+      const dir = this._aimDir();
+      const ray = new this.RAPIER.Ray(origin, dir);
+      const hit = this.world.castRay(ray, cs.range, true, undefined, undefined, undefined, this.player.body);
+      const onChunk = hit && this.destruction.hasChunk(hit.collider.handle);
+      if (onChunk) {
+        cutting = true;
+        if (this._sawTimer >= cs.tickInterval) {
+          this._sawTimer = 0;
+          const broke = this.destruction.applyPointDamage(hit.collider.handle, origin, cs.force, { mult: cs.mult });
+          // Solo: nothing broke on a hard material (concrete/metal) => metallic screech.
+          if (!broke && !this.net) this.audio.chainsawScreech();
+        }
+      } else {
+        // Revving in the air: keep the cut layer up but don't accumulate a huge pending tick.
+        if (this._sawTimer > cs.tickInterval) this._sawTimer = cs.tickInterval;
+      }
+    } else {
+      this._sawTimer = 0;
+    }
+    this.audio.chainsaw(true, cutting);
+    this._sawShake = cutting ? 1 : 0.35; // idle rumble even when not biting
   }
 
   // --- C4 ---
@@ -369,7 +477,7 @@ export class Weapons {
 
   // Build one placed-charge visual (brick mesh + blink indicator) parented to a vehicle chassis or the
   // world. Shared by solo placement and the MP c4_add relay. `tag` = { cid4, owner } for net charges.
-  _spawnChargeVisual(worldPos, worldQuat, onVehicleV, tag) {
+  _spawnChargeVisual(worldPos, worldQuat, onVehicleV, tag, list = this.charges) {
     const mesh = new THREE.Mesh(this._c4Geo, this.materials);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -391,7 +499,7 @@ export class Weapons {
       this.scene.add(mesh);
     }
     const rec = { mesh, isOnVehicle: onVehicle, vehicle: onVehicleV, indicator, cid4: tag ? tag.cid4 : undefined, owner: tag ? tag.owner : undefined };
-    this.charges.push(rec);
+    list.push(rec);
     return rec;
   }
 
@@ -456,6 +564,17 @@ export class Weapons {
     this.liveRockets.length = 0;
     for (const rk of this.remoteRockets) this.scene.remove(rk.mesh);
     this.remoteRockets.length = 0;
+    // Phase 7 batch A transient entities.
+    for (const pb of this.pipeBombs) this._removePipeBomb(pb);
+    this.pipeBombs.length = 0;
+    for (const ch of this.wireCharges) if (ch.mesh.parent) ch.mesh.parent.remove(ch.mesh);
+    this.wireCharges.length = 0;
+    this._rebuildWireLines();
+    for (const s of this.stickies) if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+    this.stickies.length = 0;
+    for (const c of this.clusters) this._clearCluster(c);
+    this.clusters.length = 0;
+    this.audio.fuse(false);
   }
 
   // --- MP rocket relay hooks (called by replication.js) --------------------------------------
@@ -508,9 +627,13 @@ export class Weapons {
   }
 
   _blinkCharges() {
-    if (this.charges.length === 0) return;
     const on = Math.floor(this._time * 2) % 2 === 0;
     for (const ch of this.charges) ch.indicator.visible = on;
+    for (const ch of this.wireCharges) if (ch.indicator) ch.indicator.visible = on;
+    // Pipe bombs / stickies blink faster as their fuse runs out (blink rate proportional to urgency).
+    const fast = Math.floor(this._time * 6) % 2 === 0;
+    for (const pb of this.pipeBombs) if (pb.indicator) pb.indicator.visible = fast;
+    for (const s of this.stickies) if (s.indicator) s.indicator.visible = s.stuck ? fast : true;
   }
 
   // Called by the manager when a vehicle is despawned: detach its stuck charges and re-parent
@@ -527,6 +650,321 @@ export class Weapons {
       ch.vehicle = null;
       ch.isOnVehicle = false;
     }
+  }
+
+  // --- Phase 7 batch A: shared explosion helper ----------------------------------------------
+  // Solo/authoritative: detach now, or (staged) bleed the job through the per-frame stage queue.
+  // Replica (this.net set): applyRadialDamage forwards a radial dmg intent to the server (server owns
+  // the detach + any staging; the client just receives the resulting detach batches). See report MP notes.
+  _explode(center, force, radius, budget, staged) {
+    if (staged && !this.net) this.destruction.enqueueRadialJobs([{ center, force, radius, budget }]);
+    else this.destruction.applyRadialDamage(center, force, radius, budget);
+  }
+
+  // --- 2b. Pipe Bomb: real dynamic Rapier body, ~3 s fuse, C4-scale blast at its resting spot ---
+  _throwPipeBomb(item) {
+    if (this._time - item.state.lastUse < W.pipeBomb.fireInterval) return;
+    item.state.lastUse = this._time;
+    const pb = W.pipeBomb;
+    while (this.pipeBombs.length >= pb.maxLive) this._removePipeBomb(this.pipeBombs.shift());
+
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(origin.x, origin.y, origin.z)
+      .setLinvel(dir.x * pb.throwSpeed, dir.y * pb.throwSpeed + pb.upBias, dir.z * pb.throwSpeed)
+      .setAngvel({ x: Math.random() * 6 - 3, y: Math.random() * 6 - 3, z: Math.random() * 6 - 3 })
+      .setLinearDamping(0.1).setCcdEnabled(true).setCanSleep(true);
+    const body = this.world.createRigidBody(bodyDesc);
+    const cd = this.RAPIER.ColliderDesc.cylinder(pb.colliderHalf, pb.colliderRadius)
+      .setRestitution(pb.restitution).setFriction(0.7).setDensity(pb.density);
+    this.world.createCollider(cd, body);
+
+    const mesh = new THREE.Mesh(this._pipeGeo, this.materials);
+    mesh.castShadow = true; mesh.position.copy(origin);
+    this.scene.add(mesh);
+    const indicator = new THREE.Mesh(this._indGeo, this._indMat);
+    indicator.position.set(0, pb.colliderHalf + 0.03, 0);
+    mesh.add(indicator);
+    this.pipeBombs.push({ body, mesh, indicator, fuse: pb.fuse, prevVy: 0 });
+    this._recoilZ -= 0.05;
+  }
+
+  _removePipeBomb(pb) {
+    if (!pb) return;
+    if (pb.mesh && pb.mesh.parent) pb.mesh.parent.remove(pb.mesh);
+    if (pb.body) { try { this.world.removeRigidBody(pb.body); } catch (e) {} }
+  }
+
+  _tickPipeBombs(dt) {
+    if (this.pipeBombs.length === 0) return;
+    const cam = this._camPos();
+    const keep = [];
+    for (const pb of this.pipeBombs) {
+      const t = pb.body.translation();
+      const r = pb.body.rotation();
+      pb.mesh.position.set(t.x, t.y, t.z);
+      pb.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+      // Bounce clink: velocity's vertical component flips from falling to rising = a bounce.
+      const lv = pb.body.linvel();
+      if (pb.prevVy < -1.5 && lv.y > 0.6) this.audio.bounceClink(cam.distanceTo(pb.mesh.position));
+      pb.prevVy = lv.y;
+      pb.fuse -= dt;
+      if (pb.fuse <= 0) {
+        const p = new THREE.Vector3(t.x, t.y, t.z);
+        this._explode(p, W.pipeBomb.force, W.pipeBomb.radius, W.pipeBomb.budget, false);
+        this.audio.explosion(cam.distanceTo(p));
+        this._removePipeBomb(pb);
+        continue;
+      }
+      keep.push(pb);
+    }
+    this.pipeBombs = keep;
+  }
+
+  // --- 2c. Demolition Wire: C4-style placement into a separate list, visually wired, RMB detonate-all ---
+  _placeWire(item) {
+    if (this._time - item.state.lastUse < W.demoWire.placeCooldown) return;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRayAndGetNormal(ray, W.demoWire.placeRange, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    item.state.lastUse = this._time;
+    const point = origin.clone().addScaledVector(dir, hit.toi);
+    const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
+    if (normal.lengthSq() < 1e-6) normal.set(0, 1, 0); else normal.normalize();
+    const worldPos = point.clone().addScaledVector(normal, this._c4HalfY);
+    const worldQuat = new THREE.Quaternion().setFromUnitVectors(UP, normal);
+    const onVehicleV = this.manager ? this.manager.byColliderHandle(hit.collider.handle) : null;
+    this._spawnChargeVisual(worldPos, worldQuat, onVehicleV, null, this.wireCharges);
+    while (this.wireCharges.length > W.demoWire.maxCharges) {
+      const old = this.wireCharges.shift();
+      if (old.mesh.parent) old.mesh.parent.remove(old.mesh);
+    }
+    this._rebuildWireLines();
+    this.audio.placeCharge();
+    this._recoilZ -= 0.05;
+  }
+
+  // Reposition pooled sagging line segments between consecutive wire charges (two segments per link, with
+  // the midpoint dropped by CONFIG sag). Called every frame so vehicle-parented charges keep their wires.
+  _rebuildWireLines() {
+    let seg = 0;
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), mid = new THREE.Vector3();
+    for (let i = 0; i < this.wireCharges.length - 1; i++) {
+      this.wireCharges[i].mesh.getWorldPosition(a);
+      this.wireCharges[i + 1].mesh.getWorldPosition(b);
+      mid.addVectors(a, b).multiplyScalar(0.5); mid.y -= W.demoWire.sag;
+      seg = this._setWireSeg(seg, a, mid);
+      seg = this._setWireSeg(seg, mid, b);
+    }
+    for (; seg < this._wireSegs.length; seg++) this._wireSegs[seg].visible = false;
+  }
+
+  _setWireSeg(idx, p0, p1) {
+    if (idx >= this._wireSegs.length) return idx;
+    const m = this._wireSegs[idx];
+    const len = p0.distanceTo(p1);
+    m.position.copy(p0).add(p1).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(FWD_Z, p1.clone().sub(p0).normalize());
+    m.scale.set(0.012, 0.012, Math.max(0.001, len));
+    m.visible = true;
+    return idx + 1;
+  }
+
+  _detonateWire() {
+    if (this.wireCharges.length === 0) return;
+    this.audio.wireBeep();
+    const cam = this._camPos();
+    const staged = this.wireCharges.length > W.demoWire.stageThreshold;
+    const blasts = [];
+    for (const ch of this.wireCharges) {
+      const pos = ch.mesh.getWorldPosition(new THREE.Vector3());
+      this._explode(pos, W.demoWire.force, W.demoWire.radius, W.demoWire.budget, staged);
+      blasts.push({ dist: cam.distanceTo(pos) });
+    }
+    blasts.sort((a, b) => a.dist - b.dist);
+    for (let i = 0; i < blasts.length && i < W.explosionSoundCap; i++) this.audio.explosion(blasts[i].dist);
+    for (const ch of this.wireCharges) if (ch.mesh.parent) ch.mesh.parent.remove(ch.mesh);
+    this.wireCharges.length = 0;
+    this._rebuildWireLines();
+  }
+
+  // --- 4b. Sticky Bomb Launcher: ray-stepped projectile that sticks to world/chunks/vehicles, 2.5 s fuse ---
+  _fireSticky(item) {
+    if (this._time - item.state.lastUse < W.sticky.fireInterval) return;
+    item.state.lastUse = this._time;
+    const st = W.sticky;
+    while (this.stickies.length >= st.maxLive) {
+      const old = this.stickies.shift();
+      if (old.mesh.parent) old.mesh.parent.remove(old.mesh);
+    }
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const mesh = new THREE.Mesh(this._c4Geo, this.materials);
+    mesh.castShadow = true; mesh.position.copy(origin);
+    this.scene.add(mesh);
+    const indicator = new THREE.Mesh(this._indGeo, this._indMat);
+    indicator.position.set(0, this._c4HalfY + 0.02, 0);
+    mesh.add(indicator);
+    this.stickies.push({ mesh, indicator, pos: origin.clone(), vel: dir.clone().multiplyScalar(st.speed), stuck: false, fuse: st.fuse, age: 0, vehicle: null });
+    this.audio.stickyThoomp();
+    this._flash(origin);
+    this._recoilZ += 0.08;
+  }
+
+  _tickStickies(dt) {
+    if (this.stickies.length === 0) return;
+    const cam = this._camPos();
+    const keep = [];
+    for (const s of this.stickies) {
+      s.age += dt;
+      if (!s.stuck) {
+        s.vel.y -= 9.81 * dt * 0.5; // slight droop; slower + heavier-feeling than the rocket
+        const step = s.vel.clone().multiplyScalar(dt);
+        const dist = step.length();
+        const dir = dist > 1e-6 ? step.clone().multiplyScalar(1 / dist) : this._aimDir();
+        const ray = new this.RAPIER.Ray(s.pos, dir);
+        const hit = this.world.castRay(ray, Math.max(dist, 0.02), true, undefined, undefined, undefined, this.player.body);
+        if (hit) {
+          const point = s.pos.clone().addScaledVector(dir, hit.toi);
+          const onVehicleV = this.manager ? this.manager.byColliderHandle(hit.collider.handle) : null;
+          s.pos.copy(point);
+          if (onVehicleV) {
+            // Stick to the chassis (same parenting as C4-on-vehicle) so it rides along.
+            const chassis = onVehicleV.chassis;
+            chassis.updateWorldMatrix(true, false);
+            s.mesh.position.copy(chassis.worldToLocal(point.clone()));
+            chassis.add(s.mesh);
+            s.vehicle = onVehicleV;
+          } else {
+            s.mesh.position.copy(point);
+          }
+          s.stuck = true; s.fuse = W.sticky.fuse;
+          this.audio.stickSplat(cam.distanceTo(point));
+          keep.push(s);
+          continue;
+        }
+        s.pos.add(step);
+        s.mesh.position.copy(s.pos);
+        if (s.age > W.sticky.lifetime) { if (s.mesh.parent) s.mesh.parent.remove(s.mesh); continue; }
+        keep.push(s);
+        continue;
+      }
+      s.fuse -= dt;
+      if (s.fuse <= 0) {
+        const p = s.mesh.getWorldPosition(new THREE.Vector3());
+        this._explode(p, W.sticky.force, W.sticky.radius, W.sticky.budget, false);
+        this.audio.explosion(cam.distanceTo(p));
+        if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+        continue;
+      }
+      keep.push(s);
+    }
+    this.stickies = keep;
+  }
+
+  // --- 4c. Cluster Bomb Launcher: arced shell splits at 0.8 s into 6 seeded bomblets; small staged blasts ---
+  _fireCluster(item) {
+    if (this._time - item.state.lastUse < W.cluster.fireInterval) return;
+    item.state.lastUse = this._time;
+    const cl = W.cluster;
+    while (this.clusters.length >= cl.maxLive) this._clearCluster(this.clusters.shift());
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const vel = dir.clone().multiplyScalar(cl.speed); vel.y += cl.upBias;
+    const mesh = new THREE.Mesh(this._clusterGeo, this.materials);
+    mesh.castShadow = true; mesh.position.copy(origin);
+    this.scene.add(mesh);
+    // Deterministic per-shot seed so the split pattern is reproducible (server-sync friendly + self-test).
+    const seed = ((this._ridCounter++ * 2654435761) ^ 0x9e3779b9) >>> 0;
+    this.clusters.push({ phase: "shell", pos: origin.clone(), vel, mesh, timer: 0, seed, bomblets: [] });
+    this.audio.stickyThoomp();
+    this._flash(origin);
+    this._recoilZ += 0.1;
+  }
+
+  _acquireBomblet() {
+    for (const e of this._bombletPool) if (!e.used) { e.used = true; e.mesh.visible = true; return e; }
+    return null; // pool exhausted (capped) — bomblet simulated without a mesh
+  }
+  _releaseBomblet(e) { if (e) { e.used = false; e.mesh.visible = false; } }
+
+  _clearCluster(c) {
+    if (!c) return;
+    if (c.mesh && c.mesh.parent) c.mesh.parent.remove(c.mesh);
+    for (const b of c.bomblets) this._releaseBomblet(b.pool);
+    c.bomblets.length = 0;
+  }
+
+  _splitCluster(c) {
+    c.phase = "bomblets";
+    if (c.mesh.parent) c.mesh.parent.remove(c.mesh);
+    c.mesh = null;
+    this.audio.clusterPop();
+    const cl = W.cluster;
+    const rng = mulberry32(c.seed);
+    for (let i = 0; i < cl.bombletCount; i++) {
+      const ang = (i / cl.bombletCount) * Math.PI * 2 + rng() * 0.6;
+      const spd = cl.spread * (0.6 + 0.6 * rng());
+      const vx = Math.cos(ang) * spd, vz = Math.sin(ang) * spd, vy = cl.bombletUp * (0.6 + 0.8 * rng());
+      const pool = this._acquireBomblet();
+      const pos = c.pos.clone();
+      if (pool) pool.mesh.position.copy(pos);
+      c.bomblets.push({
+        pos, vel: new THREE.Vector3(c.vel.x * 0.3 + vx, c.vel.y * 0.3 + vy, c.vel.z * 0.3 + vz),
+        pool, age: 0, dead: false,
+      });
+    }
+  }
+
+  _tickClusters(dt) {
+    if (this.clusters.length === 0) return;
+    const cl = W.cluster;
+    const cam = this._camPos();
+    const keep = [];
+    for (const c of this.clusters) {
+      if (c.phase === "shell") {
+        c.timer += dt;
+        c.vel.y -= cl.gravity * dt;
+        const step = c.vel.clone().multiplyScalar(dt);
+        const dist = step.length();
+        const dir = dist > 1e-6 ? step.clone().multiplyScalar(1 / dist) : new THREE.Vector3(0, -1, 0);
+        const ray = new this.RAPIER.Ray(c.pos, dir);
+        const hit = this.world.castRay(ray, Math.max(dist, 0.02), true, undefined, undefined, undefined, this.player.body);
+        if (hit) c.pos.addScaledVector(dir, hit.toi); else c.pos.add(step);
+        if (c.mesh) c.mesh.position.copy(c.pos);
+        if (c.timer >= cl.splitDelay || hit) this._splitCluster(c);
+        keep.push(c);
+        continue;
+      }
+      // bomblet phase
+      for (const b of c.bomblets) {
+        if (b.dead) continue;
+        b.age += dt;
+        b.vel.y -= cl.bombletGravity * dt;
+        const step = b.vel.clone().multiplyScalar(dt);
+        const dist = step.length();
+        const dir = dist > 1e-6 ? step.clone().multiplyScalar(1 / dist) : new THREE.Vector3(0, -1, 0);
+        const ray = new this.RAPIER.Ray(b.pos, dir);
+        const hit = this.world.castRay(ray, Math.max(dist, 0.05), true, undefined, undefined, undefined, this.player.body);
+        if (hit || b.age > cl.bombletLifetime) {
+          const point = hit ? b.pos.clone().addScaledVector(dir, hit.toi) : b.pos.clone();
+          // Each bomblet blast is staggered through the stage queue (solo) so 6 never land in one frame.
+          this._explode(point, cl.bombletForce, cl.bombletRadius, cl.bombletBudget, true);
+          this.audio.clusterCrump(cam.distanceTo(point));
+          this._releaseBomblet(b.pool);
+          b.dead = true;
+          continue;
+        }
+        b.pos.add(step);
+        if (b.pool) b.pool.mesh.position.copy(b.pos);
+      }
+      c.bomblets = c.bomblets.filter((b) => !b.dead);
+      if (c.bomblets.length > 0) keep.push(c);
+    }
+    this.clusters = keep;
   }
 
   // --- Shotgun ---
@@ -666,12 +1104,22 @@ export class Weapons {
 
     let swingPitch = 0;
     if (this._swingT >= 0) {
-      const p = this._swingT / W.melee.swingDuration;
+      const dur = (this._swingCfg || W.melee).swingDuration;
+      const p = this._swingT / dur;
       if (p < 0.4) { const e = p / 0.4; swingPitch = -0.4 + (1.1 - -0.4) * (1 - (1 - e) * (1 - e)); }
       else { const e = (p - 0.4) / 0.6; swingPitch = 1.1 * (1 - e); }
     }
 
-    this.viewmodel.position.set(b.x, b.y + equipY + bobY, b.z + this._recoilZ);
-    this.viewmodel.rotation.set(swingPitch + this._recoilPitch, VM.inwardYaw, 0);
+    // Chainsaw rumble: high-frequency shake, stronger while biting a chunk.
+    let rx = 0, ry = 0, rz = 0;
+    if (this._activeItem().kind === "chainsaw" && this._sawShake > 0) {
+      const amp = 0.006 * this._sawShake;
+      rx = Math.sin(this._time * 90) * amp;
+      ry = Math.sin(this._time * 77) * amp;
+      rz = Math.sin(this._time * 63) * amp * 0.6;
+    }
+
+    this.viewmodel.position.set(b.x + rx, b.y + equipY + bobY + ry, b.z + this._recoilZ + rz);
+    this.viewmodel.rotation.set(swingPitch + this._recoilPitch + rx, VM.inwardYaw + ry, 0);
   }
 }

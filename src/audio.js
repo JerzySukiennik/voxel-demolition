@@ -21,6 +21,19 @@ const FILES = {
   beep: ["detonate_beep.ogg"],
   explosion: ["explosion_0.ogg", "explosion_1.ogg"],
   rocket: ["rocket_launch.ogg"],
+  // ---- Phase 7 batch A (all CC0 Kenney, see CREDITS.md) ----
+  crowbarPry: ["crowbar_pry.ogg"],
+  crowbarClang: ["crowbar_clang.ogg"],
+  chainsawIdle: ["chainsaw_idle.ogg"],
+  chainsawCut: ["chainsaw_cut.ogg"],
+  chainsawScreech: ["chainsaw_screech.ogg"],
+  fuseHiss: ["fuse_hiss.ogg"],
+  bounceClink: ["bounce_clink.ogg"],
+  wireBeep: ["wire_beep.ogg"],
+  stickyThoomp: ["sticky_thoomp.ogg"],
+  stickSplat: ["stick_splat.ogg"],
+  clusterPop: ["cluster_pop.ogg"],
+  clusterCrump: ["cluster_crump.ogg"],
 };
 
 export class GameAudio {
@@ -174,5 +187,70 @@ export class GameAudio {
   // Rocket launch whoosh (short slice of the thruster loop).
   rocketLaunch() {
     this._play("rocket", { gain: A.rocketGain, rate: A.rocketRate, offset: 0, duration: A.rocketSlice });
+  }
+
+  // ---- Phase 7 batch A ----------------------------------------------------------------------
+
+  // Crowbar contact: metal clang on a break, wood pry/creak otherwise.
+  crowbarHit(broke) { this._play(broke ? "crowbarClang" : "crowbarPry", { gain: A.clangGain, rate: this._jitter() }); }
+
+  // Managed chainsaw loops (idle always-on while equipped; cut layered while actively chewing a chunk).
+  // Built lazily after decode so the buffers exist. Silences both when equipped=false.
+  chainsaw(equipped, cutting) {
+    if (!this.ready) return;
+    if (!this._saw) this._buildSaw();
+    if (!this._saw) return;
+    const t = this.ctx.currentTime;
+    this._saw.idle.gain.setTargetAtTime(equipped ? 0.32 : 0, t, 0.05);
+    this._saw.cut.gain.setTargetAtTime(equipped && cutting ? 0.5 : 0, t, 0.05);
+  }
+  _buildSaw() {
+    const mk = (cat) => {
+      const bufs = this.buffers[cat];
+      if (!bufs || !bufs.length) return null;
+      const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
+      const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
+      return { gain, src };
+    };
+    const idle = mk("chainsawIdle"), cut = mk("chainsawCut");
+    if (!idle && !cut) { this._saw = null; return; }
+    this._saw = { idle: idle || { gain: this.ctx.createGain() }, cut: cut || { gain: this.ctx.createGain() } };
+  }
+  // Metallic screech when the chainsaw bites concrete/metal (nothing detaches). Rate-limited.
+  chainsawScreech() {
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    if (this._lastScreech && now - this._lastScreech < 0.18) return;
+    this._lastScreech = now;
+    this._play("chainsawScreech", { gain: 0.4, rate: 0.9 + Math.random() * 0.2 });
+  }
+
+  // Shared fuse-hiss loop: on while any pipe bomb / sticky is ticking, off otherwise.
+  fuse(active) {
+    if (!this.ready) return;
+    if (!this._fuse) {
+      const bufs = this.buffers.fuseHiss;
+      if (!bufs || !bufs.length) return;
+      const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
+      const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
+      this._fuse = { gain, src };
+    }
+    this._fuse.gain.gain.setTargetAtTime(active ? 0.22 : 0, this.ctx.currentTime, 0.08);
+  }
+
+  bounceClink(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("bounceClink", { gain: 0.5 * atten, rate: this._jitter() });
+  }
+  wireBeep() { this._play("wireBeep", { gain: A.beepGain }); }
+  stickyThoomp() { this._play("stickyThoomp", { gain: 0.6, rate: 0.95 }); }
+  stickSplat(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("stickSplat", { gain: 0.6 * atten, rate: this._jitter() });
+  }
+  clusterPop() { this._play("clusterPop", { gain: 0.55, rate: this._jitter() }); }
+  // Small bomblet blast, attenuated by distance (lower-gain than the main explosion).
+  clusterCrump(dist) {
+    const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.2)));
+    this._play("clusterCrump", { gain: A.explosionGain * 0.6 * atten, rate: 0.95 + Math.random() * 0.15 });
   }
 }

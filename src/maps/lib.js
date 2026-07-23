@@ -5,6 +5,14 @@ const SV = CONFIG.world.structureVoxel; // 0.15 m structure/prop voxel
 const D = CONFIG.destruction;
 const v1 = (m) => Math.max(1, Math.round(m / SV)); // meters -> voxel count (>=1)
 
+// Phase 7 subsystem A.1: map a §4 material key to a coarse damage-multiplier class (default concrete).
+const MAT_CLASS = {
+  brick: "concrete", concrete: "concrete", rock: "concrete", roofTile: "concrete", glass: "concrete",
+  wood: "wood", plank: "wood", roofWood: "wood",
+  metal: "metal", sand: "dirt", skin: "dirt",
+};
+export function matClass(key) { return MAT_CLASS[key] || "concrete"; }
+
 // A MAT entry carries palette colors + its destruction tuning (threshold/density/chunkSize from CONFIG).
 // A `color` key (e.g. via {...MAT.wood, color:"#b8574a"}) tints the primary palette entry.
 function mkMat(key, color, trim, roughness, metalness) {
@@ -50,6 +58,7 @@ function rawSpec(name, mat, dims, origin, fill, override) {
   return {
     name, voxelSize: SV, dims, origin, palette: matPalette(mat, override), fill,
     density: mat.density, threshold: mat.threshold, chunkSize: mat.chunkSize, kind: "single",
+    materialClass: matClass(mat.key),
   };
 }
 
@@ -86,7 +95,7 @@ export function groundSpec(size, color, patches = []) {
   return {
     name: "ground", voxelSize: vs, dims: [nx, 1, nz], origin: [-halfX, 0, -halfZ], palette, fill,
     density: D.density.skin, threshold: D.forceThreshold.skin, chunkSize: D.chunkSizeSkin,
-    tileMeters: D.tileMeters, kind: "grid",
+    tileMeters: D.tileMeters, kind: "grid", materialClass: "dirt",
   };
 }
 
@@ -240,7 +249,7 @@ function blob(x, yb, z, w, h, mat) {
     if (r2 > 1) return 0;
     return r2 > 0.45 ? 2 : 1; // hollow-ish: interior sparser (still solid) — keep chunk-light shell
   };
-  return { name: "leaf", voxelSize: SV, dims: [nx, ny, nz], origin: [x - w / 2, yb, z - w / 2], palette: matPalette(mat), fill, density: mat.density, threshold: mat.threshold, chunkSize: 1.4, kind: "single" };
+  return { name: "leaf", voxelSize: SV, dims: [nx, ny, nz], origin: [x - w / 2, yb, z - w / 2], palette: matPalette(mat), fill, density: mat.density, threshold: mat.threshold, chunkSize: 1.4, kind: "single", materialClass: matClass(mat.key) };
 }
 function coneBlob(x, yb, z, w, h, mat) {
   const nx = v1(w), ny = v1(h), nz = v1(w);
@@ -250,7 +259,7 @@ function coneBlob(x, yb, z, w, h, mat) {
     const dxr = i - cx, dzr = k - cz;
     return dxr * dxr + dzr * dzr <= rad * rad ? 1 : 0;
   };
-  return { name: "leaf", voxelSize: SV, dims: [nx, ny, nz], origin: [x - w / 2, yb, z - w / 2], palette: matPalette(mat), fill, density: mat.density, threshold: mat.threshold, chunkSize: 1.4, kind: "single" };
+  return { name: "leaf", voxelSize: SV, dims: [nx, ny, nz], origin: [x - w / 2, yb, z - w / 2], palette: matPalette(mat), fill, density: mat.density, threshold: mat.threshold, chunkSize: 1.4, kind: "single", materialClass: matClass(mat.key) };
 }
 
 // ---- fence (from/to centerline) -------------------------------------------

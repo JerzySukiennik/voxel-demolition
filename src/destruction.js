@@ -39,6 +39,7 @@ export class Destruction {
     this.debris = [];          // per-mode debris entries (see _detach / applyDetach)
     this._detachQueue = [];
     this._pendingDetach = [];  // batched onDetach events for the current op
+    this._stageJobs = [];      // subsystem A.3: pending staged radial jobs, drained N chunks/frame
     this._time = 0;
     // Only these collider handles (player, vehicle) may trigger contact-based detach.
     this.allowedImpactors = new Set();
@@ -79,6 +80,7 @@ export class Destruction {
     }
     this._detachQueue.length = 0;
     this._pendingDetach.length = 0;
+    this._stageJobs.length = 0;
   }
 
   // ============================ AUTHORITATIVE PATH ============================
@@ -130,45 +132,51 @@ export class Destruction {
 
   hasChunk(colliderHandle) { return this.registry.has(colliderHandle); }
 
+  // Per-material multiplier lookup (subsystem A.1). opts.mult is an optional {materialClass: factor} table;
+  // absent/unknown class => 1.0, so every legacy caller is byte-identical.
+  _multFor(vol, opts) {
+    if (!opts || !opts.mult) return 1;
+    const m = opts.mult[vol.materialClass];
+    return (typeof m === "number" && m > 0) ? m : 1;
+  }
+
   // Point damage by collider handle (client raycast / solo). Replica forwards an intent instead.
-  applyPointDamage(colliderHandle, sourcePos, force) {
+  // opts.mult (optional) travels in the intent so the server applies the same material table (§ Phase 7).
+  applyPointDamage(colliderHandle, sourcePos, force, opts) {
     const r = this.registry.get(colliderHandle);
     if (!r || !r.chunk.active) return false;
     if (this.mode === "replica") {
-      if (this.onDamageIntent) this.onDamageIntent({ kind: "point", vol: r.volume.id, cid: r.chunk.id, src: sourcePos, force });
+      if (this.onDamageIntent) this.onDamageIntent({ kind: "point", vol: r.volume.id, cid: r.chunk.id, src: sourcePos, force, mult: opts ? opts.mult : undefined });
       return false;
     }
-    const broke = this._pointDamage(r.volume, r.chunk, sourcePos, force);
+    const broke = this._pointDamage(r.volume, r.chunk, sourcePos, force, opts);
     this._flushDetach();
     return broke;
   }
 
   // Point damage by (volume index, chunk id) — server applying a validated dmg intent (§5).
-  applyPointDamageRef(volIdx, cid, sourcePos, force) {
+  applyPointDamageRef(volIdx, cid, sourcePos, force, opts) {
     const vol = this.volumes[volIdx];
     if (!vol) return false;
     const chunk = vol.chunks[cid];
     if (!chunk || !chunk.active) return false;
-    const broke = this._pointDamage(vol, chunk, sourcePos, force);
+    const broke = this._pointDamage(vol, chunk, sourcePos, force, opts);
     this._flushDetach();
     return broke;
   }
 
-  _pointDamage(vol, chunk, sourcePos, force) {
-    if (force < chunk.threshold) return false;
+  _pointDamage(vol, chunk, sourcePos, force, opts) {
+    const eff = force * this._multFor(vol, opts);
+    if (eff < chunk.threshold) return false;
     const seen = new Set();
     seen.add(vol.id + ":" + chunk.id);
-    this._detach(vol, chunk, dirTo(sourcePos, chunk.centroid), force);
-    if (force >= chunk.threshold * D.neighborDetachMultiplier) this._detachRing(vol, chunk, force, seen);
+    this._detach(vol, chunk, dirTo(sourcePos, chunk.centroid), eff);
+    if (eff >= chunk.threshold * D.neighborDetachMultiplier) this._detachRing(vol, chunk, eff, seen);
     return true;
   }
 
-  // Radial damage (C4, rocket): detach active chunks within radius, nearest-first up to budget.
-  applyRadialDamage(center, force, radius, budget) {
-    if (this.mode === "replica") {
-      if (this.onDamageIntent) this.onDamageIntent({ kind: "radial", p: center, force, radius });
-      return 0;
-    }
+  // Gather active chunks within radius of center, nearest-first (shared by radial + staged jobs).
+  _radialCandidates(center, radius) {
     const r2 = radius * radius;
     const candidates = [];
     for (const vol of this.volumes) {
@@ -185,16 +193,62 @@ export class Destruction {
       }
     }
     candidates.sort((a, b) => a.dist - b.dist);
+    return candidates;
+  }
+
+  // Radial damage (C4, rocket, pipe/sticky/cluster): detach active chunks within radius, nearest-first
+  // up to budget. opts.mult (optional) applies the per-material table + travels in the replica intent.
+  applyRadialDamage(center, force, radius, budget, opts) {
+    if (this.mode === "replica") {
+      if (this.onDamageIntent) this.onDamageIntent({ kind: "radial", p: center, force, radius, mult: opts ? opts.mult : undefined });
+      return 0;
+    }
+    const candidates = this._radialCandidates(center, radius);
     let count = 0;
     for (const cand of candidates) {
       if (count >= budget) break;
-      const f = force * (1 - cand.dist / radius);
+      const f = force * (1 - cand.dist / radius) * this._multFor(cand.vol, opts);
       if (f < cand.chunk.threshold) continue;
       this._detach(cand.vol, cand.chunk, dirTo(center, cand.chunk.centroid), f);
       count++;
     }
     this._flushDetach();
     return count;
+  }
+
+  // Staged detach queue (subsystem A.3). Accepts pending radial jobs and drains at most
+  // CONFIG.weapons.stageChunksPerFrame chunk detaches per frame in update(). Authoritative-only:
+  // in replica mode nothing stages locally — the server stages and the client receives detach batches.
+  // Each job: { center:Vector3, force, radius, budget, mult? }.
+  enqueueRadialJobs(jobs) {
+    if (this.mode === "replica") return;
+    for (const j of jobs) {
+      if (!j || !j.center) continue;
+      this._stageJobs.push({
+        center: j.center, force: j.force, radius: j.radius,
+        budget: j.budget != null ? j.budget : Infinity, mult: j.mult ? { mult: j.mult } : null,
+        cands: null, i: 0, count: 0,
+      });
+    }
+  }
+
+  _drainStage() {
+    if (this._stageJobs.length === 0) return;
+    let quota = CONFIG.weapons.stageChunksPerFrame;
+    while (this._stageJobs.length && quota > 0) {
+      const job = this._stageJobs[0];
+      if (!job.cands) job.cands = this._radialCandidates(job.center, job.radius);
+      while (job.i < job.cands.length && quota > 0 && job.count < job.budget) {
+        const cand = job.cands[job.i++];
+        if (!cand.chunk.active) continue; // detached since the job was queued
+        const f = job.force * (1 - cand.dist / job.radius) * this._multFor(cand.vol, job.mult);
+        if (f < cand.chunk.threshold) continue;
+        this._detach(cand.vol, cand.chunk, dirTo(job.center, cand.chunk.centroid), f);
+        job.count++; quota--;
+      }
+      if (job.i >= job.cands.length || job.count >= job.budget) this._stageJobs.shift();
+    }
+    this._flushDetach();
   }
 
   _otherPos(handle) {
@@ -276,6 +330,7 @@ export class Destruction {
   update(dt) {
     this._time += dt;
     if (this.mode === "replica") return this._updateReplica(dt);
+    this._drainStage(); // subsystem A.3: bleed queued big-blast detaches at the per-frame budget
     const now = this._time;
     const activeCount = this.debris.filter((d) => !d.fading).length;
     const removals = [];
@@ -604,6 +659,8 @@ function buildVolume(spec, mgr, volIndex) {
 
   const vol = {
     id: volIndex, spec, dims: spec.dims, vs, origin: spec.origin, idx, chunkOf, palette,
+    // Phase 7 subsystem A.1: coarse material class for per-tool damage multipliers (default concrete).
+    materialClass: spec.materialClass || "concrete",
     chunks: [], threshold: spec.threshold,
     tiles: [], tileCountX, tileCountZ, voxelsPerTile, voxelsPerTileZ,
     scene: mgr.scene, materials: mgr.materials,

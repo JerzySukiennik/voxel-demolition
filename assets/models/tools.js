@@ -139,6 +139,175 @@ const rocket = {
   anchors: {},
 };
 
+// ============================ Phase 7 batch A held-models ====================================
+const orange = { color: "#e0731f", roughness: 0.7, metalness: 0.0 };
+const orangeDark = { color: "#a8531a", roughness: 0.75, metalness: 0.0 };
+const gray = { color: "#7d848b", roughness: 0.5, metalness: 0.2 };
+
+// --- 1b. Crowbar: red curved pry bar running +Z, hooked claw at the front, chisel flare at the back ---
+const CBX = 4, CBY = 10, CBZ = 18;
+const crowbar = {
+  name: "crowbar", voxelSize: 0.05, palette: [red, darkSteel],
+  parts: [{
+    name: "main", size: [CBX, CBY, CBZ], originOffset: [0, 0, 0],
+    pivot: [2 * 0.05, 4 * 0.05, 3 * 0.05],
+    data: vol(CBX, CBY, CBZ, (x, y, z) => {
+      const bar = (x === 1 || x === 2);
+      if (!bar) return 0;
+      // straight shaft at mid height
+      if (z >= 1 && z <= 12 && (y === 3 || y === 4)) return 1;
+      // curved neck rising toward the claw
+      if (z === 12 && y >= 3 && y <= 5) return 1;
+      if (z === 13 && y >= 4 && y <= 6) return 1;
+      if (z === 14 && y >= 6 && y <= 8) return 1;
+      // hooked claw tip (dark steel)
+      if (z >= 14 && z <= 16 && y === 8) return 2;
+      if (z === 16 && y >= 6 && y <= 8) return 2;
+      // chisel flare at the back end
+      if (z === 0 && y >= 2 && y <= 5) return 1;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 1c. Chainsaw: orange engine body at the back, long dark bar-blade with teeth running +Z ---
+const CSX = 5, CSY = 8, CSZ = 22;
+const chainsaw = {
+  name: "chainsaw", voxelSize: 0.05, palette: [orange, darkSteel, orangeDark],
+  parts: [{
+    name: "main", size: [CSX, CSY, CSZ], originOffset: [0, 0, 0],
+    pivot: [CSX * 0.05 / 2, 2 * 0.05, 5 * 0.05],
+    data: vol(CSX, CSY, CSZ, (x, y, z) => {
+      // engine body (orange block) at the back
+      if (z <= 7 && y >= 1 && y <= 6 && x >= 0 && x <= 4) return (y === 1 || y === 6 || x === 0 || x === 4) ? 3 : 1;
+      // top handle bar
+      if (z >= 2 && z <= 6 && y === 7 && (x === 1 || x === 2 || x === 3)) return 3;
+      // guide bar (dark, thin, mid height) extending forward
+      if (z >= 7 && z <= 20 && y === 3 && (x === 1 || x === 2 || x === 3)) return 2;
+      if (z >= 7 && z <= 20 && y === 4 && (x === 1 || x === 2 || x === 3)) return 2;
+      // chain teeth: alternating nubs top/bottom of the bar
+      if (z >= 8 && z <= 20 && z % 2 === 0 && (y === 2 || y === 5) && x === 2) return 2;
+      // rounded nose
+      if (z === 21 && (y === 3 || y === 4) && x === 2) return 2;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 2b. Pipe Bomb (held + thrown): grey pipe body, dark end caps, short red fuse at the top ---
+const PBX = 4, PBY = 4, PBZ = 10;
+const pipebomb = {
+  name: "pipebomb", voxelSize: 0.045, palette: [gray, darkSteel, red],
+  parts: [{
+    name: "main", size: [PBX, PBY, PBZ], originOffset: [0, 0, 0],
+    pivot: [PBX * 0.045 / 2, PBY * 0.045 / 2, PBZ * 0.045 / 2],
+    data: vol(PBX, PBY, PBZ, (x, y, z) => {
+      const cx = 1.5, cy = 1.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      const inPipe = r2 <= 1.7 * 1.7;
+      if (z === 0 || z === PBZ - 1) return inPipe ? 2 : 0; // dark end caps
+      if (z >= 1 && z <= PBZ - 2 && inPipe) return 1;       // grey body
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 2c. Demolition Wire detonator: red box body with a dark plunger handle rising from the top ---
+const DWX = 6, DWY = 8, DWZ = 6;
+const demowire = {
+  name: "demowire", voxelSize: 0.05, palette: [red, darkSteel, gray],
+  parts: [{
+    name: "main", size: [DWX, DWY, DWZ], originOffset: [0, 0, 0],
+    pivot: [DWX * 0.05 / 2, 0, DWZ * 0.05 / 2],
+    data: vol(DWX, DWY, DWZ, (x, y, z) => {
+      // detonator box
+      if (y <= 3) {
+        const edge = x === 0 || x === DWX - 1 || z === 0 || z === DWZ - 1 || y === 0;
+        return edge ? 3 : 1;
+      }
+      // plunger shaft
+      if (y >= 4 && y <= 6 && x >= 2 && x <= 3 && z >= 2 && z <= 3) return 2;
+      // plunger knob
+      if (y === 7 && x >= 1 && x <= 4 && z >= 1 && z <= 4) return 2;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 4b. Sticky Bomb Launcher: dark tube running +Z with a round drum magazine under the body ---
+const SLX = 6, SLY = 9, SLZ = 18;
+const stickylauncher = {
+  name: "stickylauncher", voxelSize: 0.055, palette: [darkSteel, olive, gray],
+  parts: [{
+    name: "main", size: [SLX, SLY, SLZ], originOffset: [0, 0, 0],
+    pivot: [SLX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(SLX, SLY, SLZ, (x, y, z) => {
+      const cx = 2.5, cy = 5.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // barrel tube (upper), hollow muzzle at front
+      if (z >= 8) {
+        if (r2 <= 2.4 * 2.4) return (z >= 16 && r2 >= 1.3 * 1.3) ? 1 : (z >= 16 ? 0 : 1);
+        return 0;
+      }
+      if (z >= 3 && z <= 8 && r2 <= 2.4 * 2.4) return 1;
+      // drum magazine (olive) below/behind
+      const dcx = 2.5, dcy = 2.5;
+      const dr2 = (x - dcx) * (x - dcx) + (y - dcy) * (y - dcy);
+      if (z >= 4 && z <= 9 && dr2 <= 2.3 * 2.3) return 2;
+      // grip
+      if ((x === 2 || x === 3) && y <= 1 && z >= 2 && z <= 4) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 4c. Cluster Bomb Launcher: fat mortar tube running +Z with a wide muzzle and stubby grip ---
+const CLX = 8, CLY = 9, CLZ = 18;
+const clusterlauncher = {
+  name: "clusterlauncher", voxelSize: 0.06, palette: [olive, darkSteel, gray],
+  parts: [{
+    name: "main", size: [CLX, CLY, CLZ], originOffset: [0, 0, 0],
+    pivot: [CLX * 0.06 / 2, 2 * 0.06, 6 * 0.06],
+    data: vol(CLX, CLY, CLZ, (x, y, z) => {
+      const cx = 3.5, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      const wide = 3.6 * 3.6, bore = 2.2 * 2.2;
+      // fat tube
+      if (z >= 4 && z <= 15 && r2 <= wide) return 1;
+      // wide dark muzzle ring, hollow bore
+      if (z >= 15 && r2 <= wide) return r2 >= bore ? 2 : 0;
+      // breech cap
+      if (z <= 3 && r2 <= wide) return 2;
+      // grip
+      if ((x === 3 || x === 4) && y <= 1 && z >= 5 && z <= 8) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- Cluster bomblet / cluster shell projectile: tiny dark voxel ball (shared, scaled per use) ---
+const CBB = 3;
+const clusterBomb = {
+  name: "clusterBomb", voxelSize: 0.06, palette: [darkSteel, red],
+  parts: [{
+    name: "main", size: [CBB, CBB, CBB], originOffset: [0, 0, 0],
+    pivot: [CBB * 0.06 / 2, CBB * 0.06 / 2, CBB * 0.06 / 2],
+    data: vol(CBB, CBB, CBB, (x, y, z) => {
+      const c = 1;
+      const r2 = (x - c) * (x - c) + (y - c) * (y - c) + (z - c) * (z - c);
+      if (r2 > 1.6 * 1.6) return 0;
+      return (x === c && y === c && z === c) ? 2 : 1; // red core, dark shell
+    }).data,
+  }],
+  anchors: {},
+};
+
 // --- First-person arms: two forearm+hand columns straddling the grip; skin hands (+Z front), orange sleeves behind. Palette matches character.js. ---
 const skinTone = { color: "#c9986b", roughness: 0.9, metalness: 0.0 };
 const sleeve = { color: "#d6702a", roughness: 0.9, metalness: 0.0 };
@@ -164,4 +333,8 @@ const arms = {
   anchors: {},
 };
 
-export default { sledgehammer, c4, shotgun, rocketLauncher, rocket, arms };
+export default {
+  sledgehammer, c4, shotgun, rocketLauncher, rocket, arms,
+  // Phase 7 batch A
+  crowbar, chainsaw, pipebomb, demowire, stickylauncher, clusterlauncher, clusterBomb,
+};

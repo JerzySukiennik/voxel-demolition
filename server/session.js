@@ -258,23 +258,27 @@ export class Session {
 
   _onDmg(player, msg) {
     const now = this._time();
-    if (now - player.lastDmg < CAPS.dmgMinIntervalSec) return this._dropDmg(player, "rate");
     const senderP = player.lastState.p;
     if (msg.kind === "point") {
+      // Point ticks may arrive at the chainsaw's 0.12 s hold-fire rate (Phase 7).
+      if (now - player.lastDmg < CAPS.dmgMinIntervalPointSec) return this._dropDmg(player, "rate");
       const src = arr3(msg.src);
       const force = num(msg.force);
       if (!src || force <= 0 || force > CAPS.pointForceMax) return this._dropDmg(player, "point-force");
       if (!this._posValid(src, senderP)) return this._dropDmg(player, "point-pos");
       player.lastDmg = now;
-      this.destruction.applyPointDamageRef(msg.vol | 0, msg.cid | 0, new THREE.Vector3(src[0], src[1], src[2]), force);
+      const opts = sanitizeMult(msg.mult);
+      this.destruction.applyPointDamageRef(msg.vol | 0, msg.cid | 0, new THREE.Vector3(src[0], src[1], src[2]), force, opts);
     } else if (msg.kind === "radial") {
+      if (now - player.lastDmg < CAPS.dmgMinIntervalRadialSec) return this._dropDmg(player, "rate");
       const p = arr3(msg.p);
       const force = num(msg.force);
       const radius = num(msg.radius);
       if (!p || force <= 0 || force > CAPS.radialForceMax || radius <= 0 || radius > CAPS.radialRadiusMax) return this._dropDmg(player, "radial-cap");
       if (!this._posValid(p, senderP)) return this._dropDmg(player, "radial-pos");
       player.lastDmg = now;
-      this.destruction.applyRadialDamage(new THREE.Vector3(p[0], p[1], p[2]), force, radius, WPN.explosionDetachBudget);
+      const opts = sanitizeMult(msg.mult);
+      this.destruction.applyRadialDamage(new THREE.Vector3(p[0], p[1], p[2]), force, radius, WPN.explosionDetachBudget, opts);
     }
   }
 
@@ -535,6 +539,18 @@ function sanitizeNick(n) {
   let s = typeof n === "string" ? n.trim().slice(0, CAPS.nickMaxLen) : "";
   if (!s) s = "Player";
   return s;
+}
+// Phase 7: validate + clamp a per-material multiplier table from a client dmg intent. Each factor is
+// clamped to (0, CAPS.dmgMultMax]; anything malformed is dropped. Returns { mult } opts or undefined.
+function sanitizeMult(raw) {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out = {};
+  let any = false;
+  for (const k of ["wood", "concrete", "metal", "dirt", "foam"]) {
+    const v = raw[k];
+    if (Number.isFinite(v) && v > 0) { out[k] = Math.min(v, CAPS.dmgMultMax); any = true; }
+  }
+  return any ? { mult: out } : undefined;
 }
 function num(v) { return Number.isFinite(v) ? v : 0; }
 function round3(v) { return Math.round(num(v) * 1000) / 1000; }

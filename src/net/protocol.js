@@ -85,7 +85,12 @@ export const CAPS = {
   pointForceMax: 15400,
   radialForceMax: 44000,
   radialRadiusMax: 4.4,
-  dmgMinIntervalSec: 0.15,   // per-player minimum interval between dmg intents
+  // Per-player minimum interval between dmg intents, split by kind (Phase 7): point ticks fast enough for
+  // the chainsaw hold-fire (0.12 s), radial stays at the Phase 6 rate. Legacy alias kept = radial value.
+  dmgMinIntervalSec: 0.15,
+  dmgMinIntervalPointSec: 0.1,
+  dmgMinIntervalRadialSec: 0.15,
+  dmgMultMax: 3.5,           // Phase 7: per-material multiplier is clamped to this ceiling server-side
   dmgWithinSenderM: 20,      // dmg pos must be within this of the sender (+ map AABB)
   c4MaxPerPlayer: 20,
   stateTeleportMax: 30,      // > this per tick => clamp server capsule + log

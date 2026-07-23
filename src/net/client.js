@@ -131,9 +131,13 @@ export class NetClient {
   // (src / p) into a quantized [x,y,z] array to match the wire convention.
   sendDmg(intent) {
     if (intent.kind === "point") {
-      return this._send({ t: C2S.DMG, kind: "point", vol: intent.vol, cid: intent.cid, src: packP(intent.src), force: intent.force });
+      const m = { t: C2S.DMG, kind: "point", vol: intent.vol, cid: intent.cid, src: packP(intent.src), force: intent.force };
+      if (intent.mult) m.mult = intent.mult; // Phase 7: per-material multiplier table (server clamps each ≤ dmgMultMax)
+      return this._send(m);
     }
-    return this._send({ t: C2S.DMG, kind: "radial", p: packP(intent.p), force: intent.force, radius: intent.radius });
+    const m = { t: C2S.DMG, kind: "radial", p: packP(intent.p), force: intent.force, radius: intent.radius };
+    if (intent.mult) m.mult = intent.mult;
+    return this._send(m);
   }
   sendDmgPoint(vol, cid, src, force) { return this._send({ t: C2S.DMG, kind: "point", vol, cid, src: packP(src), force }); }
   sendDmgRadial(p, force, radius) { return this._send({ t: C2S.DMG, kind: "radial", p: packP(p), force, radius }); }

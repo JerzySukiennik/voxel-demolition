@@ -20,6 +20,7 @@ function propSpecs() {
       name: "wall", voxelSize: vs, dims: [nx, ny, nz], origin: [-3.0 + 8, y0, -0.225],
       palette: [brick, mortar], fill: (x, y) => ((y % 4 === 0 || x % 8 === 0) ? 2 : 1),
       density: Dn.density.wall, threshold: Dn.forceThreshold.wall, chunkSize: Dn.chunkSizeProp, kind: "single",
+      materialClass: "concrete",
     });
   }
 
@@ -41,6 +42,7 @@ function propSpecs() {
             return e >= 2 ? 2 : 1;
           },
           density: Dn.density.crate, threshold: Dn.forceThreshold.crate, chunkSize: 0.42, kind: "single",
+          materialClass: "wood",
         });
       }
     }
@@ -64,6 +66,7 @@ function propSpecs() {
         return trimV ? 2 : 1;
       },
       density: Dn.density.shed, threshold: Dn.forceThreshold.shed, chunkSize: Dn.chunkSizeProp, kind: "single",
+      materialClass: "wood",
     });
   }
   return specs;

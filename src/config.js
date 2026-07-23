@@ -176,6 +176,10 @@ export const CONFIG = {
   weapons: {
     explosionDetachBudget: 60,
     explosionSoundCap: 3,
+    // Staged-detach queue (Phase 7 subsystem A.3): huge/multi radial jobs drain at most this many
+    // chunk detaches per frame so nuke-scale collapses ripple outward instead of a single-frame hitch.
+    // Authoritative-only (solo/server); replica clients receive the resulting detach batches over frames.
+    stageChunksPerFrame: 40,
     melee: {
       force: 14000,
       range: 2.8,
@@ -208,9 +212,52 @@ export const CONFIG = {
       trailPool: 24,
       trailLife: 0.5,
     },
+
+    // ---- Phase 7 batch A additions ----------------------------------------------------------
+    // Per-material damage multipliers (subsystem A.1): effective force = force * (mult[materialClass] ?? 1).
+    // Volumes are tagged with a coarse materialClass (wood|concrete|metal|dirt|foam; default concrete).
+    // The destruction model is binary (no per-chunk HP), so "weak vs concrete" means the effective force
+    // stays below the concrete threshold — the tool simply cannot break it, which is the intended feel.
+
+    // 1b. Crowbar (Melee) — precise, weak: pops single wood/crate chunks, effectively immune to concrete/metal.
+    crowbar: {
+      force: 1800, range: 2.2, cooldown: 0.32, swingDuration: 0.30, hitDelay: 0.12,
+      mult: { wood: 1.5, concrete: 0.4, metal: 0.3, dirt: 1.0 },
+    },
+    // 1c. Chainsaw (Melee) — hold LMB, fast point-damage tick. Chews wood, sparks uselessly on concrete/metal.
+    chainsaw: {
+      tickInterval: 0.12, range: 2.2, force: 4000,
+      mult: { wood: 3.0, dirt: 1.5, concrete: 0.35, metal: 0.15 },
+    },
+    // 2b. Pipe Bomb (Explosives) — real dynamic Rapier body, bounces/rolls, ~3 s fuse, C4-scale blast.
+    pipeBomb: {
+      fuse: 3.0, force: 34000, radius: 3.0, budget: 60,
+      throwSpeed: 13, upBias: 3.5, restitution: 0.5, colliderRadius: 0.055, colliderHalf: 0.09,
+      density: 1200, maxLive: 6, fireInterval: 0.5,
+    },
+    // 2c. Demolition Wire (Explosives) — C4-pattern placement, weaker-per-charge, wired visual, RMB detonate-all.
+    demoWire: {
+      force: 24000, radius: 2.6, budget: 40, placeRange: 3.0, maxCharges: 12,
+      placeCooldown: 0.18, stageThreshold: 8, sag: 0.28,
+    },
+    // 4b. Sticky Bomb Launcher (Launchers) — ray-stepped projectile that sticks to world/chunks/vehicles, 2.5 s fuse.
+    sticky: {
+      speed: 34, fuse: 2.5, force: 30000, radius: 2.5, budget: 50,
+      maxLive: 8, fireInterval: 0.55, lifetime: 6, blinkFrom: 1.5,
+    },
+    // 4c. Cluster Bomb Launcher (Launchers) — arced projectile splits at 0.8 s into 6 seeded bomblets; each a small staged blast.
+    cluster: {
+      speed: 21, upBias: 6.5, gravity: 18, splitDelay: 0.8,
+      bombletCount: 6, spread: 5.5, bombletUp: 2.2, bombletGravity: 20,
+      bombletForce: 26000, bombletRadius: 1.8, bombletBudget: 12, bombletLifetime: 4,
+      fireInterval: 1.2, maxLive: 2,
+    },
+
     viewmodel: {
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
       sledgeOffset: { x: 0.18, y: -0.30, z: -0.5 },
+      crowbarOffset: { x: 0.20, y: -0.28, z: -0.5 },
+      chainsawOffset: { x: 0.22, y: -0.30, z: -0.42 },
       armsOffset: { x: 0.16, y: -0.34, z: -0.30 },
       armsOffsetSledge: { x: 0.10, y: -0.36, z: -0.34 },
       inwardYaw: -0.08,

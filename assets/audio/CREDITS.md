@@ -26,6 +26,18 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
 | plane_loop.ogg | thrusterFire_001.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | hover_loop.ogg | forceField_000.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | boat_loop.ogg | engineCircular_003.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| crowbar_pry.ogg | impactPlank_medium_002.ogg | Kenney — Impact Sounds — https://kenney.nl/assets/impact-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| crowbar_clang.ogg | impactMetal_medium_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| chainsaw_idle.ogg | spaceEngineSmall_000.ogg | Kenney — Sci-Fi Sounds — https://kenney.nl/assets/sci-fi-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| chainsaw_cut.ogg | spaceEngineLarge_000.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| chainsaw_screech.ogg | impactMetal_light_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| fuse_hiss.ogg | forceField_001.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| bounce_clink.ogg | impactTin_medium_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| wire_beep.ogg | bong_001.ogg | Kenney — Interface Sounds — https://kenney.nl/assets/interface-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| sticky_thoomp.ogg | impactSoft_heavy_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| stick_splat.ogg | slime_000.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| cluster_pop.ogg | impactGeneric_light_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| cluster_crump.ogg | explosionCrunch_002.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 
 ## Runtime usage notes
 - Phase 3 vehicle loops: `rotor_loop.ogg` (helicopter), `plane_loop.ogg` (airplane),
@@ -34,6 +46,12 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
   vehicles keep using `engine_loop.ogg`. Freesound was the primary candidate for the rotor,
   plane and boat loops but requires an authenticated download, so the proven CC0 Kenney
   Sci-Fi Sounds pack (same source as `engine_loop.ogg`) was used per the brief's fallback.
+- Phase 7 batch A loops: `chainsaw_idle.ogg` + `chainsaw_cut.ogg` (dedicated looped sources, idle
+  always-on while equipped, cut layered while chewing) and `fuse_hiss.ogg` (one shared looped source,
+  on while any pipe bomb / sticky is live). All three are Kenney Sci-Fi engine/force-field loops chosen
+  because they loop cleanly (same family as the proven vehicle loops). Reused for batch A (no new file):
+  `explosion_*` (pipe/sticky/wire detonations), `c4_place.ogg` (wire placement click),
+  `detonate_beep.ogg` (sticky arm blip via the existing beep path).
 - `rocket_launch.ogg` (a 5 s thruster loop) is played as a ~0.6 s slice for the launch whoosh.
 - `gunshot.wav` is a single double-barrel trigger blast, pitched down slightly for body.
 - `engine_loop.ogg` is looped with `playbackRate` driven by wheel speed.
