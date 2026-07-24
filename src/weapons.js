@@ -2101,7 +2101,7 @@ export class Weapons {
     const collider = this.world.createCollider(cd, body);
     // Temp-register in allowedImpactors for its lifetime => smashes structures via the vehicle-grade
     // contact-force detach path (the whole trick). Unregistered on despawn (proof of no leak in the report).
-    this.destruction.registerImpactor(collider.handle);
+    this.destruction.registerImpactor(collider.handle, true); // heavy: the flung car smashes like a rammed vehicle
     const mesh = new THREE.Mesh(this._carCannonGeo, this.materials);
     mesh.castShadow = true; mesh.receiveShadow = true;
     mesh.position.copy(origin); mesh.quaternion.setFromUnitVectors(FWD_Z, dir);

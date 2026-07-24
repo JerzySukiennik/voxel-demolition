@@ -49,6 +49,9 @@ export class Destruction {
     this._time = 0;
     // Only these collider handles (player, vehicle) may trigger contact-based detach.
     this.allowedImpactors = new Set();
+    // Subset of allowedImpactors that ram "cardboard": vehicles + Car Cannon. They get a big force
+    // multiplier + a radial punch so a car plows through buildings. The player stays OUT of this set.
+    this.heavyImpactors = new Set();
     this.stats = {
       chunks: 0, chunksGrid: 0, chunksStructure: 0,
       collidersCuboid: 0, collidersHull: 0,
@@ -56,8 +59,8 @@ export class Destruction {
     };
   }
 
-  registerImpactor(handle) { this.allowedImpactors.add(handle); }
-  unregisterImpactor(handle) { this.allowedImpactors.delete(handle); }
+  registerImpactor(handle, heavy = false) { this.allowedImpactors.add(handle); if (heavy) this.heavyImpactors.add(handle); }
+  unregisterImpactor(handle) { this.allowedImpactors.delete(handle); this.heavyImpactors.delete(handle); }
 
   addVolume(spec) {
     const volIndex = this.volumes.length; // volume identity = index in build order (brief §2)
@@ -107,11 +110,15 @@ export class Destruction {
       if (!hit) return;
       if (!this.allowedImpactors.has(otherHandle)) return;
       const chunk = hit.chunk;
-      if (f < chunk.threshold) return;
+      // Vehicles (heavy) ram like cardboard: boosted force clears any material; the player stays at full
+      // material threshold so walking into a wall never breaks it.
+      const heavy = this.heavyImpactors.has(otherHandle);
+      const eff = heavy ? f * D.vehicleImpactForceMult : f;
+      if (eff < chunk.threshold) return;
       const gid = hit.volume.id + ":" + chunk.id;
       if (seen.has(gid)) return;
       seen.add(gid);
-      this._detachQueue.push({ volume: hit.volume, chunk, force: f, otherHandle, ring: f >= chunk.threshold * D.neighborDetachMultiplier });
+      this._detachQueue.push({ volume: hit.volume, chunk, force: eff, otherHandle, heavy, ring: eff >= chunk.threshold * D.neighborDetachMultiplier });
     });
 
     const impacts = [];
@@ -120,11 +127,39 @@ export class Destruction {
       const dir = dirTo(other, req.chunk.centroid);
       this._detach(req.volume, req.chunk, dir, req.force);
       impacts.push(req.force);
-      if (req.ring) this._detachRing(req.volume, req.chunk, req.force, seen);
+      if (req.heavy) this._vehiclePunch(req.chunk.centroid, D.vehiclePunchRadius, req.force, seen);
+      else if (req.ring) this._detachRing(req.volume, req.chunk, req.force, seen);
     }
     this._detachQueue.length = 0;
     this._flushDetach();
     return impacts;
+  }
+
+  // Vehicle ram: detach every active chunk within `radius` of the contact (across volumes), bypassing
+  // per-material thresholds so a car punches a car-sized tunnel and keeps its momentum. Deduped via `seen`,
+  // capped by vehiclePunchBudget. Only ever reached from a heavy (vehicle) contact -> never a debris cascade.
+  _vehiclePunch(center, radius, force, seen) {
+    const r2 = radius * radius;
+    let budget = D.vehiclePunchBudget;
+    for (const vol of this.volumes) {
+      if (budget <= 0) break;
+      const [nx, ny, nz] = vol.dims;
+      const [ox, oy, oz] = vol.origin;
+      const vs = vol.vs;
+      if (center.x < ox - radius || center.x > ox + nx * vs + radius) continue;
+      if (center.y < oy - radius || center.y > oy + ny * vs + radius) continue;
+      if (center.z < oz - radius || center.z > oz + nz * vs + radius) continue;
+      for (const chunk of vol.chunks) {
+        if (budget <= 0) break;
+        if (!chunk.active) continue;
+        if (chunk.centroid.distanceToSquared(center) > r2) continue;
+        const gid = vol.id + ":" + chunk.id;
+        if (seen.has(gid)) continue;
+        seen.add(gid);
+        this._detach(vol, chunk, dirTo(center, chunk.centroid), force * 0.5);
+        budget--;
+      }
+    }
   }
 
   _detachRing(vol, chunk, force, seen) {
@@ -1053,7 +1088,9 @@ function createChunkBody(vol, chunk, mgr, opts = {}) {
   const applyProps = (cd) => cd
     .setDensity(spec.density).setFriction(D.friction).setRestitution(D.restitution)
     .setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS)
-    .setContactForceEventThreshold(spec.threshold);
+    // Fire events down to a low floor so slower vehicle rams still register; the actual detach is gated
+    // per-impactor in drainContacts (vehicles = fragile, player = full material threshold).
+    .setContactForceEventThreshold(Math.min(spec.threshold, D.vehicleEventFloor));
 
   let collider = null;
   let usedHull = false;

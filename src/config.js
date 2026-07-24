@@ -72,6 +72,13 @@ export const CONFIG = {
     fadeSeconds: 0.3,
     detachKick: 0.5,
     neighborDetachMultiplier: 2.0,
+    // Vehicle ramming feel: buildings should be very fragile to vehicles (drive through a house or two on
+    // the loose) WITHOUT changing weapon or on-foot-player balance. Only handles tagged `heavy` (vehicles +
+    // Car Cannon) get these; the player capsule stays a normal impactor so walking never breaks walls.
+    vehicleEventFloor: 1500,        // chunk colliders fire contact events down to this force (so slower rams still register); still gated per-impactor in code
+    vehicleImpactForceMult: 8,      // heavy-impactor contact force is multiplied before the threshold gate — vehicles clear any material easily
+    vehiclePunchRadius: 1.9,        // each vehicle contact carves this radius of chunks -> a car-sized tunnel, so the car plows through instead of stalling
+    vehiclePunchBudget: 48,         // max chunks detached per punch (perf cap)
     // Phase 1 props (skin/wall/crate/shed) unchanged. Phase 4 map materials appended (brief section 4).
     // Phase 7 batch D: `foam` = the constructive-voxel material sprayed by the Foam Cannon — light density,
     // low-ish threshold so every weapon breaks it through the normal pipeline, yet high enough to stand/drive on.

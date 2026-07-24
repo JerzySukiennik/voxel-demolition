@@ -47,7 +47,7 @@ export class VehicleManager {
     v.water = this.water;
     for (const h of v.colliderHandles) {
       this.byHandle.set(h, v);
-      this.destruction.registerImpactor(h);
+      this.destruction.registerImpactor(h, true); // heavy: vehicles ram buildings like cardboard
     }
     this.all.push(v);
     return v;
