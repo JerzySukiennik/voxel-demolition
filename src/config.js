@@ -253,11 +253,53 @@ export const CONFIG = {
       fireInterval: 1.2, maxLive: 2,
     },
 
+    // ---- Phase 7 batch B: category 5 "Grab & Force" (force-field / grab tools) ---------------
+    // Cycle order (DoD layout table): Gravity Gun -> Magnet Gun -> Grapple Hook -> Wind Cannon -> Debris Vacuum.
+    // Hard rule: NONE of these ever adds a handle to allowedImpactors, so thrown/blown/vacuumed/magnetized
+    // debris still cannot cascade a detach. Wind/vacuum/magnet call NO damage function at all; the gravity
+    // gun only throws (ordinary physics); grapple's ONLY damage path is the vehicle-rope tension tear.
+
+    // 5d. Wind Cannon — one-shot cone impulse to all dynamic bodies, zero destruction, 1/dist falloff.
+    // Mass-capped so light debris is shoved (<= maxDV m/s) while heavy chunks only nudge — reads as wind.
+    windCannon: {
+      range: 10, halfAngleDeg: 32, impulse: 9000, maxDV: 9,
+      vehicleFactor: 0.25, cooldown: 0.7,
+      dust: { count: 10, life: 0.5, size: 0.5, spread: 0.9, speed: 7 },
+    },
+    // 5e. Debris Vacuum — hold LMB, cone velocity-steer on destruction.debris toward the muzzle, consume < 1.1 m.
+    // Also a performance tool: consumeDebris permanently frees entries against the 200 cap.
+    vacuum: {
+      range: 9, halfAngleDeg: 34, suckSpeed: 10, steer: 5, consumeDist: 1.1, shrinkFrom: 2.3,
+    },
+    // 5c-var. Magnet Gun — narrow metal-only force field. Hold LMB attract / hold RMB repel, 10 nearest, no carry.
+    magnet: {
+      range: 12, halfAngleDeg: 26, pullSpeed: 9, steer: 4, maxTargets: 10, clampDist: 1.5, massMax: 1600,
+    },
+    // 5a. Gravity Gun — hold LMB grabs ONE dynamic body; critically-damped spring to a hold-point 2.5 m ahead.
+    // Force clamped by mass (maxAccel), angular vel damped, auto-release when wedged; RMB throws along aim.
+    gravityGun: {
+      grabRange: 30, holdDist: 2.5, springK: 90, dampRatio: 1.0, maxAccel: 70, angularDamp: 10,
+      releaseDist: 4.5, releaseTime: 0.4, massMax: 1600, throwSpeed: 24, strainTime: 0.3,
+    },
+    // 5c. Grapple Hook — one rope at a time. On foot: manual distance-constraint spring on the capsule (player.js
+    // grappleConstraint hook) + reel; in a vehicle: real Rapier spring joint chunk<->chassis, tension tears the chunk.
+    grapple: {
+      range: 60, hookSpeed: 90, segments: 16, thickness: 0.02,
+      pullK: 55, pullDamp: 9, minLen: 2.0, reelRate: 6.0,
+      veh: { spring: 24000, damp: 1400, restSlack: 0.92, maxLen: 24, tearTension: 8000, snapTension: 70000, tearForce: 18000 },
+    },
+
     viewmodel: {
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
       sledgeOffset: { x: 0.18, y: -0.30, z: -0.5 },
       crowbarOffset: { x: 0.20, y: -0.28, z: -0.5 },
       chainsawOffset: { x: 0.22, y: -0.30, z: -0.42 },
+      // Grab & Force family: emitter devices held slightly lower/forward so the muzzle reads.
+      gravityOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      magnetOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      grappleOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      windOffset: { x: 0.24, y: -0.28, z: -0.42 },
+      vacuumOffset: { x: 0.24, y: -0.28, z: -0.42 },
       armsOffset: { x: 0.16, y: -0.34, z: -0.30 },
       armsOffsetSledge: { x: 0.10, y: -0.36, z: -0.34 },
       inwardYaw: -0.08,

@@ -17,6 +17,11 @@ export class Player {
     this.faceYaw = 0;
     this._armsHidden = false;
     this.water = null; // map water body (set by loader); wading slows movement and disables jump
+    // Phase 7 Grapple Hook (on foot): weapons.js installs a distance-constraint callback here. It runs at
+    // the fixed physics rate (once per substep, BEFORE setLinvel) and returns a velocity delta {x,y,z} to
+    // add — a spring pull toward the anchor when the rope is taut. Kept as a hook (not a Rapier joint) so
+    // the character controller's setLinvel doesn't fight it. MP note: this is client-predicted movement.
+    this.grappleConstraint = null;
 
     const feetY = spawn.y;
     const cy = feetY + CAP_CENTER;
@@ -116,6 +121,14 @@ export class Player {
 
     let vy = lv.y;
     if (onGround && !wading && (input.down("Space")) && vy <= 0.1) vy = P.jumpVelocity;
+
+    // Grapple distance-constraint: a taut rope adds a spring pull toward the anchor. Applied here (post
+    // movement-integration, pre-setLinvel) so it composes with WASD instead of being overwritten by it.
+    if (this.grappleConstraint) {
+      const d = this.grappleConstraint(this.body.translation(), { x: cur.x, y: vy, z: cur.z }, dt);
+      if (d) { cur.x += d.x; vy += d.y; cur.z += d.z; }
+    }
+
     this.body.setLinvel({ x: cur.x, y: vy, z: cur.z }, true);
   }
 

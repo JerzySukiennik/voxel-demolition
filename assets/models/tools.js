@@ -308,6 +308,145 @@ const clusterBomb = {
   anchors: {},
 };
 
+// ============================ Phase 7 batch B held-models (Grab & Force) ======================
+// Shared visual language: a compact "device with a business-end emitter" running +Z, a grip below.
+const lightBlue = { color: "#7fb4d8", roughness: 0.5, metalness: 0.1 };
+const purple = { color: "#7a5bd0", roughness: 0.45, metalness: 0.15 };
+
+// --- 5a. Gravity Gun: dark body, glowing purple core, splayed claw prongs at the mouth (HL-ish) ---
+const GGX = 6, GGY = 9, GGZ = 18;
+const gravitygun = {
+  name: "gravitygun", voxelSize: 0.055, palette: [darkSteel, purple, steel],
+  parts: [{
+    name: "main", size: [GGX, GGY, GGZ], originOffset: [0, 0, 0],
+    pivot: [GGX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(GGX, GGY, GGZ, (x, y, z) => {
+      const cx = 2.5, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // main body block
+      if (z >= 3 && z <= 12 && r2 <= 2.6 * 2.6) return (r2 >= 2.0 * 2.0 ? 3 : 1);
+      // glowing core in the mouth
+      if (z >= 12 && z <= 14 && r2 <= 1.2 * 1.2) return 2;
+      // four splayed claw prongs reaching forward from the corners
+      if (z >= 12 && z <= 17) {
+        if ((x === 0 || x === GGX - 1) && (y === 2 || y === 6)) return 1;
+        if ((y === 1 || y === GGY - 1) && (x === 1 || x === 4)) return 1;
+      }
+      // grip
+      if ((x === 2 || x === 3) && y <= 1 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 5b. Magnet Gun: steel body + a red horseshoe magnet (two prongs, gap) with steel tips at the front ---
+const MGX = 6, MGY = 9, MGZ = 16;
+const magnetgun = {
+  name: "magnetgun", voxelSize: 0.055, palette: [steel, red, darkSteel],
+  parts: [{
+    name: "main", size: [MGX, MGY, MGZ], originOffset: [0, 0, 0],
+    pivot: [MGX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(MGX, MGY, MGZ, (x, y, z) => {
+      const cx = 2.5, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // body
+      if (z >= 3 && z <= 9 && r2 <= 2.4 * 2.4) return 1;
+      // horseshoe: two red prongs (upper + lower) with a gap, tips capped steel
+      if (z >= 9 && z <= 15) {
+        const upper = (y >= 6 && y <= 7) && x >= 1 && x <= 4;
+        const lower = (y >= 1 && y <= 2) && x >= 1 && x <= 4;
+        if (upper || lower) return (z >= 14 ? 1 : 2);
+        // yoke joining the prongs at the base
+        if (z === 9 && y >= 1 && y <= 7 && (x === 1 || x === 4)) return 2;
+      }
+      // grip
+      if ((x === 2 || x === 3) && y <= 0 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 5c. Grapple Hook: dark launcher tube +Z with a steel harpoon point out front, reel drum below ---
+const GPX = 5, GPY = 9, GPZ = 20;
+const grapplegun = {
+  name: "grapplegun", voxelSize: 0.055, palette: [darkSteel, steel, gray],
+  parts: [{
+    name: "main", size: [GPX, GPY, GPZ], originOffset: [0, 0, 0],
+    pivot: [GPX * 0.055 / 2, 3 * 0.055, 6 * 0.055],
+    data: vol(GPX, GPY, GPZ, (x, y, z) => {
+      const cx = 2, cy = 5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // launcher tube (upper), hollow muzzle at the front
+      if (z >= 5 && z <= 15 && r2 <= 2.1 * 2.1) return (z >= 13 && r2 >= 1.1 * 1.1 ? 1 : (z >= 13 ? 0 : 1));
+      // harpoon point sticking out the front, tapering to a tip
+      if (z >= 15 && z <= 18 && y === 5) { const w = 18 - z; if (Math.abs(x - cx) <= w) return 2; }
+      if (z === 15 && y >= 4 && y <= 6 && x === cx) return 2; // barb base
+      // reel drum below/behind the tube
+      const dcx = 2, dcy = 2.5;
+      const dr2 = (x - dcx) * (x - dcx) + (y - dcy) * (y - dcy);
+      if (z >= 4 && z <= 9 && dr2 <= 2.2 * 2.2) return 3;
+      // grip
+      if ((x === 1 || x === 3) && y <= 1 && z >= 3 && z <= 5) return 1;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 5d. Wind Cannon: gray body flaring into a wide light-blue funnel mouth at the front ---
+const WCX = 8, WCY = 8, WCZ = 17;
+const windcannon = {
+  name: "windcannon", voxelSize: 0.055, palette: [gray, lightBlue, darkSteel],
+  parts: [{
+    name: "main", size: [WCX, WCY, WCZ], originOffset: [0, 0, 0],
+    pivot: [WCX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(WCX, WCY, WCZ, (x, y, z) => {
+      const cx = 3.5, cy = 3.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // narrow body at the back
+      if (z >= 2 && z <= 9 && r2 <= 2.0 * 2.0) return 1;
+      // flaring funnel: radius grows toward the front, hollow bore
+      if (z >= 9) {
+        const rad = 2.0 + (z - 9) * 0.35;
+        if (r2 <= rad * rad) return (r2 >= (rad - 1.0) * (rad - 1.0) ? 2 : 0);
+      }
+      // breech ring
+      if (z <= 1 && r2 <= 2.0 * 2.0) return 3;
+      // grip
+      if ((x === 3 || x === 4) && y <= 0 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 5e. Debris Vacuum: gray canister with an orange nozzle tapering at the front, grip below ---
+const VCX = 6, VCY = 9, VCZ = 18;
+const vacuum = {
+  name: "vacuum", voxelSize: 0.055, palette: [gray, orange, darkSteel],
+  parts: [{
+    name: "main", size: [VCX, VCY, VCZ], originOffset: [0, 0, 0],
+    pivot: [VCX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(VCX, VCY, VCZ, (x, y, z) => {
+      const cx = 2.5, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // fat canister body at the back
+      if (z >= 2 && z <= 10 && r2 <= 2.7 * 2.7) return (r2 >= 2.1 * 2.1 ? 3 : 1);
+      // nozzle: radius shrinks toward the front, hollow intake
+      if (z >= 10) {
+        const rad = 2.4 - (z - 10) * 0.22;
+        if (r2 <= rad * rad) return (r2 >= (rad - 0.9) * (rad - 0.9) ? 2 : 0);
+      }
+      // grip
+      if ((x === 2 || x === 3) && y <= 0 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
 // --- First-person arms: two forearm+hand columns straddling the grip; skin hands (+Z front), orange sleeves behind. Palette matches character.js. ---
 const skinTone = { color: "#c9986b", roughness: 0.9, metalness: 0.0 };
 const sleeve = { color: "#d6702a", roughness: 0.9, metalness: 0.0 };
@@ -337,4 +476,6 @@ export default {
   sledgehammer, c4, shotgun, rocketLauncher, rocket, arms,
   // Phase 7 batch A
   crowbar, chainsaw, pipebomb, demowire, stickylauncher, clusterlauncher, clusterBomb,
+  // Phase 7 batch B (Grab & Force)
+  gravitygun, magnetgun, grapplegun, windcannon, vacuum,
 };

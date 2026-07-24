@@ -12,6 +12,7 @@ export class Input {
     this._lmbQueued = false;
     this._rmbQueued = false;
     this.lmbDown = false;
+    this.rmbDown = false; // held RMB state (Phase 7 Magnet Gun repel needs a continuous button, not just an edge)
     this.wheelDelta = 0;
 
     window.addEventListener("keydown", (e) => {
@@ -33,10 +34,11 @@ export class Input {
     document.addEventListener("mousedown", (e) => {
       if (!this.locked) return;
       if (e.button === 0) { this._lmbQueued = true; this.lmbDown = true; }
-      else if (e.button === 2) { this._rmbQueued = true; }
+      else if (e.button === 2) { this._rmbQueued = true; this.rmbDown = true; }
     });
     document.addEventListener("mouseup", (e) => {
       if (e.button === 0) this.lmbDown = false;
+      else if (e.button === 2) this.rmbDown = false;
     });
     document.addEventListener("contextmenu", (e) => e.preventDefault());
     document.addEventListener("wheel", (e) => {
@@ -48,7 +50,7 @@ export class Input {
     document.addEventListener("pointerlockchange", () => {
       this.locked = document.pointerLockElement === this.canvas;
     });
-    window.addEventListener("blur", () => { this.keys.clear(); this.lmbDown = false; });
+    window.addEventListener("blur", () => { this.keys.clear(); this.lmbDown = false; this.rmbDown = false; });
   }
 
   requestLock() {

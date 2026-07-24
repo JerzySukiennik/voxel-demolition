@@ -34,6 +34,18 @@ const FILES = {
   stickSplat: ["stick_splat.ogg"],
   clusterPop: ["cluster_pop.ogg"],
   clusterCrump: ["cluster_crump.ogg"],
+  // ---- Phase 7 batch B: Grab & Force (all CC0 Kenney, see CREDITS.md) ----
+  windWhoomp: ["wind_whoomp.ogg"],
+  vacuumLoop: ["vacuum_loop.ogg"],
+  vacuumThup: ["vacuum_thup.ogg"],
+  magnetAttract: ["magnet_attract.ogg"],
+  magnetRepel: ["magnet_repel.ogg"],
+  gravityHum: ["gravity_hum.ogg"],
+  gravityThrow: ["gravity_throw.ogg"],
+  grappleLaunch: ["grapple_launch.ogg"],
+  grappleAnchor: ["grapple_anchor.ogg"],
+  grappleReel: ["grapple_reel.ogg"],
+  grappleSnap: ["grapple_snap.ogg"],
 };
 
 export class GameAudio {
@@ -252,5 +264,54 @@ export class GameAudio {
   clusterCrump(dist) {
     const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.2)));
     this._play("clusterCrump", { gain: A.explosionGain * 0.6 * atten, rate: 0.95 + Math.random() * 0.15 });
+  }
+
+  // ---- Phase 7 batch B: Grab & Force ---------------------------------------------------------
+  // Generic managed looping source (one per category, gain 0 until driven), built lazily post-decode.
+  // Same pattern as the chainsaw/fuse loops; used by the vacuum motor, magnet hums and grapple reel.
+  _getLoop(cat) {
+    if (!this._mloops) this._mloops = {};
+    if (cat in this._mloops) return this._mloops[cat];
+    const bufs = this.buffers[cat];
+    if (!this.ready || !bufs || !bufs.length) { this._mloops[cat] = null; return null; }
+    const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
+    const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
+    const l = { gain, src }; this._mloops[cat] = l; return l;
+  }
+  _setLoop(cat, target, tc = 0.05) {
+    if (!this.ready) return;
+    const l = this._getLoop(cat);
+    if (!l) return;
+    l.gain.gain.setTargetAtTime(target, this.ctx.currentTime, tc);
+  }
+
+  windWhoomp() { this._play("windWhoomp", { gain: 0.6, rate: 0.9 + Math.random() * 0.15 }); }
+  // Debris Vacuum motor loop (on while holding LMB) + rate-limited low-gain consume "thup".
+  vacuum(active) { this._setLoop("vacuumLoop", active ? 0.3 : 0); }
+  vacuumThup(dist) {
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    if (this._lastThup && now - this._lastThup < 0.1) return; // rate-limit ~10/s
+    this._lastThup = now;
+    const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("vacuumThup", { gain: 0.28 * atten, rate: this._jitter() });
+  }
+  // Magnet hums: distinct attract vs. repel loop; mode = "attract" | "repel" | null.
+  magnet(mode) {
+    this._setLoop("magnetAttract", mode === "attract" ? 0.32 : 0);
+    this._setLoop("magnetRepel", mode === "repel" ? 0.32 : 0);
+  }
+  // Gravity Gun grab hum (on while a body is held) + throw whump (a short slice of the thruster file).
+  gravityHum(active) { this._setLoop("gravityHum", active ? 0.28 : 0); }
+  gravityThrow() { this._play("gravityThrow", { gain: 0.5, rate: 1.1, offset: 0, duration: 0.5 }); }
+  // Grapple: launch pop, metallic anchor hit, reel loop (on while reeling), rope snap.
+  grappleLaunch() { this._play("grappleLaunch", { gain: 0.5, rate: this._jitter() }); }
+  grappleAnchor(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
+    this._play("grappleAnchor", { gain: 0.55 * atten, rate: this._jitter() });
+  }
+  grappleReel(active) { this._setLoop("grappleReel", active ? 0.3 : 0); }
+  grappleSnap(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
+    this._play("grappleSnap", { gain: 0.6 * atten, rate: this._jitter() });
   }
 }

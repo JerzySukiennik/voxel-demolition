@@ -132,6 +132,37 @@ export class Destruction {
 
   hasChunk(colliderHandle) { return this.registry.has(colliderHandle); }
 
+  // ---- Public debris accessors (Phase 7 batch B Grab & Force tools) ----------------------------
+  // These let weapons.js query and consume debris WITHOUT reaching into private fade/interp state, and
+  // they never touch allowedImpactors, so the no-cascade rule is preserved by construction.
+
+  // Iterate live (non-fading) debris entries. Each entry exposes { vol, chunk, mesh, body }.
+  forEachDebris(cb) { for (const d of this.debris) { if (!d.fading) cb(d); } }
+
+  // Live-debris count (Debris Vacuum verification: the count actually drops as debris is consumed).
+  liveDebrisCount() { let n = 0; for (const d of this.debris) if (!d.fading) n++; return n; }
+
+  // Resolve a raycast collider handle to its live debris entry, or null if the handle is an attached
+  // (fixed) chunk / not debris. Used by the Gravity Gun to grab a specific detached chunk.
+  findDebrisByCollider(handle) {
+    const r = this.registry.get(handle);
+    if (!r || r.chunk.active) return null; // active === still attached to the structure, not debris
+    for (const d of this.debris) if (!d.fading && d.chunk === r.chunk) return d;
+    return null;
+  }
+
+  // Debris Vacuum consume: permanently dispose one debris entry (body + mesh + registry), freeing it
+  // against the 200 cap. Mirrors the headless cull path, incl. the server debris_rm broadcast hook.
+  consumeDebris(entry) {
+    const i = this.debris.indexOf(entry);
+    if (i < 0) return false;
+    this._removeDebrisBody(entry);
+    this.debris.splice(i, 1);
+    this._replicaIndex = null; // invalidate the replica lookup cache
+    if (this.onDebrisRemove && entry.vol && entry.chunk) this.onDebrisRemove([[entry.vol.id, entry.chunk.id]]);
+    return true;
+  }
+
   // Per-material multiplier lookup (subsystem A.1). opts.mult is an optional {materialClass: factor} table;
   // absent/unknown class => 1.0, so every legacy caller is byte-identical.
   _multFor(vol, opts) {

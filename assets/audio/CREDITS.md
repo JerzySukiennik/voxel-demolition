@@ -38,6 +38,17 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
 | stick_splat.ogg | slime_000.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | cluster_pop.ogg | impactGeneric_light_000.ogg | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | cluster_crump.ogg | explosionCrunch_002.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| wind_whoomp.ogg | lowFrequency_explosion_001.ogg | Kenney — Sci-Fi Sounds — https://kenney.nl/assets/sci-fi-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| vacuum_loop.ogg | spaceEngineSmall_001.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| vacuum_thup.ogg | drop_002.ogg | Kenney — Interface Sounds — https://kenney.nl/assets/interface-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| magnet_attract.ogg | forceField_002.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| magnet_repel.ogg | forceField_003.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| gravity_hum.ogg | spaceEngineLow_000.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| gravity_throw.ogg | thrusterFire_004.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| grapple_launch.ogg | laserSmall_003.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| grapple_anchor.ogg | impactMetal_002.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| grapple_reel.ogg | spaceEngineSmall_003.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| grapple_snap.ogg | impactMetal_004.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 
 ## Runtime usage notes
 - Phase 3 vehicle loops: `rotor_loop.ogg` (helicopter), `plane_loop.ogg` (airplane),
@@ -52,6 +63,11 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
   because they loop cleanly (same family as the proven vehicle loops). Reused for batch A (no new file):
   `explosion_*` (pipe/sticky/wire detonations), `c4_place.ogg` (wire placement click),
   `detonate_beep.ogg` (sticky arm blip via the existing beep path).
+- Phase 7 batch B loops: `vacuum_loop.ogg`, `gravity_hum.ogg` and `grapple_reel.ogg` are dedicated
+  looped sources (managed like the chainsaw loops) — on only while the vacuum holds / a body is grabbed /
+  the grapple reels. `magnet_attract.ogg` + `magnet_repel.ogg` are two DISTINCT force-field files (no
+  pitch-shift synthesis) for the attract vs. repel hum. `wind_whoomp.ogg` is a deep one-shot air blast,
+  `gravity_throw.ogg` a ~0.5 s thruster slice, and grapple's launch/anchor/snap are one-shots.
 - `rocket_launch.ogg` (a 5 s thruster loop) is played as a ~0.6 s slice for the launch whoosh.
 - `gunshot.wav` is a single double-barrel trigger blast, pitched down slightly for body.
 - `engine_loop.ogg` is looped with `playbackRate` driven by wheel speed.

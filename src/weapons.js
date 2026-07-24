@@ -20,6 +20,35 @@ const FX = W.fx;
 const UP = new THREE.Vector3(0, 1, 0);
 const FWD_Z = new THREE.Vector3(0, 0, 1);
 
+// Self-contained Gravity-Gun hold step (Phase 7 §5a). ***MP-CRITICAL: this function depends ONLY on its
+// arguments — no `this`, no scene, no globals — so Phase 6 can relocate it verbatim to the server, which
+// owns the spring simulation while the client only sends grab/aim/release/throw intents.***
+// It keeps the body DYNAMIC and each call applies a critically-damped spring impulse toward a hold-point
+// `cfg.holdDist` ahead of the camera (position + velocity feedback), clamps the acceleration by the body's
+// mass (force clamp), damps angular velocity, and returns false when the body can't keep up (auto-release).
+export function gravityHoldStep(camPos, aimDir, body, cfg, dt) {
+  const t = body.translation();
+  const hx = camPos.x + aimDir.x * cfg.holdDist;
+  const hy = camPos.y + aimDir.y * cfg.holdDist;
+  const hz = camPos.z + aimDir.z * cfg.holdDist;
+  const ex = hx - t.x, ey = hy - t.y, ez = hz - t.z;
+  const err = Math.sqrt(ex * ex + ey * ey + ez * ez);
+  const v = body.linvel();
+  const k = cfg.springK;
+  const c = 2 * Math.sqrt(k) * cfg.dampRatio; // critically damped at dampRatio = 1
+  let ax = k * ex - c * v.x;
+  let ay = k * ey - c * v.y + 9.81; // +g compensation so the body holds its height
+  let az = k * ez - c * v.z;
+  const amag = Math.sqrt(ax * ax + ay * ay + az * az);
+  if (amag > cfg.maxAccel) { const s = cfg.maxAccel / amag; ax *= s; ay *= s; az *= s; }
+  const mass = body.mass ? body.mass() : 1;
+  body.applyImpulse({ x: ax * mass * dt, y: ay * mass * dt, z: az * mass * dt }, true);
+  const av = body.angvel();
+  const damp = Math.exp(-cfg.angularDamp * dt);
+  body.setAngvel({ x: av.x * damp, y: av.y * damp, z: av.z * damp }, true);
+  return err <= cfg.releaseDist;
+}
+
 export class Weapons {
   // `net` is the Phase 6 NetClient handle, or null in single-player. When null every code path below is
   // byte-identical to Phase 5. When set, the weapon system routes C4/rocket lifecycle + FX through the
@@ -155,6 +184,42 @@ export class Weapons {
     this._sawTimer = 0;
     this._sawShake = 0;
 
+    // --- Phase 7 batch B: Grab & Force shared resources --------------------------------------
+    // Wind Cannon dust-puff pool: soft billboard quads that drift along the cone and fade.
+    this._dustGeo = new THREE.PlaneGeometry(1, 1);
+    this._dust = [];
+    for (let i = 0; i < W.windCannon.dust.count * 2; i++) {
+      const m = new THREE.Mesh(this._dustGeo, new THREE.MeshBasicMaterial({ color: 0xdfe8f0, transparent: true, opacity: 0.5, depthWrite: false, side: THREE.DoubleSide }));
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._dust.push({ mesh: m, life: 0, vel: new THREE.Vector3() });
+    }
+    this._dustIdx = 0;
+
+    // Grapple rope: ONE pooled straight segment strip, shared by the on-foot rope and the vehicle rope
+    // (only one is ever live at a time). Thin dark boxes lerped from muzzle/chassis to the anchor.
+    this._ropeGeo = new THREE.BoxGeometry(1, 1, 1);
+    this._ropeMat = new THREE.MeshBasicMaterial({ color: 0x23262b });
+    this._ropeSegs = [];
+    for (let i = 0; i < W.grapple.segments; i++) {
+      const m = new THREE.Mesh(this._ropeGeo, this._ropeMat);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._ropeSegs.push(m);
+    }
+
+    // Grab & Force runtime state.
+    this._gravHeld = null;       // { kind:"debris"|"vehicle", body, entry?, vehicle?, mass }
+    this._gravReleaseT = 0;      // auto-release timer (wedged target can't keep up)
+    this._strainT = 0;           // heavy-vehicle refusal shake timer
+    this._grappleHook = null;    // in-flight hook { pos, dir, traveled } before it anchors (on foot)
+    this._grappleFoot = null;    // anchored on-foot rope { anchored, anchor:Vector3, ropeLen, reeling }
+    this._grappleWheel = 0;      // scroll-to-reel, routed here by _handleSelection while a rope is out
+    this._vgrapple = null;       // vehicle rope { joint?, chunk, vol, colliderHandle, localA, localB, restLen, torn }
+    this._vacShrunk = new Set(); // debris entries currently scaled down by the vacuum (restored on release)
+    // Feature-detect Rapier's generic spring joint (vehicle rope). Fallback = a manual spring (see report).
+    this._hasSpringJoint = !!(this.RAPIER.JointData && typeof this.RAPIER.JointData.spring === "function");
+
     // Label DOM.
     this._label = document.getElementById("tool-label");
     this._labelNum = document.getElementById("tool-label-num");
@@ -176,6 +241,12 @@ export class Weapons {
       { num: 4, catLabel: "Launchers", id: "rocketLauncher", name: "Rocket Launcher", kind: "rocket", model: toolModels.rocketLauncher, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "stickyLauncher", name: "Sticky Bomb Launcher", kind: "sticky", model: toolModels.stickylauncher, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "clusterLauncher", name: "Cluster Bomb Launcher", kind: "cluster", model: toolModels.clusterlauncher, base: VM.baseOffset },
+      // Category 5 "Grab & Force" — cycle order per the Phase 7 layout table.
+      { num: 5, catLabel: "Grab & Force", id: "gravitygun", name: "Gravity Gun", kind: "gravitygun", model: toolModels.gravitygun, base: VM.gravityOffset },
+      { num: 5, catLabel: "Grab & Force", id: "magnetgun", name: "Magnet Gun", kind: "magnet", model: toolModels.magnetgun, base: VM.magnetOffset },
+      { num: 5, catLabel: "Grab & Force", id: "grapplegun", name: "Grapple Hook", kind: "grapple", model: toolModels.grapplegun, base: VM.grappleOffset },
+      { num: 5, catLabel: "Grab & Force", id: "windcannon", name: "Wind Cannon", kind: "windcannon", model: toolModels.windcannon, base: VM.windOffset },
+      { num: 5, catLabel: "Grab & Force", id: "vacuum", name: "Debris Vacuum", kind: "vacuum", model: toolModels.vacuum, base: VM.vacuumOffset },
     ];
     const meleeKinds = new Set(["melee", "crowbar", "chainsaw"]);
     this.categories = [];
@@ -273,6 +344,7 @@ export class Weapons {
     this._tickTrail(dt);
     this._tickFlash(dt);
     this._tickTracers(dt);
+    this._tickDust(dt);
     this._decayAnim(dt);
     this._blinkCharges();
     // Shared fuse hiss loop is on whenever a fused throwable is live (survives tool-switch / driving).
@@ -285,13 +357,20 @@ export class Weapons {
       this._armsMesh.visible = false;
       this.player.setArmsHidden(false);
       this.audio.chainsaw(false, false);
-      // Drain edges so nothing fires on exit; RMB is ignored while driving.
+      // Leaving foot means any on-foot rope is gone; silence force-field loops.
+      if (this._grappleFoot || this._grappleHook) this._detachFootGrapple();
+      this._silenceGrabForceAudio();
+      // Grapple is the one tool usable while driving (the wall-tearing fantasy). No-op for any other tool.
+      this._tickVehicleGrapple(dt);
+      // Drain edges so nothing fires on exit.
       this.input.consumeDigits();
       this.input.consumeLMB();
       this.input.consumeRMB();
       this.input.consumeWheel();
       return;
     }
+    // Back on foot: drop any vehicle rope we were holding.
+    if (this._vgrapple) this._detachVehicleGrapple();
 
     this._handleSelection();
 
@@ -302,6 +381,8 @@ export class Weapons {
     const equipped = this.activeCat >= 0;
     // Chainsaw continuous hold-fire + looping audio (also keeps the loops silenced for every other tool).
     this._tickChainsaw(dt, equipped);
+    // Grab & Force category (Wind / Vacuum / Magnet / Gravity / Grapple-on-foot); manages its own loops.
+    this._tickGrabForce(dt, equipped, lmb, rmb);
     // Demolition-wire line visuals follow their (possibly vehicle-parented) charges every frame.
     if (this.wireCharges.length) this._rebuildWireLines();
 
@@ -322,6 +403,11 @@ export class Weapons {
     }
     const w = this.input.consumeWheel();
     if (w !== 0 && this.activeCat >= 0) {
+      // While an on-foot grapple rope is anchored, the wheel reels the rope instead of cycling tools.
+      if (this._activeItem().kind === "grapple" && this._grappleFoot) {
+        if (w < 0) this._grappleWheel += 1; // scroll up = reel in
+        return;
+      }
       const len = this.categories[this.activeCat].items.length;
       this.activeItem = ((this.activeItem + w) % len + len) % len;
       this._equip();
@@ -361,6 +447,8 @@ export class Weapons {
       case "rocket": if (lmb) this._fireRocket(item); break;
       case "sticky": if (lmb) this._fireSticky(item); break;
       case "cluster": if (lmb) this._fireCluster(item); break;
+      case "windcannon": if (lmb) this._fireWind(item); break;
+      // Vacuum / Magnet / Gravity / Grapple are continuous or hold-based — handled in _tickGrabForce.
     }
   }
 
@@ -575,6 +663,13 @@ export class Weapons {
     for (const c of this.clusters) this._clearCluster(c);
     this.clusters.length = 0;
     this.audio.fuse(false);
+    // Phase 7 batch B: drop any grab/rope state and hide their pooled visuals.
+    this._releaseGrav();
+    this._detachFootGrapple();
+    this._detachVehicleGrapple();
+    this._restoreShrunk();
+    for (const e of this._dust) { e.mesh.visible = false; e.life = 0; }
+    this._silenceGrabForceAudio();
   }
 
   // --- MP rocket relay hooks (called by replication.js) --------------------------------------
@@ -1085,6 +1180,429 @@ export class Weapons {
     }
   }
 
+  // ============================ Phase 7 batch B: Grab & Force ================================
+  // Shared cone query over DYNAMIC bodies (debris chunk bodies + local drivable vehicles). Foundation for
+  // Wind / Vacuum / Magnet. NEVER touches fixed chunks and never adds anyone to allowedImpactors.
+  // Returns [{ body, pos:Vector3, dist, kind:"debris"|"vehicle", entry?, vehicle? }].
+  _coneBodies(apex, dir, range, cosHalf, opts = {}) {
+    const out = [];
+    const tmp = new THREE.Vector3();
+    if (opts.debris !== false) {
+      this.destruction.forEachDebris((d) => {
+        if (opts.metalOnly && d.vol.materialClass !== "metal") return;
+        const t = d.body.translation();
+        tmp.set(t.x - apex.x, t.y - apex.y, t.z - apex.z);
+        const dist = tmp.length();
+        if (dist < 1e-3 || dist > range) return;
+        if (tmp.dot(dir) / dist < cosHalf) return;
+        out.push({ body: d.body, pos: new THREE.Vector3(t.x, t.y, t.z), dist, kind: "debris", entry: d });
+      });
+    }
+    if (opts.vehicles && this.manager && this.manager.all) {
+      for (const v of this.manager.all) {
+        if (!v.body || !v.V || typeof v.centerWorld !== "function") continue; // defensive: skip odd controllers
+        if (v === this.manager.driven) continue; // don't shove/grab the car you're driving
+        if (opts.massMax && v.V.mass > opts.massMax) continue;
+        const c = v.centerWorld();
+        tmp.set(c.x - apex.x, c.y - apex.y, c.z - apex.z);
+        const dist = tmp.length();
+        if (dist < 1e-3 || dist > range) continue;
+        if (tmp.dot(dir) / dist < cosHalf) continue;
+        out.push({ body: v.body, pos: c, dist, kind: "vehicle", vehicle: v });
+      }
+    }
+    return out;
+  }
+
+  // --- 5d. Wind Cannon: one-shot cone impulse to all dynamic bodies, ZERO destruction, 1/dist falloff ---
+  _fireWind(item) {
+    const wc = W.windCannon;
+    if (this._time - item.state.lastUse < wc.cooldown) return;
+    item.state.lastUse = this._time;
+    const dir = this._aimDir();
+    const apex = this._muzzleWorld(item);
+    const cosHalf = Math.cos((wc.halfAngleDeg * Math.PI) / 180);
+    const bodies = this._coneBodies(apex, dir, wc.range, cosHalf, { debris: true, vehicles: true });
+    for (const b of bodies) {
+      const falloff = 1 - b.dist / wc.range;
+      const mass = b.body.mass ? b.body.mass() : 1;
+      // Mass-capped impulse: light debris is shoved (<= maxDV m/s), heavy chunks only nudge — reads as wind.
+      let impMag = Math.min(wc.impulse * falloff, mass * wc.maxDV);
+      if (b.kind === "vehicle") impMag *= wc.vehicleFactor;
+      const away = b.pos.clone().sub(apex);
+      if (away.lengthSq() < 1e-6) away.copy(dir); else away.normalize();
+      b.body.applyImpulse({ x: away.x * impMag, y: away.y * impMag + impMag * 0.15, z: away.z * impMag }, true);
+    }
+    this._spawnDust(apex, dir);
+    this.audio.windWhoomp();
+    this._recoilZ += 0.12;
+    // MP note (stub): remote-player knockback + server-owned debris would travel as a "wind" impulse intent.
+  }
+
+  _spawnDust(apex, dir) {
+    const d = W.windCannon.dust;
+    for (let i = 0; i < d.count; i++) {
+      const e = this._dust[this._dustIdx];
+      this._dustIdx = (this._dustIdx + 1) % this._dust.length;
+      const along = (i / d.count) * W.windCannon.range * 0.6;
+      const off = new THREE.Vector3((Math.random() * 2 - 1) * d.spread, (Math.random() * 2 - 1) * d.spread, (Math.random() * 2 - 1) * d.spread);
+      e.mesh.position.copy(apex).addScaledVector(dir, along).add(off);
+      e.mesh.scale.setScalar(d.size * (0.6 + Math.random() * 0.8));
+      e.mesh.material.opacity = 0.5;
+      e.mesh.visible = true;
+      e.life = d.life;
+      e.vel.copy(dir).multiplyScalar(d.speed).addScaledVector(off, 0.5);
+    }
+  }
+
+  _tickDust(dt) {
+    for (const e of this._dust) {
+      if (e.life <= 0) continue;
+      e.life -= dt;
+      if (e.life <= 0) { e.mesh.visible = false; continue; }
+      e.mesh.position.addScaledVector(e.vel, dt);
+      e.vel.multiplyScalar(1 - Math.min(1, 3 * dt));
+      e.mesh.material.opacity = 0.5 * (e.life / W.windCannon.dust.life);
+      e.mesh.quaternion.copy(this.camera.quaternion); // billboard toward the viewer
+    }
+  }
+
+  // --- Grab & Force per-frame dispatcher (walk mode). Manages the category's looping audio too. ---
+  _tickGrabForce(dt, equipped, lmb, rmb) {
+    const item = equipped ? this._activeItem() : null;
+    const kind = item ? item.kind : null;
+    // Release anything owned by a tool we're no longer holding.
+    if (kind !== "gravitygun" && this._gravHeld) this._releaseGrav();
+    if (kind !== "grapple" && (this._grappleFoot || this._grappleHook)) this._detachFootGrapple();
+    if (kind !== "vacuum" && this._vacShrunk.size) this._restoreShrunk();
+
+    let magnetMode = null;
+    if (kind === "vacuum") this._tickVacuum(dt, item);
+    else if (kind === "magnet") {
+      magnetMode = this.input.lmbDown ? "attract" : (this.input.rmbDown ? "repel" : null);
+      this._tickMagnet(dt, item, magnetMode);
+    } else if (kind === "gravitygun") this._tickGravity(dt, item, rmb);
+    else if (kind === "grapple") this._tickGrappleFoot(dt, item, lmb);
+
+    // Looping audio (set explicitly every frame so switching tools silences the others).
+    this.audio.vacuum(kind === "vacuum" && this.input.lmbDown);
+    this.audio.magnet(magnetMode);
+    this.audio.gravityHum(kind === "gravitygun" && !!this._gravHeld);
+    this.audio.grappleReel(kind === "grapple" && !!(this._grappleFoot && this._grappleFoot.reeling));
+
+    if (this._strainT > 0) this._strainT = Math.max(0, this._strainT - dt);
+  }
+
+  _silenceGrabForceAudio() {
+    this.audio.vacuum(false); this.audio.magnet(null); this.audio.gravityHum(false); this.audio.grappleReel(false);
+  }
+
+  // --- 5e. Debris Vacuum: hold LMB, velocity-steer debris toward the muzzle, consume within ~1 m ---
+  _tickVacuum(dt, item) {
+    const vc = W.vacuum;
+    if (!this.input.lmbDown) { this._restoreShrunk(); return; }
+    const dir = this._aimDir();
+    const muzzle = this._muzzleWorld(item);
+    const cosHalf = Math.cos((vc.halfAngleDeg * Math.PI) / 180);
+    const bodies = this._coneBodies(muzzle, dir, vc.range, cosHalf, { debris: true });
+    const stillShrunk = new Set();
+    const consumed = [];
+    const to = new THREE.Vector3();
+    for (const b of bodies) {
+      to.set(muzzle.x - b.pos.x, muzzle.y - b.pos.y, muzzle.z - b.pos.z);
+      const dist = to.length();
+      if (dist < 1e-4) continue;
+      to.multiplyScalar(1 / dist);
+      const falloff = 1 - b.dist / vc.range;
+      const mass = b.body.mass ? b.body.mass() : 1;
+      const vel = b.body.linvel();
+      const vAlong = vel.x * to.x + vel.y * to.y + vel.z * to.z;
+      const desired = vc.suckSpeed * (0.4 + 0.6 * falloff);
+      const dv = (desired - vAlong) * Math.min(1, vc.steer * dt); // velocity-steer toward the muzzle
+      b.body.applyImpulse({ x: to.x * dv * mass, y: to.y * dv * mass, z: to.z * dv * mass }, true);
+      if (b.entry && b.entry.mesh && dist < vc.shrinkFrom) {
+        const s = THREE.MathUtils.clamp((dist - vc.consumeDist) / (vc.shrinkFrom - vc.consumeDist), 0.15, 1);
+        b.entry.mesh.scale.setScalar(s);
+        this._vacShrunk.add(b.entry); stillShrunk.add(b.entry);
+      }
+      if (dist <= vc.consumeDist) consumed.push({ entry: b.entry, dist: b.dist });
+    }
+    // Restore debris that left the shrink zone this frame.
+    for (const e of this._vacShrunk) if (!stillShrunk.has(e) && e.mesh) e.mesh.scale.setScalar(1);
+    this._vacShrunk = stillShrunk;
+    // Consume (permanent disposal via the public API — frees the 200 cap).
+    for (const c of consumed) {
+      this._vacShrunk.delete(c.entry);
+      if (this.destruction.consumeDebris(c.entry)) this.audio.vacuumThup(c.dist);
+    }
+  }
+
+  _restoreShrunk() {
+    for (const e of this._vacShrunk) if (e.mesh) e.mesh.scale.setScalar(1);
+    this._vacShrunk.clear();
+  }
+
+  // --- 5b. Magnet Gun: metal-only stateless force field. Hold LMB attract / hold RMB repel, 10 nearest ---
+  _tickMagnet(dt, item, mode) {
+    if (!mode) return;
+    const mg = W.magnet;
+    const dir = this._aimDir();
+    const muzzle = this._muzzleWorld(item);
+    const cosHalf = Math.cos((mg.halfAngleDeg * Math.PI) / 180);
+    let bodies = this._coneBodies(muzzle, dir, mg.range, cosHalf, { debris: true, metalOnly: true, vehicles: true, massMax: mg.massMax });
+    bodies.sort((a, b) => a.dist - b.dist);
+    if (bodies.length > mg.maxTargets) bodies = bodies.slice(0, mg.maxTargets);
+    const sign = mode === "attract" ? 1 : -1;
+    const to = new THREE.Vector3();
+    for (const b of bodies) {
+      to.set(muzzle.x - b.pos.x, muzzle.y - b.pos.y, muzzle.z - b.pos.z);
+      const dist = to.length();
+      if (dist < 1e-4) continue;
+      to.multiplyScalar(sign / dist); // + = toward muzzle (attract), - = away (repel)
+      const mass = b.body.mass ? b.body.mass() : 1;
+      const vel = b.body.linvel();
+      const vAlong = vel.x * to.x + vel.y * to.y + vel.z * to.z;
+      const falloff = 1 - b.dist / mg.range;
+      let desired = mg.pullSpeed * (0.4 + 0.6 * falloff);
+      if (mode === "attract" && dist < mg.clampDist) desired = 0; // soft clamp: park at the muzzle, no carry
+      const dv = (desired - vAlong) * Math.min(1, mg.steer * dt);
+      b.body.applyImpulse({ x: to.x * dv * mass, y: to.y * dv * mass, z: to.z * dv * mass }, true);
+    }
+  }
+
+  // --- 5a. Gravity Gun: hold LMB to grab one dynamic body, spring-hold ahead of camera, RMB throws ---
+  _tickGravity(dt, item, rmb) {
+    const cfg = W.gravityGun;
+    const camPos = this._camPos();
+    const aim = this._aimDir();
+    if (this.input.lmbDown && !this._gravHeld) this._acquireGrav(camPos, aim, cfg);
+    if (!this.input.lmbDown && this._gravHeld) { this._releaseGrav(); return; }
+    if (!this._gravHeld) return;
+    if (rmb) { this._throwGrav(aim); return; }
+    // Validity: dropped if a held debris entry faded/was culled, or a held vehicle despawned.
+    const h = this._gravHeld;
+    if (h.entry && (h.entry.fading || this.destruction.debris.indexOf(h.entry) < 0)) { this._releaseGrav(); return; }
+    if (h.vehicle && this.manager.all.indexOf(h.vehicle) < 0) { this._releaseGrav(); return; }
+    const keep = gravityHoldStep(camPos, aim, h.body, cfg, dt);
+    if (!keep) { this._gravReleaseT += dt; if (this._gravReleaseT > cfg.releaseTime) this._releaseGrav(); }
+    else this._gravReleaseT = 0;
+  }
+
+  _acquireGrav(camPos, aim, cfg) {
+    const ray = new this.RAPIER.Ray(camPos, aim);
+    const hit = this.world.castRay(ray, cfg.grabRange, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    const handle = hit.collider.handle;
+    const entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
+    if (entry) { this._gravHeld = { kind: "debris", body: entry.body, entry, mass: entry.body.mass ? entry.body.mass() : 1 }; this._gravReleaseT = 0; return; }
+    const veh = this.manager ? this.manager.byColliderHandle(handle) : null;
+    if (veh && veh.body && veh.V) {
+      if (veh === this.manager.driven) return;
+      if (veh.V.mass > cfg.massMax) { this._strainT = cfg.strainTime; this._recoilPitch += 0.05; return; } // heavy -> strain refusal
+      this._gravHeld = { kind: "vehicle", body: veh.body, vehicle: veh, mass: veh.V.mass }; this._gravReleaseT = 0;
+    }
+    // Ground / static / fixed chunk / player => not grabbable (no-op).
+  }
+
+  _releaseGrav() { this._gravHeld = null; this._gravReleaseT = 0; }
+
+  _throwGrav(aim) {
+    const h = this._gravHeld;
+    const mass = h.body.mass ? h.body.mass() : h.mass;
+    const speed = W.gravityGun.throwSpeed;
+    // impulse = mass * speed => a consistent launch velocity along aim regardless of the body's mass.
+    h.body.applyImpulse({ x: aim.x * speed * mass, y: (aim.y * speed + 2) * mass, z: aim.z * speed * mass }, true);
+    // No-cascade rule: thrown debris is STILL debris — never registered as an impactor, so it knocks
+    // things around by ordinary physics but can never detach a fixed chunk.
+    this.audio.gravityThrow();
+    this._recoilZ += 0.14; this._recoilPitch += 0.1;
+    this._releaseGrav();
+  }
+
+  // --- 5c. Grapple Hook (on foot): ray-stepped hook -> manual distance-constraint on the capsule + reel ---
+  _tickGrappleFoot(dt, item, lmb) {
+    const g = W.grapple;
+    if (lmb && !this._grappleHook && !this._grappleFoot) this._fireFootGrapple(item);
+    if (this._grappleHook) { this._stepHook(dt, item); return; }
+    if (this._grappleFoot) {
+      if (!this.input.lmbDown) { this._detachFootGrapple(); return; }
+      const reelIn = this.input.down("KeyW") || this._grappleWheel > 0; // scroll or hold-W = reel/zip
+      this._grappleFoot.reeling = reelIn;
+      if (reelIn) this._grappleFoot.ropeLen = Math.max(g.minLen, this._grappleFoot.ropeLen - g.reelRate * dt);
+      this._grappleWheel = 0;
+      this._drawRope(this._muzzleWorld(item), this._grappleFoot.anchor);
+    } else {
+      this._hideRope();
+    }
+  }
+
+  _fireFootGrapple(item) {
+    this._grappleHook = { pos: this._muzzleWorld(item), dir: this._aimDir(), traveled: 0 };
+    this.audio.grappleLaunch();
+    this._recoilZ += 0.06;
+  }
+
+  _stepHook(dt, item) {
+    const g = W.grapple;
+    const h = this._grappleHook;
+    const step = g.hookSpeed * dt;
+    const ray = new this.RAPIER.Ray(h.pos, h.dir);
+    const hit = this.world.castRay(ray, step, true, undefined, undefined, undefined, this.player.body);
+    if (hit) {
+      const point = h.pos.clone().addScaledVector(h.dir, hit.toi);
+      const pt = this.player.body.translation();
+      const dist = Math.hypot(point.x - pt.x, point.y - pt.y, point.z - pt.z);
+      this._anchorFoot(point, dist);
+      this._grappleHook = null;
+      return;
+    }
+    h.pos.addScaledVector(h.dir, step);
+    h.traveled += step;
+    this._drawRope(this._muzzleWorld(item), h.pos);
+    if (h.traveled > g.range) { this._grappleHook = null; this._hideRope(); } // missed
+  }
+
+  _anchorFoot(point, dist) {
+    const g = W.grapple;
+    const st = { anchored: true, anchor: point.clone(), ropeLen: Math.max(g.minLen, dist), reeling: false };
+    this._grappleFoot = st;
+    this.audio.grappleAnchor(dist);
+    // Install the player distance-constraint hook. Runs at the fixed physics rate (see player.js).
+    this.player.grappleConstraint = (t, v, dtp) => {
+      if (!st.anchored) return null;
+      const ax = st.anchor.x - t.x, ay = st.anchor.y - t.y, az = st.anchor.z - t.z;
+      const d = Math.sqrt(ax * ax + ay * ay + az * az);
+      if (d < 1e-3 || d <= st.ropeLen) return null; // slack: rope exerts no force
+      const nx = ax / d, ny = ay / d, nz = az / d;
+      const vAlong = v.x * nx + v.y * ny + v.z * nz;
+      let accel = g.pullK * (d - st.ropeLen) - g.pullDamp * vAlong;
+      if (accel < 0) accel = 0; // a rope pulls, never pushes
+      const dv = accel * dtp;
+      return { x: nx * dv, y: ny * dv, z: nz * dv };
+    };
+  }
+
+  _detachFootGrapple() {
+    this._grappleFoot = null;
+    this._grappleHook = null;
+    this.player.grappleConstraint = null;
+    this._hideRope();
+  }
+
+  _drawRope(from, to) {
+    const segs = this._ropeSegs;
+    const n = segs.length;
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), ab = new THREE.Vector3();
+    for (let i = 0; i < n; i++) {
+      a.lerpVectors(from, to, i / n);
+      b.lerpVectors(from, to, (i + 1) / n);
+      const m = segs[i];
+      ab.subVectors(b, a);
+      const len = ab.length();
+      m.position.copy(a).add(b).multiplyScalar(0.5);
+      if (len > 1e-6) m.quaternion.setFromUnitVectors(FWD_Z, ab.multiplyScalar(1 / len));
+      m.scale.set(W.grapple.thickness, W.grapple.thickness, Math.max(0.001, len));
+      m.visible = true;
+    }
+  }
+
+  _hideRope() { for (const m of this._ropeSegs) m.visible = false; }
+
+  // --- 5c. Grapple Hook (while driving): real Rapier spring joint chunk<->chassis; tension tears the chunk ---
+  // MP note: on-foot swing is client-predicted movement (same reconciliation bucket as normal movement);
+  // the vehicle rope is a server-side joint — the tear routes through the normal server-authoritative
+  // applyPointDamage path (replica forwards it as a point-dmg intent).
+  _tickVehicleGrapple(dt) {
+    if (this.activeCat < 0) { if (this._vgrapple) this._detachVehicleGrapple(); return; }
+    if (this._activeItem().kind !== "grapple") { if (this._vgrapple) this._detachVehicleGrapple(); return; }
+    const v = this.manager.driven;
+    if (!v || !v.body) { if (this._vgrapple) this._detachVehicleGrapple(); return; }
+    const fire = this.input.consumeLMB();
+    if (!this.input.lmbDown && this._vgrapple) { this._detachVehicleGrapple(); return; }
+    if (fire && !this._vgrapple) this._fireVehicleGrapple(v);
+    if (this._vgrapple) this._stepVehicleRope(dt, v);
+  }
+
+  _fireVehicleGrapple(v) {
+    const g = W.grapple.veh;
+    const chassis = v.body;
+    const cpos = v.centerWorld();
+    const aim = this._aimDir();
+    const ray = new this.RAPIER.Ray(cpos, aim);
+    const hit = this.world.castRay(ray, g.maxLen, true, undefined, undefined, undefined, chassis);
+    if (!hit) return;
+    const handle = hit.collider.handle;
+    const r = this.destruction.registry.get(handle);
+    if (!r) return; // only destructible chunks can be roped/torn (world/static/vehicle => no rope)
+    const point = cpos.clone().addScaledVector(aim, hit.toi);
+    const chunkBody = r.chunk.body;
+    const cq = v.quaternion();
+    const localA = point.clone().sub(cpos).applyQuaternion(cq.clone().invert()); // chassis-local
+    const ct = chunkBody.translation();
+    const localB = new THREE.Vector3(point.x - ct.x, point.y - ct.y, point.z - ct.z); // chunk-local
+    const restLen = Math.max(1.0, cpos.distanceTo(point) * g.restSlack);
+    let joint = null;
+    if (this._hasSpringJoint) {
+      try {
+        const jd = this.RAPIER.JointData.spring(restLen, g.spring, g.damp, localA, localB);
+        joint = this.world.createImpulseJoint(jd, chassis, chunkBody, true);
+      } catch (e) { joint = null; }
+    }
+    this._vgrapple = { joint, chunk: r.chunk, vol: r.volume, colliderHandle: handle, localA, localB, restLen, torn: !r.chunk.active };
+    this.audio.grappleLaunch();
+    this.audio.grappleAnchor(hit.toi);
+  }
+
+  _stepVehicleRope(dt, v) {
+    const g = W.grapple.veh;
+    const vg = this._vgrapple;
+    // If the torn chunk's body was disposed (cap/sleep cull), the anchor is gone — drop the rope.
+    if (vg.torn && !this.destruction.registry.has(vg.colliderHandle)) { this._detachVehicleGrapple(); return; }
+    const chunkBody = vg.chunk.body;
+    if (!chunkBody) { this._detachVehicleGrapple(); return; }
+    const cpos = v.centerWorld();
+    const cq = v.quaternion();
+    const worldA = vg.localA.clone().applyQuaternion(cq).add(cpos);
+    const ct = chunkBody.translation(), cr = chunkBody.rotation();
+    const qB = new THREE.Quaternion(cr.x, cr.y, cr.z, cr.w);
+    const worldB = vg.localB.clone().applyQuaternion(qB).add(new THREE.Vector3(ct.x, ct.y, ct.z));
+    const delta = worldB.clone().sub(worldA);
+    const dist = delta.length();
+    const tension = g.spring * Math.max(0, dist - vg.restLen); // geometric tension estimate
+    this._drawRope(worldA, worldB);
+
+    // Manual spring path (when Rapier's spring joint isn't available): pull the chassis toward the chunk;
+    // a torn (dynamic) chunk also gets pulled so it drags behind the car. A live joint does this itself.
+    if (!vg.joint && dist > 1e-3) {
+      const n = delta.multiplyScalar(1 / dist);
+      const va = v.body.linvel();
+      const vb = chunkBody.linvel ? chunkBody.linvel() : { x: 0, y: 0, z: 0 };
+      const relV = (vb.x - va.x) * n.x + (vb.y - va.y) * n.y + (vb.z - va.z) * n.z;
+      const f = g.spring * (dist - vg.restLen) - g.damp * relV;
+      if (f > 0) {
+        const imp = f * dt;
+        v.body.applyImpulse({ x: n.x * imp, y: n.y * imp, z: n.z * imp }, true);
+        if (vg.torn) chunkBody.applyImpulse({ x: -n.x * imp, y: -n.y * imp, z: -n.z * imp }, true);
+      }
+    }
+
+    // TEAR: chunk still attached + tension over threshold-scale -> rip it out (+ neighbor ring, normal path).
+    if (vg.chunk.active && tension > g.tearTension) {
+      this.destruction.applyPointDamage(vg.colliderHandle, cpos, g.tearForce);
+      vg.torn = true; // still debris — NEVER added to allowedImpactors (no-cascade rule stands)
+    }
+    // SNAP: excessive tension -> break the rope.
+    if (tension > g.snapTension) { this.audio.grappleSnap(cpos.distanceTo(worldB)); this._detachVehicleGrapple(); }
+  }
+
+  _detachVehicleGrapple() {
+    const vg = this._vgrapple;
+    if (!vg) return;
+    if (vg.joint) { try { this.world.removeImpulseJoint(vg.joint, true); } catch (e) {} }
+    this._vgrapple = null;
+    this._hideRope();
+  }
+
   // --- Viewmodel animation ---
   _decayAnim(dt) {
     const k = 1 - Math.exp(-14 * dt);
@@ -1117,6 +1635,12 @@ export class Weapons {
       rx = Math.sin(this._time * 90) * amp;
       ry = Math.sin(this._time * 77) * amp;
       rz = Math.sin(this._time * 63) * amp * 0.6;
+    }
+    // Gravity Gun heavy-vehicle refusal: a brief "strain" shake when a grab is rejected for being too heavy.
+    if (this._strainT > 0) {
+      const amp = 0.02 * (this._strainT / W.gravityGun.strainTime);
+      rx += Math.sin(this._time * 120) * amp;
+      ry += Math.sin(this._time * 101) * amp;
     }
 
     this.viewmodel.position.set(b.x + rx, b.y + equipY + bobY + ry, b.z + this._recoilZ + rz);
