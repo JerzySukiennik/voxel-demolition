@@ -46,6 +46,21 @@ const FILES = {
   grappleAnchor: ["grapple_anchor.ogg"],
   grappleReel: ["grapple_reel.ogg"],
   grappleSnap: ["grapple_snap.ogg"],
+  // ---- Phase 7 batch C: Strikes + heavy/vehicular ordnance (CC0 Kenney reuse, see CREDITS.md) ----
+  spraySound: ["spray_loop.ogg"],
+  propaneClonk: ["propane_clonk.ogg"],
+  nukeArm: ["nuke_arm.ogg"],
+  nukeKlaxon: ["nuke_klaxon.ogg"],
+  nukeBlast: ["nuke_blast.ogg"],
+  nukeRumble: ["nuke_rumble.ogg"],
+  orbitalCharge: ["orbital_charge.ogg"],
+  orbitalZap: ["orbital_zap.ogg"],
+  carWhoosh: ["carcannon_whoosh.ogg"],
+  carCrash: ["carcannon_crash.ogg"],
+  rcMotor: ["rc_motor.ogg"],
+  airPlane: ["airstrike_plane.ogg"],
+  airFlyby: ["airstrike_flyby.ogg"],
+  bombWhistle: ["bomb_whistle.ogg"],
 };
 
 export class GameAudio {
@@ -314,4 +329,38 @@ export class GameAudio {
     const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
     this._play("grappleSnap", { gain: 0.6 * atten, rate: this._jitter() });
   }
+
+  // ---- Phase 7 batch C: Strikes + heavy/vehicular ordnance -----------------------------------
+  // Blast Painter spray loop (managed, on while holding LMB); RC-car electric motor + circling plane loops.
+  blastSpray(active) { this._setLoop("spraySound", active ? 0.28 : 0); }
+  rcMotor(active) { this._setLoop("rcMotor", active ? 0.3 : 0); }
+  airPlaneLoop(active) { this._setLoop("airPlane", active ? 0.18 : 0); }
+
+  propaneClonk(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("propaneClonk", { gain: 0.6 * atten, rate: this._jitter() });
+  }
+  // Nuke: arm blip, accelerating countdown beep (reuses the confirm beep), massive layered blast + rumble
+  // tail, and a klaxon. The blast is the biggest CC0 file we have, layered with a low rumble.
+  nukeArm() { this._play("nukeArm", { gain: A.beepGain }); }
+  nukeBeep() { this._play("beep", { gain: A.beepGain, rate: 1.1 }); }
+  nukeKlaxon() { this._play("nukeKlaxon", { gain: 0.5, rate: 0.8 }); }
+  nukeBlast(dist) {
+    const atten = Math.max(0.3, Math.min(1, 1 / (1 + dist * 0.05)));
+    this._play("nukeBlast", { gain: Math.min(1, A.explosionGain * 1.4) * atten, rate: 0.8 });
+    this._play("nukeRumble", { gain: 0.6 * atten, rate: 0.8 });
+  }
+  // Orbital laser: rising charge, accelerating marker beep (reuses confirm beep), sustained beam zap.
+  orbitalCharge() { this._play("orbitalCharge", { gain: A.rocketGain, rate: 1.0, offset: 0, duration: 1.2 }); }
+  orbitalBeep() { this._play("beep", { gain: A.beepGain * 0.8, rate: 1.3 }); }
+  orbitalZap() { this._play("orbitalZap", { gain: 0.6, rate: 0.8 }); }
+  // Car Cannon: launch whoosh + heavy crash (chunk impacts also sound via the existing impact voices).
+  carCannonWhoosh() { this._play("carWhoosh", { gain: A.rocketGain, rate: 0.85, offset: 0, duration: 0.6 }); }
+  carCannonCrash(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
+    this._play("carCrash", { gain: A.explosionGain * atten, rate: 0.85 });
+  }
+  // Airstrike: attack-run flyby whoosh + falling-bomb whistle (impacts reuse the explosion voices).
+  airFlyby() { this._play("airFlyby", { gain: 0.55, rate: 0.9 }); }
+  bombWhistle() { this._play("bombWhistle", { gain: 0.5, rate: 0.8 }); }
 }

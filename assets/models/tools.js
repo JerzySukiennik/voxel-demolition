@@ -447,6 +447,201 @@ const vacuum = {
   anchors: {},
 };
 
+// ============================ Phase 7 batch C held-models (Strikes + heavy ordnance) ==========
+// Strikes (orbital + airstrike) share a "handheld designator" language; the others are distinct silhouettes.
+const yellow = { color: "#e8c020", roughness: 0.6, metalness: 0.1 };
+const white = { color: "#e9e9e2", roughness: 0.7, metalness: 0.0 };
+const green = { color: "#3f8a3a", roughness: 0.6, metalness: 0.05 };
+const propRed = { color: "#c0332a", roughness: 0.55, metalness: 0.1 };
+
+// --- 2d. Blast Painter: gray spray-gun body +Z, orange paint canister on top, dark nozzle at the front ---
+const BPX = 6, BPY = 10, BPZ = 16;
+const blastpainter = {
+  name: "blastpainter", voxelSize: 0.05, palette: [gray, orange, darkSteel],
+  parts: [{
+    name: "main", size: [BPX, BPY, BPZ], originOffset: [0, 0, 0],
+    pivot: [BPX * 0.05 / 2, 2 * 0.05, 6 * 0.05],
+    data: vol(BPX, BPY, BPZ, (x, y, z) => {
+      const cx = 2.5, cy = 3.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // spray-gun barrel body
+      if (z >= 3 && z <= 12 && r2 <= 2.3 * 2.3) return 1;
+      // dark nozzle ring at the muzzle
+      if (z >= 12 && r2 <= 2.3 * 2.3) return r2 >= 1.1 * 1.1 ? 3 : 0;
+      // orange paint canister sitting on top
+      const dcx = 2.5, dcy = 7;
+      const dr2 = (x - dcx) * (x - dcx) + (y - dcy) * (y - dcy);
+      if (z >= 4 && z <= 9 && dr2 <= 2.1 * 2.1) return 2;
+      // grip
+      if ((x === 2 || x === 3) && y <= 1 && z >= 3 && z <= 6) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 2e. Propane (held deploy device): compact red canister with a dark valve cap on top ---
+const PPX = 5, PPY = 9, PPZ = 8;
+const propane = {
+  name: "propane", voxelSize: 0.05, palette: [propRed, darkSteel, steel],
+  parts: [{
+    name: "main", size: [PPX, PPY, PPZ], originOffset: [0, 0, 0],
+    pivot: [PPX * 0.05 / 2, 2 * 0.05, PPZ * 0.05 / 2],
+    data: vol(PPX, PPY, PPZ, (x, y, z) => {
+      const cx = 2, cz = 3.5;
+      const r2 = (x - cx) * (x - cx) + (z - cz) * (z - cz);
+      if (y >= 1 && y <= 6 && r2 <= 2.1 * 2.1) return 1;   // upright cylinder body
+      if (y === 0 && r2 <= 2.1 * 2.1) return 2;            // base
+      if (y >= 7 && x >= 1 && x <= 3 && z >= 2 && z <= 5) return 2; // valve block
+      if (y === 8 && x === 2 && z >= 3 && z <= 4) return 3;         // valve nub
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- Propane tank (thrown world mesh): larger red cylinder lying along +Z with dark caps + valve ---
+const PTX = 6, PTY = 6, PTZ = 11;
+const propanetank = {
+  name: "propanetank", voxelSize: 0.075, palette: [propRed, darkSteel, steel],
+  parts: [{
+    name: "main", size: [PTX, PTY, PTZ], originOffset: [0, 0, 0],
+    pivot: [PTX * 0.075 / 2, PTY * 0.075 / 2, PTZ * 0.075 / 2],
+    data: vol(PTX, PTY, PTZ, (x, y, z) => {
+      const cx = 2.5, cy = 2.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      if (r2 > 2.7 * 2.7) {
+        // valve collar sticking out the top at the front cap
+        if (z >= PTZ - 2 && y >= 4 && x >= 2 && x <= 3) return 3;
+        return 0;
+      }
+      if (z === 0 || z === PTZ - 1) return 2; // dark end caps
+      return 1;                                // red body
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 6c. Nuke: chunky dark briefcase device with yellow hazard stripes and a red arm button on top ---
+const NKX = 9, NKY = 7, NKZ = 12;
+const nuke = {
+  name: "nuke", voxelSize: 0.05, palette: [darkSteel, yellow, red, steel],
+  parts: [{
+    name: "main", size: [NKX, NKY, NKZ], originOffset: [0, 0, 0],
+    pivot: [NKX * 0.05 / 2, 1 * 0.05, NKZ * 0.05 / 2],
+    data: vol(NKX, NKY, NKZ, (x, y, z) => {
+      // solid case body
+      if (y <= 4) {
+        const edge = x === 0 || x === NKX - 1 || z === 0 || z === NKZ - 1 || y === 0;
+        // yellow hazard stripes along the sides
+        if ((x === 0 || x === NKX - 1) && (z % 3 === 0)) return 2;
+        return edge ? 4 : 1;
+      }
+      // raised top plate + red arm button
+      if (y === 5 && x >= 1 && x <= NKX - 2 && z >= 1 && z <= NKZ - 2) return 4;
+      if (y === 6 && x >= 3 && x <= 5 && z >= 5 && z <= 7) return 3; // arm button
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 6b. Orbital Laser Designator: dark handheld unit +Z with a glowing lens eye and a top antenna ---
+const OLX = 5, OLY = 9, OLZ = 18;
+const orbital = {
+  name: "orbital", voxelSize: 0.05, palette: [darkSteel, lightBlue, steel, red],
+  parts: [{
+    name: "main", size: [OLX, OLY, OLZ], originOffset: [0, 0, 0],
+    pivot: [OLX * 0.05 / 2, 2 * 0.05, 6 * 0.05],
+    data: vol(OLX, OLY, OLZ, (x, y, z) => {
+      const cx = 2, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // designator barrel
+      if (z >= 3 && z <= 14 && r2 <= 2.0 * 2.0) return (r2 >= 1.5 * 1.5 ? 3 : 1);
+      // glowing lens eye at the front
+      if (z >= 14 && z <= 16 && r2 <= 1.3 * 1.3) return 2;
+      // top antenna
+      if (y >= 7 && y <= 8 && x === 2 && z >= 5 && z <= 6) return 3;
+      // grip
+      if ((x === 1 || x === 3) && y <= 1 && z >= 4 && z <= 7) return 1;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 6a. Airstrike Designator: olive handheld unit +Z with a small dish + amber lens (designator family) ---
+const ASX = 5, ASY = 9, ASZ = 18;
+const airstrike = {
+  name: "airstrike", voxelSize: 0.05, palette: [olive, yellow, darkSteel, oliveDark],
+  parts: [{
+    name: "main", size: [ASX, ASY, ASZ], originOffset: [0, 0, 0],
+    pivot: [ASX * 0.05 / 2, 2 * 0.05, 6 * 0.05],
+    data: vol(ASX, ASY, ASZ, (x, y, z) => {
+      const cx = 2, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // designator barrel
+      if (z >= 3 && z <= 14 && r2 <= 2.0 * 2.0) return (r2 >= 1.5 * 1.5 ? 4 : 1);
+      // amber lens at the front
+      if (z >= 14 && z <= 16 && r2 <= 1.3 * 1.3) return 2;
+      // small dish/screen on top
+      if (y >= 7 && y <= 8 && x >= 1 && x <= 3 && z >= 4 && z <= 7) return 3;
+      // grip
+      if ((x === 1 || x === 3) && y <= 1 && z >= 4 && z <= 7) return 1;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 4d. Car Cannon: absurd wide-bore cannon +Z, olive body with a huge dark muzzle ring + under-grip ---
+const CCX = 9, CCY = 9, CCZ = 20;
+const carcannon = {
+  name: "carcannon", voxelSize: 0.06, palette: [olive, darkSteel, gray],
+  parts: [{
+    name: "main", size: [CCX, CCY, CCZ], originOffset: [0, 0, 0],
+    pivot: [CCX * 0.06 / 2, 2 * 0.06, 6 * 0.06],
+    data: vol(CCX, CCY, CCZ, (x, y, z) => {
+      const cx = 4, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      const wide = 4.2 * 4.2, bore = 3.0 * 3.0;
+      // fat cannon tube
+      if (z >= 4 && z <= 15 && r2 <= wide) return 1;
+      // huge dark muzzle ring, big hollow bore
+      if (z >= 15 && r2 <= wide) return r2 >= bore ? 2 : 0;
+      // breech cap
+      if (z <= 3 && r2 <= wide) return 2;
+      // under-grip
+      if ((x === 3 || x === 5) && y <= 1 && z >= 6 && z <= 9) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 2f. RC Car Bomb (deployer handset): flat dark handset with a green screen and twin antennas ---
+const RCX = 8, RCY = 3, RCZ = 10;
+const rccar = {
+  name: "rccar", voxelSize: 0.05, palette: [darkSteel, green, gray, steel],
+  parts: [{
+    name: "main", size: [RCX, RCY, RCZ], originOffset: [0, 0, 0],
+    pivot: [RCX * 0.05 / 2, 1 * 0.05, RCZ * 0.05 / 2],
+    data: vol(RCX, RCY, RCZ, (x, y, z) => {
+      // flat handset slab
+      if (y <= 1 && x >= 0 && x <= RCX - 1 && z >= 0 && z <= RCZ - 1) {
+        if (y === 1 && x >= 2 && x <= 5 && z >= 3 && z <= 6) return 2; // green screen
+        return (x === 0 || x === RCX - 1 || z === 0 || z === RCZ - 1) ? 3 : 1;
+      }
+      // control sticks
+      if (y === 2 && (x === 1 || x === 6) && z >= 2 && z <= 3) return 4;
+      // twin antennas rising at the back
+      if (y === 2 && (x === 1 || x === 6) && z === RCZ - 1) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
 // --- First-person arms: two forearm+hand columns straddling the grip; skin hands (+Z front), orange sleeves behind. Palette matches character.js. ---
 const skinTone = { color: "#c9986b", roughness: 0.9, metalness: 0.0 };
 const sleeve = { color: "#d6702a", roughness: 0.9, metalness: 0.0 };
@@ -478,4 +673,6 @@ export default {
   crowbar, chainsaw, pipebomb, demowire, stickylauncher, clusterlauncher, clusterBomb,
   // Phase 7 batch B (Grab & Force)
   gravitygun, magnetgun, grapplegun, windcannon, vacuum,
+  // Phase 7 batch C (Strikes + heavy/vehicular ordnance)
+  blastpainter, propane, propanetank, nuke, orbital, airstrike, carcannon, rccar,
 };

@@ -350,7 +350,9 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
     const forward = rig.getForward();
     const right = rig.getRight();
     if (mode === "walk") {
-      if (menuOpen) {
+      // Freeze the character while a weapon owns an external entity (RC car / airstrike plane view) —
+      // the same accepted "character stands still" vulnerability as the RC Car Bomb / plane-cam spec.
+      if (menuOpen || (weapons.freezePlayer && weapons.freezePlayer())) {
         const lv = player.body.linvel();
         player.body.setLinvel({ x: 0, y: lv.y, z: 0 }, true);
       } else {
@@ -382,7 +384,8 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
 
     if (input.locked && !menuOpen) {
       rig.addMouseLook(input.mouseDX, input.mouseDY);
-      if (input.consumeE()) tryEnterExit();
+      // E returns control from a weapon-owned entity (RC car / airstrike plane-cam) before any vehicle enter/exit.
+      if (input.consumeE()) { if (weapons.controlsExternalEntity && weapons.controlsExternalEntity()) weapons.returnControl(); else tryEnterExit(); }
     }
 
     // MP: advance interpolation of non-driver networked vehicles before the physics step.

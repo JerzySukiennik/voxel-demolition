@@ -105,6 +105,10 @@ export const CONFIG = {
     // hatchback = exactly the Phase 1 numbers; springForceClamp pinned to keep it byte-identical.
     hatchback: { mass: 1100, engineForce: 5500, brakeForce: 8000, reverseForce: 3000, wheelRadius: 0.30, suspensionRest: 0.35, maxTravel: 0.18, springK: 24000, damperC: 3000, tireMu: 1.6, lateralGrip: 8.0, steerLow: 0.55, steerHigh: 0.18, colliderHalf: { x: 0.8, y: 0.5, z: 1.8 }, colliderCenterY: 0.65, spawnBodyY: 0.19, springForceClamp: 40000 },
 
+    // Phase 7 batch C — RC Car Bomb micro vehicle (weapon-owned; reuses the GroundVehicle controller +
+    // hatchback model). ~15 kg is unstable in Rapier, so mass 60 with nippy forces + a small collider.
+    rccar: { mass: 60, engineForce: 900, brakeForce: 700, reverseForce: 500, wheelRadius: 0.12, suspensionRest: 0.14, maxTravel: 0.08, springK: 2600, damperC: 320, tireMu: 1.7, lateralGrip: 9.0, steerLow: 0.65, steerHigh: 0.35, steerHighSpeed: 12, colliderHalf: { x: 0.30, y: 0.16, z: 0.55 }, colliderCenterY: 0.20, spawnBodyY: 0.08, audioSpeedRef: 8, springForceClamp: 3000 },
+
     buggy: { mass: 900, engineForce: 6500, brakeForce: 8000, reverseForce: 3500, wheelRadius: 0.55, suspensionRest: 0.55, maxTravel: 0.30, springK: 20000, damperC: 2500, tireMu: 1.8, lateralGrip: 7.0, steerLow: 0.60, steerHigh: 0.22, colliderHalf: { x: 1.0, y: 0.55, z: 1.6 }, colliderCenterY: 1.0, spawnBodyY: 0.30 },
     monster: { mass: 2600, engineForce: 14000, brakeForce: 18000, reverseForce: 8000, wheelRadius: 0.90, suspensionRest: 0.75, maxTravel: 0.40, springK: 57000, damperC: 7100, tireMu: 1.7, lateralGrip: 6.5, steerLow: 0.50, steerHigh: 0.20, colliderHalf: { x: 1.3, y: 0.7, z: 2.4 }, colliderCenterY: 1.9, spawnBodyY: 0.42, audioSpeedRef: 14 },
     racecar: { mass: 1000, engineForce: 8500, brakeForce: 10000, reverseForce: 3000, wheelRadius: 0.32, suspensionRest: 0.28, maxTravel: 0.12, springK: 22000, damperC: 2750, tireMu: 2.0, lateralGrip: 10.0, steerLow: 0.50, steerHigh: 0.15, steerHighSpeed: 35, colliderHalf: { x: 0.9, y: 0.35, z: 2.2 }, colliderCenterY: 0.5, spawnBodyY: 0.16 },
@@ -289,8 +293,66 @@ export const CONFIG = {
       veh: { spring: 24000, damp: 1400, restSlack: 0.92, maxLen: 24, tearTension: 8000, snapTension: 70000, tearForce: 18000 },
     },
 
+    // ---- Phase 7 batch C: Strikes (6) + heavy/vehicular ordnance ----------------------------
+    // Chain-reaction beat: a propane tank caught in a blast waits this long before its own explosion,
+    // so chains ripple one tank at a time instead of a single-frame cascade (shared by all radial damage).
+    propChainDelay: 0.09,
+
+    // 2d. Blast Painter (Explosives) — hold LMB spray-paints chunks, RMB detonatePainted them together.
+    blastPainter: {
+      range: 6, tickInterval: 0.05, maxPainted: 80, splatSize: 0.16, force: 30000,
+    },
+    // 2e. Propane Tank (Explosives) — thrown dynamic tank; explodes on shot / hard impact / blast chain.
+    propane: {
+      force: 30000, radius: 5.0, budget: 60, throwSpeed: 11, upBias: 3.0,
+      colliderRadius: 0.22, colliderHalf: 0.34, density: 240, maxLive: 8, fireInterval: 0.45,
+      impactDV: 9.0, chainR: 5.0,
+    },
+    // 6c. Nuke (Strikes) — thrown device, 5 s beep countdown, flash + shake + staged radius-18 collapse.
+    // The one huge radial job is fed ENTIRELY through the staged queue (stageChunksPerFrame) — debrisCap
+    // (200) is NEVER raised. budget Infinity => clears every threshold in radius, paced by the stage queue.
+    nuke: {
+      force: 90000, radius: 18, budget: 100000, throwSpeed: 9, upBias: 4.5,
+      countdown: 5.0, cooldown: 20, flashTime: 0.8, shakeTime: 0.9, shakeAmp: 0.28,
+      dustHeight: 26, dustRadius: 5, dustLife: 6,
+    },
+    // 6b. Orbital Laser Designator (Strikes) — marker, 3 s countdown, vertical carveCylinder hole.
+    orbital: {
+      countdown: 3.0, beamLife: 1.5, cooldown: 6, radius: 1.2, force: 60000, carveBudget: 240,
+      throughGround: 40, markerSize: 0.5, pillarHeight: 60, beamRadius: 1.2,
+    },
+    // 4d. Car Cannon (Launchers) — fires the hatchback mesh as a plain dynamic cuboid, temp-registered in
+    // allowedImpactors for its lifetime so it smashes structures via the vehicle-grade contact path.
+    carCannon: {
+      speed: 30, upBias: 4, spin: 6, lifetime: 6, cooldown: 2.0, restSpeed: 0.6, fadeTime: 0.5,
+      half: { x: 0.8, y: 0.5, z: 1.8 }, density: 300,
+    },
+    // 2f. RC Car Bomb (Explosives) — deploys a mini GroundVehicle; control transfers (chase cam), RMB/LMB
+    // detonates (C4-scale), E/detonation/flip returns control instantly.
+    rcCar: {
+      force: 40000, radius: 4.0, budget: 60, autoReturnTime: 2.0, flipDot: 0.2,
+      chaseBack: 4.5, chaseUp: 2.0, chaseLook: 0.5,
+    },
+    // 6a. Airstrike Designator (Strikes) — scripted circling plane, R cycles 3 ammo, LMB designates, RMB
+    // plane-cam view. Reuses cluster machinery (bomblets) + carveCylinder (penetrator) + camera detach.
+    airstrike: {
+      circleRadius: 46, altitude: 60, circleSpeed: 0.35, runTime: 4.0, cooldown: 1.5,
+      planeScale: 0.7, dropCount: 5, dropSpacing: 6, dropSpeed: 34,
+      bombRadius: 3.0, bombForce: 34000, bombBudget: 24,
+      penRadius: 1.5, penForce: 60000, penBudget: 120, penThrough: 30,
+      clusterSpread: 8, aimSpeed: 0.9,
+    },
+
     viewmodel: {
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
+      // Batch C held devices: painter/nuke/orbital/airstrike/carcannon/rccar/propane share the base grip.
+      blastpainterOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      propaneOffset: { x: 0.24, y: -0.30, z: -0.42 },
+      nukeOffset: { x: 0.22, y: -0.30, z: -0.40 },
+      orbitalOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      airstrikeOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      carcannonOffset: { x: 0.20, y: -0.30, z: -0.46 },
+      rccarOffset: { x: 0.24, y: -0.28, z: -0.42 },
       sledgeOffset: { x: 0.18, y: -0.30, z: -0.5 },
       crowbarOffset: { x: 0.20, y: -0.28, z: -0.5 },
       chainsawOffset: { x: 0.22, y: -0.30, z: -0.42 },

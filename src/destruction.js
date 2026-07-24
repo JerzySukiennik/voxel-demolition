@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { CONFIG } from "./config.js";
 import { buildGeometry, jitterBucket, jitteredColor } from "./voxel.js";
 import { mulberry32, volumeSeed } from "./sim/rng.js";
+import { CAPS } from "./net/protocol.js"; // server-side validation caps (Phase 7 batch C replica-intent clamps)
 
 const D = CONFIG.destruction;
 const BUCKETS = CONFIG.voxel.jitterBuckets;
@@ -39,7 +40,11 @@ export class Destruction {
     this.debris = [];          // per-mode debris entries (see _detach / applyDetach)
     this._detachQueue = [];
     this._pendingDetach = [];  // batched onDetach events for the current op
-    this._stageJobs = [];      // subsystem A.3: pending staged radial jobs, drained N chunks/frame
+    this._stageJobs = [];      // subsystem A.3: pending staged jobs (radial | list), drained N chunks/frame
+    // Phase 7 batch C: non-chunk dynamic props (propane tanks) that explode on shot/impact/chain. Each rec:
+    // { pos():Vector3, explode(), chainR, exploded, queued }. NOT in allowedImpactors (never cascades).
+    this.damageableProps = new Map(); // colliderHandle -> rec
+    this._propChain = [];      // scheduled chain-reaction explosions: [{ rec, at }] (staged 1 beat apart)
     this._time = 0;
     // Only these collider handles (player, vehicle) may trigger contact-based detach.
     this.allowedImpactors = new Set();
@@ -81,6 +86,7 @@ export class Destruction {
     this._detachQueue.length = 0;
     this._pendingDetach.length = 0;
     this._stageJobs.length = 0;
+    this._propChain.length = 0; // Phase 7 batch C: cancel any pending propane chain reactions
   }
 
   // ============================ AUTHORITATIVE PATH ============================
@@ -244,7 +250,121 @@ export class Destruction {
       count++;
     }
     this._flushDetach();
+    this._chainProps(center, radius); // Phase 7 batch C: any propane tank caught in the blast chain-reacts
     return count;
+  }
+
+  // ---- Phase 7 batch C: carve helper + painted detonation + damageable props ------------------
+
+  // carveCylinder (subsystem A.2): stepped radial damage marched along a ray, SHARING one overall budget
+  // (total detaches <= budget). Powers the Orbital Laser (vertical carve through floors) and the airstrike
+  // Penetrator (carve along the descent ray). Synchronous but budget-bounded, so a thin column stays within
+  // the per-frame cost even at full length; the wide nuke uses the staged radial queue instead. Authoritative
+  // only — replica forwards a single (clamped) radial intent and the server owns the carve. (MP stub: flagged.)
+  carveCylinder(start, dir, length, radius, forcePerStep, budget) {
+    if (this.mode === "replica") {
+      // MP stub (flagged): forward one cap-fitting radial intent; the server owns the actual carve.
+      if (this.onDamageIntent) this.onDamageIntent({ kind: "radial", p: { x: start.x, y: start.y, z: start.z }, force: Math.min(forcePerStep, CAPS.radialForceMax), radius: Math.min(radius, CAPS.radialRadiusMax) });
+      return 0;
+    }
+    const d = new THREE.Vector3(dir.x, dir.y, dir.z);
+    if (d.lengthSq() < 1e-9) return 0;
+    d.normalize();
+    const stepLen = Math.max(radius * 0.9, 0.4);
+    const steps = Math.max(1, Math.ceil(length / stepLen));
+    let remaining = budget;
+    const center = new THREE.Vector3();
+    for (let s = 0; s <= steps && remaining > 0; s++) {
+      center.set(start.x + d.x * stepLen * s, start.y + d.y * stepLen * s, start.z + d.z * stepLen * s);
+      const cands = this._radialCandidates(center, radius);
+      this._chainProps(center, radius);
+      for (const cand of cands) {
+        if (remaining <= 0) break;
+        if (!cand.chunk.active) continue; // detached by an earlier overlapping step
+        const f = forcePerStep * (1 - cand.dist / radius);
+        if (f < cand.chunk.threshold) continue;
+        this._detach(cand.vol, cand.chunk, dirTo(center, cand.chunk.centroid), f);
+        remaining--;
+      }
+    }
+    this._flushDetach();
+    return budget - remaining;
+  }
+
+  // detonatePainted (Blast Painter): direct-detach EXACTLY the given chunk ids through the normal _detach
+  // path (kick + debris + tile rebuild). `keys` is an iterable of "volId:cid" strings. Staged via the
+  // per-frame list queue when the set is large (>40) so a facade-sized blast ripples instead of popping.
+  detonatePainted(keys, forcePerChunk) {
+    if (this.mode === "replica") {
+      // MP stub (flagged): forward each painted chunk as a point-dmg intent so the server detaches it.
+      if (this.onDamageIntent) {
+        for (const key of keys) {
+          const i = key.indexOf(":"); if (i < 0) continue;
+          const vid = +key.slice(0, i), cid = +key.slice(i + 1);
+          const vol = this.volumes[vid]; const chunk = vol && vol.chunks[cid];
+          if (chunk) this.onDamageIntent({ kind: "point", vol: vid, cid, src: chunk.centroid, force: Math.min(forcePerChunk, CAPS.pointForceMax) });
+        }
+      }
+      return 0;
+    }
+    const pairs = [];
+    for (const key of keys) {
+      const i = key.indexOf(":"); if (i < 0) continue;
+      const vid = +key.slice(0, i), cid = +key.slice(i + 1);
+      const vol = this.volumes[vid]; if (!vol) continue;
+      const chunk = vol.chunks[cid];
+      if (!chunk || !chunk.active) continue;
+      pairs.push({ vol, cid, dir: this._outwardDir(vol, chunk), force: forcePerChunk });
+    }
+    if (pairs.length <= CONFIG.weapons.stageChunksPerFrame) {
+      for (const it of pairs) {
+        const ch = it.vol.chunks[it.cid];
+        if (ch && ch.active) this._detach(it.vol, ch, it.dir, it.force);
+      }
+      this._flushDetach();
+    } else {
+      this._stageJobs.push({ kind: "list", pairs, i: 0 });
+    }
+    return pairs.length;
+  }
+
+  // Outward kick direction for a painted chunk (away from its volume centre; falls back to up).
+  _outwardDir(vol, chunk) {
+    const [nx, ny, nz] = vol.dims; const [ox, oy, oz] = vol.origin; const vs = vol.vs;
+    const cx = ox + nx * vs * 0.5, cy = oy + ny * vs * 0.5, cz = oz + nz * vs * 0.5;
+    const v = new THREE.Vector3(chunk.centroid.x - cx, chunk.centroid.y - cy, chunk.centroid.z - cz);
+    if (v.lengthSq() < 1e-6) return new THREE.Vector3(0, 1, 0);
+    return v.normalize();
+  }
+
+  // Register/unregister a damageable prop (propane tank). rec must expose pos()/explode()/chainR.
+  registerDamageableProp(handle, rec) { this.damageableProps.set(handle, rec); }
+  unregisterDamageableProp(handle) { this.damageableProps.delete(handle); }
+
+  // Schedule chain-reaction explosions for any live prop within a blast radius, one beat apart so chains
+  // ripple (never a single-frame cascade). Called on every radial/carve damage. Authoritative only.
+  _chainProps(center, radius) {
+    if (this.damageableProps.size === 0) return;
+    for (const rec of this.damageableProps.values()) {
+      if (rec.exploded || rec.queued) continue;
+      const p = rec.pos();
+      if (!p) continue;
+      const dx = p.x - center.x, dy = p.y - center.y, dz = p.z - center.z;
+      const rr = radius + (rec.chainR || 0);
+      if (dx * dx + dy * dy + dz * dz <= rr * rr) {
+        rec.queued = true;
+        this._propChain.push({ rec, at: this._time + CONFIG.weapons.propChainDelay });
+      }
+    }
+  }
+
+  _drainPropChain() {
+    if (this._propChain.length === 0) return;
+    const keep = [];
+    const due = [];
+    for (const item of this._propChain) { if (this._time >= item.at) due.push(item); else keep.push(item); }
+    this._propChain = keep;
+    for (const item of due) if (!item.rec.exploded) item.rec.explode();
   }
 
   // Staged detach queue (subsystem A.3). Accepts pending radial jobs and drains at most
@@ -268,7 +388,19 @@ export class Destruction {
     let quota = CONFIG.weapons.stageChunksPerFrame;
     while (this._stageJobs.length && quota > 0) {
       const job = this._stageJobs[0];
-      if (!job.cands) job.cands = this._radialCandidates(job.center, job.radius);
+      if (job.kind === "list") {
+        // Blast-painter staged detonation: detach exactly the queued chunk ids, budget-paced per frame.
+        while (job.i < job.pairs.length && quota > 0) {
+          const it = job.pairs[job.i++];
+          const chunk = it.vol.chunks[it.cid];
+          if (!chunk || !chunk.active) continue;
+          this._detach(it.vol, chunk, it.dir, it.force);
+          quota--;
+        }
+        if (job.i >= job.pairs.length) this._stageJobs.shift();
+        continue;
+      }
+      if (!job.cands) { job.cands = this._radialCandidates(job.center, job.radius); this._chainProps(job.center, job.radius); }
       while (job.i < job.cands.length && quota > 0 && job.count < job.budget) {
         const cand = job.cands[job.i++];
         if (!cand.chunk.active) continue; // detached since the job was queued
@@ -361,6 +493,7 @@ export class Destruction {
   update(dt) {
     this._time += dt;
     if (this.mode === "replica") return this._updateReplica(dt);
+    this._drainPropChain(); // Phase 7 batch C: fire scheduled propane chain reactions (one beat apart)
     this._drainStage(); // subsystem A.3: bleed queued big-blast detaches at the per-frame budget
     const now = this._time;
     const activeCount = this.debris.filter((d) => !d.fading).length;

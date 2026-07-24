@@ -4,6 +4,9 @@ import { CONFIG } from "./config.js";
 import { decodeModel, meshModelPart } from "./voxel.js";
 import { mulberry32 } from "./sim/rng.js";
 import toolModels from "../assets/models/tools.js";
+import { GroundVehicle } from "./vehicles/ground.js";
+import { VEHICLE_SPECS } from "./vehicles/registry.js";
+import { CAPS } from "./net/protocol.js";
 
 // Build a centered voxel geometry for an in-world projectile from a tool model's "main" part.
 function centeredGeo(model) {
@@ -220,6 +223,81 @@ export class Weapons {
     // Feature-detect Rapier's generic spring joint (vehicle rope). Fallback = a manual spring (see report).
     this._hasSpringJoint = !!(this.RAPIER.JointData && typeof this.RAPIER.JointData.spring === "function");
 
+    // --- Phase 7 batch C: Strikes + heavy/vehicular ordnance shared resources ----------------
+    // Blast Painter: painted chunk set ("vol:cid") + a pool of flat "splat" quads stuck to hit surfaces.
+    this._painted = new Map();   // "vol:cid" -> { splat, born }  (Map preserves insertion order => oldest expires first)
+    this._paintTimer = 0;
+    this._splatGeo = new THREE.PlaneGeometry(1, 1);
+    this._splatMat = new THREE.MeshBasicMaterial({ color: 0xff5a2a, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide });
+    this._splatPool = [];
+    for (let i = 0; i < W.blastPainter.maxPainted; i++) {
+      const m = new THREE.Mesh(this._splatGeo, this._splatMat);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._splatPool.push({ mesh: m, used: false });
+    }
+
+    // Propane tanks: dynamic bodies registered in destruction.damageableProps (never in allowedImpactors).
+    this._propaneGeo = centeredGeo(toolModels.propanetank);
+    this.propaneTanks = [];
+
+    // Nuke: thrown device + screen-flash DOM overlay + pooled dust column + camera-shake timer.
+    this._nukeGeo = centeredGeo(toolModels.nuke);
+    this.nukes = [];             // { body, mesh, fuse, armed }
+    this._nukeArmed = false;     // one nuke armed at a time
+    this._nukeCooldownT = -1e9;
+    this._shakeT = 0; this._shakeAmp = 0;
+    this._flashDiv = document.createElement("div");
+    this._flashDiv.style.cssText = "position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:50;transition:none;";
+    document.body.appendChild(this._flashDiv);
+    this._flashT = 0; this._flashDur = 0;
+    // Dust column (pooled, simple stacked box), shown at ground zero after a nuke.
+    this._dustColMat = new THREE.MeshBasicMaterial({ color: 0x9a8f80, transparent: true, opacity: 0.5, depthWrite: false });
+    this._dustCol = new THREE.Mesh(new THREE.CylinderGeometry(W.nuke.dustRadius, W.nuke.dustRadius * 0.6, W.nuke.dustHeight, 8), this._dustColMat);
+    this._dustCol.visible = false;
+    scene.add(this._dustCol);
+    this._dustColT = 0;
+
+    // Orbital laser: one marker (quad + pillar) + one emissive beam column; timeline state.
+    this._orbMarkMat = new THREE.MeshBasicMaterial({ color: 0x9fd8ff, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide });
+    this._orbMarker = new THREE.Mesh(this._splatGeo, this._orbMarkMat);
+    this._orbMarker.rotation.x = -Math.PI / 2; this._orbMarker.visible = false; scene.add(this._orbMarker);
+    this._orbPillarMat = new THREE.MeshBasicMaterial({ color: 0x9fd8ff, transparent: true, opacity: 0.35, depthWrite: false, blending: THREE.AdditiveBlending });
+    this._orbPillar = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, W.orbital.pillarHeight, 6), this._orbPillarMat);
+    this._orbPillar.visible = false; scene.add(this._orbPillar);
+    this._orbBeamMat = new THREE.MeshBasicMaterial({ color: 0xdff2ff, transparent: true, opacity: 0.7, depthWrite: false, blending: THREE.AdditiveBlending });
+    this._orbBeam = new THREE.Mesh(new THREE.CylinderGeometry(W.orbital.beamRadius, W.orbital.beamRadius, W.orbital.pillarHeight, 10), this._orbBeamMat);
+    this._orbBeam.visible = false; scene.add(this._orbBeam);
+    this._orbital = null;        // { pos, t, phase:"count"|"beam", beamT, nextBeep, beepGap }
+    this._orbCooldownT = -1e9;
+
+    // Car Cannon: one live hatchback-mesh projectile (plain dynamic cuboid, temp-registered impactor).
+    const hbDec = decodeModel(VEHICLE_SPECS.hatchback.model);
+    this._carCannonGeo = meshModelPart(hbDec, "body");
+    this.carShots = [];          // { body, collider, mesh, age }
+    this._carCooldownT = -1e9;
+
+    // RC Car Bomb: one live mini GroundVehicle; control transfers to it (chase cam, character frozen).
+    this._rc = null;             // { veh, deployT }
+    this._rcSpec = { ...VEHICLE_SPECS.hatchback, id: "rccar", name: "RC Car", tuning: "rccar" };
+
+    // Airstrike Designator: scripted circling plane prop + 3-ammo select + one live run + plane-cam view.
+    this._planeDec = decodeModel(VEHICLE_SPECS.plane.model);
+    this._planeGeo = meshModelPart(this._planeDec, "body");
+    this._airPlane = null;       // THREE.Mesh (exists only while the designator is equipped)
+    this._airAmmo = 0;           // 0 Bombs, 1 Penetrator, 2 Cluster
+    this._airAmmoNames = ["Bombs", "Penetrator", "Cluster"];
+    this._airRun = null;         // active strike run { target, t, released, descentDir, releasePos }
+    this._airCircleT = Math.random() * Math.PI * 2;
+    this._prevR = false;
+    this._planeView = false;     // RMB plane-camera toggle
+    this._planeAim = new THREE.Vector2(0, 0); // slow aim offset while in plane view
+    this._airDropGeo = centeredGeo(toolModels.clusterBomb);
+    this._airDrops = [];         // falling ordnance meshes (ray-stepped along the descent ray)
+    this._airMarkMat = new THREE.MeshBasicMaterial({ color: 0xffcf5a, transparent: true, opacity: 0.8, depthWrite: false, side: THREE.DoubleSide });
+    this._airMarker = new THREE.Mesh(this._splatGeo, this._airMarkMat);
+    this._airMarker.rotation.x = -Math.PI / 2; this._airMarker.visible = false; scene.add(this._airMarker);
+
     // Label DOM.
     this._label = document.getElementById("tool-label");
     this._labelNum = document.getElementById("tool-label-num");
@@ -237,16 +315,25 @@ export class Weapons {
       { num: 2, catLabel: "Explosives", id: "c4", name: "C4 Charge", kind: "c4", model: toolModels.c4, base: VM.baseOffset },
       { num: 2, catLabel: "Explosives", id: "pipeBomb", name: "Pipe Bomb", kind: "pipebomb", model: toolModels.pipebomb, base: VM.baseOffset },
       { num: 2, catLabel: "Explosives", id: "demoWire", name: "Demolition Wire", kind: "demowire", model: toolModels.demowire, base: VM.baseOffset },
+      // Batch C explosives: Blast Painter -> Propane Tank -> RC Car Bomb (cycle order per layout table).
+      { num: 2, catLabel: "Explosives", id: "blastpainter", name: "Blast Painter", kind: "blastpainter", model: toolModels.blastpainter, base: VM.blastpainterOffset },
+      { num: 2, catLabel: "Explosives", id: "propane", name: "Propane Tank", kind: "propane", model: toolModels.propane, base: VM.propaneOffset },
+      { num: 2, catLabel: "Explosives", id: "rcCarBomb", name: "RC Car Bomb", kind: "rccar", model: toolModels.rccar, base: VM.rccarOffset },
       { num: 3, catLabel: "Firearms", id: "shotgun", name: "Shotgun", kind: "shotgun", model: toolModels.shotgun, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "rocketLauncher", name: "Rocket Launcher", kind: "rocket", model: toolModels.rocketLauncher, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "stickyLauncher", name: "Sticky Bomb Launcher", kind: "sticky", model: toolModels.stickylauncher, base: VM.baseOffset },
       { num: 4, catLabel: "Launchers", id: "clusterLauncher", name: "Cluster Bomb Launcher", kind: "cluster", model: toolModels.clusterlauncher, base: VM.baseOffset },
+      { num: 4, catLabel: "Launchers", id: "carCannon", name: "Car Cannon", kind: "carcannon", model: toolModels.carcannon, base: VM.carcannonOffset },
       // Category 5 "Grab & Force" — cycle order per the Phase 7 layout table.
       { num: 5, catLabel: "Grab & Force", id: "gravitygun", name: "Gravity Gun", kind: "gravitygun", model: toolModels.gravitygun, base: VM.gravityOffset },
       { num: 5, catLabel: "Grab & Force", id: "magnetgun", name: "Magnet Gun", kind: "magnet", model: toolModels.magnetgun, base: VM.magnetOffset },
       { num: 5, catLabel: "Grab & Force", id: "grapplegun", name: "Grapple Hook", kind: "grapple", model: toolModels.grapplegun, base: VM.grappleOffset },
       { num: 5, catLabel: "Grab & Force", id: "windcannon", name: "Wind Cannon", kind: "windcannon", model: toolModels.windcannon, base: VM.windOffset },
       { num: 5, catLabel: "Grab & Force", id: "vacuum", name: "Debris Vacuum", kind: "vacuum", model: toolModels.vacuum, base: VM.vacuumOffset },
+      // Category 6 "Strikes" (Batch C) — cycle order: Airstrike Designator -> Orbital Laser -> Nuke.
+      { num: 6, catLabel: "Strikes", id: "airstrike", name: "Airstrike Designator", kind: "airstrike", model: toolModels.airstrike, base: VM.airstrikeOffset },
+      { num: 6, catLabel: "Strikes", id: "orbital", name: "Orbital Laser Designator", kind: "orbital", model: toolModels.orbital, base: VM.orbitalOffset },
+      { num: 6, catLabel: "Strikes", id: "nuke", name: "Nuke", kind: "nuke", model: toolModels.nuke, base: VM.nukeOffset },
     ];
     const meleeKinds = new Set(["melee", "crowbar", "chainsaw"]);
     this.categories = [];
@@ -350,6 +437,16 @@ export class Weapons {
     // Shared fuse hiss loop is on whenever a fused throwable is live (survives tool-switch / driving).
     this.audio.fuse(this.pipeBombs.length + this.stickies.length > 0);
 
+    // Batch C world entities complete on their own timers (like rockets), even after a tool-switch.
+    this._tickPropane(dt);
+    this._tickNukes(dt);
+    this._tickOrbital(dt);
+    this._tickCarShots(dt);
+    this._tickAirDrops(dt);
+    this._tickScreenFlash(dt);
+    this._tickDustColumn(dt);
+    this.audio.rcMotor(!!this._rc); // RC-car electric motor loop (on only while a car is deployed)
+
     const driving = mode !== "walk";
     if (driving) {
       this._swingT = -1;
@@ -360,6 +457,8 @@ export class Weapons {
       // Leaving foot means any on-foot rope is gone; silence force-field loops.
       if (this._grappleFoot || this._grappleHook) this._detachFootGrapple();
       this._silenceGrabForceAudio();
+      this.audio.blastSpray(false);
+      if (this._airPlane) this._despawnPlane(); // designator's scripted plane exists only on foot/equipped
       // Grapple is the one tool usable while driving (the wall-tearing fantasy). No-op for any other tool.
       this._tickVehicleGrapple(dt);
       // Drain edges so nothing fires on exit.
@@ -372,6 +471,12 @@ export class Weapons {
     // Back on foot: drop any vehicle rope we were holding.
     if (this._vgrapple) this._detachVehicleGrapple();
 
+    // RC Car Bomb: while a car is deployed, control is transferred to it. Drive + detonate here, place the
+    // fixed chase cam, and skip the normal selection/fire path. Character is frozen (main gates player.update).
+    if (this._rc) { this._tickRcActive(dt); this.viewmodel.visible = false; this._armsMesh.visible = false; this.player.setArmsHidden(false); this._applyShake(); return; }
+    // Airstrike plane-camera view: slow aim + LMB designate + RMB exit here; character frozen; skip fire.
+    if (this._planeView) { this._tickPlaneView(dt); this.viewmodel.visible = false; this._armsMesh.visible = false; this.player.setArmsHidden(false); this._applyShake(); return; }
+
     this._handleSelection();
 
     const lmb = this.input.consumeLMB();
@@ -383,6 +488,9 @@ export class Weapons {
     this._tickChainsaw(dt, equipped);
     // Grab & Force category (Wind / Vacuum / Magnet / Gravity / Grapple-on-foot); manages its own loops.
     this._tickGrabForce(dt, equipped, lmb, rmb);
+    // Blast Painter hold-spray + Airstrike scripted plane / R-cycle (spawn while equipped, despawn otherwise).
+    this._tickBlastPainter(dt, equipped);
+    this._tickAirstrike(dt, equipped);
     // Demolition-wire line visuals follow their (possibly vehicle-parented) charges every frame.
     if (this.wireCharges.length) this._rebuildWireLines();
 
@@ -390,6 +498,7 @@ export class Weapons {
     this._armsMesh.visible = equipped;
     this.player.setArmsHidden(equipped);
     if (equipped) this._animateViewmodel(dt);
+    this._applyShake(); // nuke camera shake (added on top of the FPP camera main just placed)
   }
 
   _handleSelection() {
@@ -447,7 +556,15 @@ export class Weapons {
       case "rocket": if (lmb) this._fireRocket(item); break;
       case "sticky": if (lmb) this._fireSticky(item); break;
       case "cluster": if (lmb) this._fireCluster(item); break;
+      case "carcannon": if (lmb) this._fireCarCannon(item); break;
       case "windcannon": if (lmb) this._fireWind(item); break;
+      // Batch C:
+      case "blastpainter": if (rmb) this._detonatePaint(); break; // LMB spray handled in _tickBlastPainter
+      case "propane": if (lmb) this._throwPropane(item); break;
+      case "rccar": if (lmb) this._deployRc(item); break;
+      case "nuke": if (lmb) this._throwNuke(item); break;
+      case "orbital": if (lmb) this._plantOrbital(item); break;
+      case "airstrike": if (lmb) this._airDesignateFpp(item); if (rmb) this._enterPlaneView(); break;
       // Vacuum / Magnet / Gravity / Grapple are continuous or hold-based — handled in _tickGrabForce.
     }
   }
@@ -670,6 +787,25 @@ export class Weapons {
     this._restoreShrunk();
     for (const e of this._dust) { e.mesh.visible = false; e.life = 0; }
     this._silenceGrabForceAudio();
+    // Phase 7 batch C transient entities.
+    for (const tank of this.propaneTanks) this._disposeTank(tank);
+    this.propaneTanks.length = 0;
+    for (const nk of this.nukes) { if (nk.mesh && nk.mesh.parent) nk.mesh.parent.remove(nk.mesh); try { this.world.removeRigidBody(nk.body); } catch (e) {} }
+    this.nukes.length = 0;
+    this._nukeArmed = false;
+    for (const s of [...this.carShots]) this._removeCarShot(s);
+    this.carShots.length = 0;
+    this._returnRc(false);
+    this._despawnPlane();
+    for (const d of this._airDrops) if (d.mesh.parent) d.mesh.parent.remove(d.mesh);
+    this._airDrops.length = 0;
+    this._airRun = null;
+    for (const rec of this._painted.values()) this._releaseSplat(rec.splat);
+    this._painted.clear();
+    this._endOrbital();
+    this._flashT = 0; this._shakeT = 0; this._dustColT = 0;
+    this._flashDiv.style.opacity = "0"; this._dustCol.visible = false;
+    this.audio.blastSpray(false); this.audio.rcMotor(false); this.audio.airPlaneLoop(false);
   }
 
   // --- MP rocket relay hooks (called by replication.js) --------------------------------------
@@ -1383,6 +1519,7 @@ export class Weapons {
     const h = this._gravHeld;
     if (h.entry && (h.entry.fading || this.destruction.debris.indexOf(h.entry) < 0)) { this._releaseGrav(); return; }
     if (h.vehicle && this.manager.all.indexOf(h.vehicle) < 0) { this._releaseGrav(); return; }
+    if (h.kind === "prop" && !this.propaneTanks.some((t) => t.body === h.body && !t.disposed)) { this._releaseGrav(); return; } // tank exploded while held
     const keep = gravityHoldStep(camPos, aim, h.body, cfg, dt);
     if (!keep) { this._gravReleaseT += dt; if (this._gravReleaseT > cfg.releaseTime) this._releaseGrav(); }
     else this._gravReleaseT = 0;
@@ -1395,6 +1532,9 @@ export class Weapons {
     const handle = hit.collider.handle;
     const entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
     if (entry) { this._gravHeld = { kind: "debris", body: entry.body, entry, mass: entry.body.mass ? entry.body.mass() : 1 }; this._gravReleaseT = 0; return; }
+    // Propane tanks are grabbable props (a thrown tank explodes on hard impact — the sanctioned destructive gravity-throw).
+    const tank = this.findPropByCollider(handle);
+    if (tank) { this._gravHeld = { kind: "prop", body: tank.body, mass: tank.body.mass ? tank.body.mass() : 1 }; this._gravReleaseT = 0; return; }
     const veh = this.manager ? this.manager.byColliderHandle(handle) : null;
     if (veh && veh.body && veh.V) {
       if (veh === this.manager.driven) return;
@@ -1602,6 +1742,614 @@ export class Weapons {
     this._vgrapple = null;
     this._hideRope();
   }
+
+  // ============================ Phase 7 batch C: Strikes + heavy/vehicular ordnance ============
+  // MP note (flag): the heavy Strike destruction (nuke radius 18, orbital carve, painted set) is
+  // authoritative/solo. On a replica client this forwards a cap-fitting radial intent (server owns the
+  // detach + staging) so nothing exceeds the server caps — a deliberate simplification, NOT a redesign.
+  _bigBlast(center, force, radius, budget, staged) {
+    if (this.net) {
+      const f = Math.min(force, CAPS.radialForceMax), r = Math.min(radius, CAPS.radialRadiusMax);
+      this.destruction.applyRadialDamage(center, f, r, budget); // forwards a valid radial intent
+      return;
+    }
+    if (staged) this.destruction.enqueueRadialJobs([{ center, force, radius, budget }]);
+    else this.destruction.applyRadialDamage(center, force, radius, budget);
+  }
+
+  _applyShake() {
+    if (this._shakeT <= 0) return;
+    const k = this._shakeT / W.nuke.shakeTime;
+    const a = this._shakeAmp * k * k;
+    this.camera.position.x += (Math.random() * 2 - 1) * a;
+    this.camera.position.y += (Math.random() * 2 - 1) * a;
+    this.camera.position.z += (Math.random() * 2 - 1) * a;
+  }
+  _tickShake(dt) { if (this._shakeT > 0) this._shakeT -= dt; }
+
+  // --- 2d. Blast Painter: hold LMB spray-paints chunks (pooled splats), RMB detonatePainted them all ---
+  _tickBlastPainter(dt, equipped) {
+    const item = equipped ? this._activeItem() : null;
+    const spraying = !!(item && item.kind === "blastpainter" && this.input.lmbDown);
+    this.audio.blastSpray(spraying);
+    if (!spraying) { this._paintTimer = 0; return; }
+    this._paintTimer += dt;
+    if (this._paintTimer < W.blastPainter.tickInterval) return;
+    this._paintTimer = 0;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRayAndGetNormal(ray, W.blastPainter.range, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    const r = this.destruction.registry.get(hit.collider.handle);
+    if (!r || !r.chunk.active) return;
+    const key = r.volume.id + ":" + r.chunk.id;
+    if (this._painted.has(key)) return;
+    const point = origin.clone().addScaledVector(dir, hit.toi);
+    const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
+    if (normal.lengthSq() < 1e-6) normal.set(0, 1, 0); else normal.normalize();
+    const pooled = this._acquireSplat();
+    if (pooled) {
+      pooled.mesh.position.copy(point).addScaledVector(normal, 0.03);
+      pooled.mesh.quaternion.setFromUnitVectors(FWD_Z, normal);
+      pooled.mesh.scale.setScalar(W.blastPainter.splatSize + Math.random() * 0.06);
+      pooled.mesh.visible = true;
+    }
+    this._painted.set(key, { splat: pooled });
+    while (this._painted.size > W.blastPainter.maxPainted) {
+      const oldestKey = this._painted.keys().next().value;
+      this._releaseSplat(this._painted.get(oldestKey).splat);
+      this._painted.delete(oldestKey);
+    }
+  }
+  _acquireSplat() { for (const e of this._splatPool) if (!e.used) { e.used = true; return e; } return null; }
+  _releaseSplat(e) { if (e) { e.used = false; e.mesh.visible = false; } }
+
+  _detonatePaint() {
+    if (this._painted.size === 0) return;
+    this.audio.armBeep();
+    this.destruction.detonatePainted(new Set(this._painted.keys()), W.blastPainter.force);
+    const cam = this._camPos();
+    this.audio.explosion(0);
+    this.audio.explosion(4);
+    for (const rec of this._painted.values()) this._releaseSplat(rec.splat);
+    this._painted.clear();
+    this._recoilZ += 0.1;
+    void cam;
+  }
+
+  // --- 2e. Propane Tank: thrown dynamic body; explodes on shot / hard impact / blast chain -----------
+  _throwPropane(item) {
+    if (this._time - item.state.lastUse < W.propane.fireInterval) return;
+    item.state.lastUse = this._time;
+    const pr = W.propane;
+    while (this.propaneTanks.length >= pr.maxLive) { const old = this.propaneTanks.shift(); this._disposeTank(old); }
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const lv = { x: dir.x * pr.throwSpeed, y: dir.y * pr.throwSpeed + pr.upBias, z: dir.z * pr.throwSpeed };
+    const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(origin.x, origin.y, origin.z)
+      .setLinvel(lv.x, lv.y, lv.z)
+      .setAngvel({ x: Math.random() * 4 - 2, y: Math.random() * 4 - 2, z: Math.random() * 4 - 2 })
+      .setCcdEnabled(true).setCanSleep(true);
+    const body = this.world.createRigidBody(bodyDesc);
+    const cd = this.RAPIER.ColliderDesc.cylinder(pr.colliderHalf, pr.colliderRadius)
+      .setRestitution(0.2).setFriction(0.85).setDensity(pr.density);
+    const collider = this.world.createCollider(cd, body);
+    const mesh = new THREE.Mesh(this._propaneGeo, this.materials);
+    mesh.castShadow = true; mesh.position.copy(origin);
+    this.scene.add(mesh);
+    const tank = {
+      body, collider, mesh, exploded: false, queued: false, disposed: false, age: 0,
+      prevVel: new THREE.Vector3(lv.x, lv.y, lv.z), chainR: pr.chainR,
+    };
+    tank.pos = () => { const t = body.translation(); return new THREE.Vector3(t.x, t.y, t.z); };
+    tank.explode = () => this._explodePropane(tank);
+    this.destruction.registerDamageableProp(collider.handle, tank);
+    this.propaneTanks.push(tank);
+    this.audio.propaneClonk(0);
+    this._recoilZ -= 0.05;
+  }
+
+  _tickPropane(dt) {
+    if (this.propaneTanks.length === 0) return;
+    const keep = [];
+    const cur = new THREE.Vector3();
+    for (const tank of this.propaneTanks) {
+      if (tank.exploded || tank.disposed) continue;
+      tank.age += dt;
+      const t = tank.body.translation();
+      const rr = tank.body.rotation();
+      tank.mesh.position.set(t.x, t.y, t.z);
+      tank.mesh.quaternion.set(rr.x, rr.y, rr.z, rr.w);
+      const lv = tank.body.linvel();
+      cur.set(lv.x, lv.y, lv.z);
+      const dv = cur.distanceTo(tank.prevVel);
+      tank.prevVel.copy(cur);
+      // Hard impact = a big single-frame velocity change (NOT via allowedImpactors, no cascade). Grace
+      // period so the launch impulse itself doesn't count.
+      if (tank.age > 0.3 && dv > W.propane.impactDV) { this._explodePropane(tank); continue; }
+      keep.push(tank);
+    }
+    this.propaneTanks = keep;
+  }
+
+  _explodePropane(tank) {
+    if (tank.exploded) return;
+    tank.exploded = true;
+    const p = tank.pos();
+    this._disposeTank(tank);
+    this._bigBlast(p, W.propane.force, W.propane.radius, W.propane.budget, false);
+    this.audio.explosion(this._camPos().distanceTo(p));
+  }
+  _disposeTank(tank) {
+    if (!tank || tank.disposed) return;
+    tank.disposed = true; tank.exploded = true;
+    this.destruction.unregisterDamageableProp(tank.collider.handle);
+    if (tank.mesh && tank.mesh.parent) tank.mesh.parent.remove(tank.mesh);
+    try { this.world.removeRigidBody(tank.body); } catch (e) {}
+  }
+
+  // Propane tanks are grabbable by the Gravity Gun (a thrown tank explodes on hard impact — the sanctioned
+  // gravity-throw destruction path). Resolve a collider handle to a live tank body, or null.
+  findPropByCollider(handle) {
+    const tank = this.propaneTanks.find((t) => !t.disposed && t.collider.handle === handle);
+    return tank || null;
+  }
+
+  // --- 6c. Nuke: thrown device, 5 s accelerating beep, flash + shake + staged radius-18 collapse -----
+  _throwNuke(item) {
+    if (this._nukeArmed) return;
+    if (this._time - this._nukeCooldownT < W.nuke.cooldown) return;
+    this._nukeArmed = true;
+    const nk = W.nuke;
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(origin.x, origin.y, origin.z)
+      .setLinvel(dir.x * nk.throwSpeed, dir.y * nk.throwSpeed + nk.upBias, dir.z * nk.throwSpeed)
+      .setCcdEnabled(true).setCanSleep(true);
+    const body = this.world.createRigidBody(bodyDesc);
+    const cd = this.RAPIER.ColliderDesc.cuboid(0.22, 0.16, 0.28).setDensity(400).setFriction(0.9).setRestitution(0.1);
+    this.world.createCollider(cd, body);
+    const mesh = new THREE.Mesh(this._nukeGeo, this.materials);
+    mesh.castShadow = true; mesh.position.copy(origin);
+    this.scene.add(mesh);
+    this.nukes.push({ body, mesh, fuse: nk.countdown, nextBeep: 0 });
+    this.audio.nukeArm();
+    this._recoilZ -= 0.05;
+  }
+
+  _tickNukes(dt) {
+    if (this.nukes.length === 0) return;
+    const keep = [];
+    for (const nk of this.nukes) {
+      const t = nk.body.translation();
+      const r = nk.body.rotation();
+      nk.mesh.position.set(t.x, t.y, t.z);
+      nk.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+      nk.fuse -= dt;
+      nk.nextBeep -= dt;
+      if (nk.nextBeep <= 0) { this.audio.nukeBeep(); nk.nextBeep = Math.max(0.09, nk.fuse * 0.25); } // accelerating
+      if (nk.fuse <= 0) { this._detonateNuke(nk); continue; }
+      keep.push(nk);
+    }
+    this.nukes = keep;
+  }
+
+  _detonateNuke(nk) {
+    const nkc = W.nuke;
+    const t = nk.body.translation();
+    const p = new THREE.Vector3(t.x, t.y, t.z);
+    if (nk.mesh.parent) nk.mesh.parent.remove(nk.mesh);
+    try { this.world.removeRigidBody(nk.body); } catch (e) {}
+    // Effect (not HUD): fullscreen white flash + camera shake.
+    this._flashT = nkc.flashTime; this._flashDur = nkc.flashTime; this._flashDiv.style.opacity = "1";
+    this._shakeT = nkc.shakeTime; this._shakeAmp = nkc.shakeAmp;
+    // ONE huge radial job fed ENTIRELY through the staged queue (debrisCap 200 never raised).
+    this._bigBlast(p, nkc.force, nkc.radius, nkc.budget, true);
+    // Pooled dust column at ground zero.
+    this._dustCol.position.set(p.x, p.y + nkc.dustHeight / 2, p.z);
+    this._dustCol.visible = true; this._dustColMat.opacity = 0.55; this._dustColT = nkc.dustLife;
+    this.audio.nukeBlast(this._camPos().distanceTo(p));
+    this.audio.nukeKlaxon();
+    this._nukeArmed = false;
+    this._nukeCooldownT = this._time;
+  }
+
+  _tickScreenFlash(dt) {
+    if (this._flashT <= 0) return;
+    this._flashT -= dt;
+    const a = Math.max(0, this._flashT / this._flashDur);
+    this._flashDiv.style.opacity = a <= 0 ? "0" : String(a);
+  }
+  _tickDustColumn(dt) {
+    if (this._dustColT <= 0) return;
+    this._dustColT -= dt;
+    this._dustCol.position.y += dt * 2;
+    this._dustColMat.opacity = 0.55 * Math.max(0, this._dustColT / W.nuke.dustLife);
+    if (this._dustColT <= 0) this._dustCol.visible = false;
+  }
+
+  // --- 6b. Orbital Laser Designator: marker + 3 s countdown, vertical carveCylinder hole -------------
+  _plantOrbital(item) {
+    if (this._orbital) return;
+    if (this._time - this._orbCooldownT < W.orbital.cooldown) return;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRay(ray, 200, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    const point = origin.clone().addScaledVector(dir, hit.toi);
+    this._orbital = { pos: point, t: W.orbital.countdown, phase: "count", nextBeep: 0, beamT: 0 };
+    this._orbMarker.position.set(point.x, point.y + 0.04, point.z); this._orbMarker.scale.setScalar(W.orbital.markerSize); this._orbMarker.visible = true;
+    this._orbPillar.position.set(point.x, point.y + W.orbital.pillarHeight / 2, point.z); this._orbPillar.visible = true;
+    this.audio.orbitalCharge();
+    item.state.lastUse = this._time;
+  }
+
+  _tickOrbital(dt) {
+    if (!this._orbital) return;
+    const o = this._orbital;
+    if (o.phase === "count") {
+      o.t -= dt;
+      o.nextBeep -= dt;
+      if (o.nextBeep <= 0) { this.audio.orbitalBeep(); o.nextBeep = Math.max(0.08, o.t * 0.3); }
+      const blink = Math.floor(this._time * (3 + (W.orbital.countdown - o.t) * 3)) % 2 === 0;
+      this._orbMarker.visible = blink; this._orbPillar.visible = blink;
+      if (o.t <= 0) {
+        o.phase = "beam"; o.beamT = W.orbital.beamLife;
+        this._fireOrbitalCarve(o);
+        this.audio.orbitalZap();
+        this.audio.explosion(this._camPos().distanceTo(o.pos));
+      }
+    } else {
+      o.beamT -= dt;
+      const on = o.beamT > 0;
+      this._orbMarker.visible = false; this._orbPillar.visible = false;
+      this._orbBeam.visible = on;
+      if (on) {
+        this._orbBeam.position.set(o.pos.x, o.pos.y + W.orbital.pillarHeight / 2, o.pos.z);
+        const s = 0.7 + Math.random() * 0.5;
+        this._orbBeamMat.opacity = 0.7 * (o.beamT / W.orbital.beamLife);
+        this._orbBeam.scale.set(s, 1, s);
+      } else { this._endOrbital(); }
+    }
+  }
+  _fireOrbitalCarve(o) {
+    const top = new THREE.Vector3(o.pos.x, o.pos.y + 5, o.pos.z);
+    this.destruction.carveCylinder(top, new THREE.Vector3(0, -1, 0), W.orbital.throughGround, W.orbital.radius, W.orbital.force, W.orbital.carveBudget);
+  }
+  _endOrbital() {
+    this._orbital = null;
+    this._orbMarker.visible = false; this._orbPillar.visible = false; this._orbBeam.visible = false;
+    this._orbCooldownT = this._time;
+  }
+
+  // --- 4d. Car Cannon: fires the hatchback mesh as a plain dynamic cuboid, temp-registered impactor ---
+  _fireCarCannon(item) {
+    if (this._time - this._carCooldownT < W.carCannon.cooldown) return;
+    this._carCooldownT = this._time;
+    while (this.carShots.length) this._removeCarShot(this.carShots[0]); // one live -> despawn old
+    const cc = W.carCannon;
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item).addScaledVector(dir, 1.5); // clear the player
+    const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(origin.x, origin.y, origin.z)
+      .setLinvel(dir.x * cc.speed, dir.y * cc.speed + cc.upBias, dir.z * cc.speed)
+      .setAngvel({ x: Math.random() * cc.spin - cc.spin / 2, y: Math.random() * cc.spin - cc.spin / 2, z: Math.random() * cc.spin - cc.spin / 2 })
+      .setCcdEnabled(true).setCanSleep(false);
+    const body = this.world.createRigidBody(bodyDesc);
+    const cd = this.RAPIER.ColliderDesc.cuboid(cc.half.x, cc.half.y, cc.half.z)
+      .setDensity(cc.density).setFriction(0.6).setRestitution(0.05);
+    const collider = this.world.createCollider(cd, body);
+    // Temp-register in allowedImpactors for its lifetime => smashes structures via the vehicle-grade
+    // contact-force detach path (the whole trick). Unregistered on despawn (proof of no leak in the report).
+    this.destruction.registerImpactor(collider.handle);
+    const mesh = new THREE.Mesh(this._carCannonGeo, this.materials);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    mesh.position.copy(origin); mesh.quaternion.setFromUnitVectors(FWD_Z, dir);
+    this.scene.add(mesh);
+    this.carShots.push({ body, collider, mesh, age: 0, fading: null, prevSpeed: cc.speed });
+    this.audio.carCannonWhoosh();
+    this._recoilZ += 0.2; this._recoilPitch += 0.14;
+  }
+
+  _tickCarShots(dt) {
+    if (this.carShots.length === 0) return;
+    const cc = W.carCannon;
+    const keep = [];
+    for (const s of this.carShots) {
+      const t = s.body.translation();
+      const r = s.body.rotation();
+      s.mesh.position.set(t.x, t.y, t.z);
+      s.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+      s.age += dt;
+      const lv = s.body.linvel();
+      const speed = Math.hypot(lv.x, lv.y, lv.z);
+      if (s.fading == null && s.prevSpeed - speed > 8) this.audio.carCannonCrash(this._camPos().distanceTo(s.mesh.position));
+      s.prevSpeed = speed;
+      const atRest = s.age > 0.6 && speed < cc.restSpeed;
+      if (s.fading == null && (s.age > cc.lifetime || atRest)) {
+        s.fading = cc.fadeTime;
+        this.destruction.unregisterImpactor(s.collider.handle); // stop smashing while it fades out
+      }
+      if (s.fading != null) {
+        s.fading -= dt;
+        s.mesh.scale.setScalar(Math.max(0, s.fading / cc.fadeTime));
+        if (s.fading <= 0) { this._removeCarShot(s); continue; }
+      }
+      keep.push(s);
+    }
+    this.carShots = keep;
+  }
+  _removeCarShot(s) {
+    this.destruction.unregisterImpactor(s.collider.handle); // idempotent
+    if (s.mesh && s.mesh.parent) s.mesh.parent.remove(s.mesh);
+    try { this.world.removeRigidBody(s.body); } catch (e) {}
+    this.carShots = this.carShots.filter((x) => x !== s);
+  }
+
+  // --- 2f. RC Car Bomb: deploy a mini GroundVehicle; control transfers (chase cam, character frozen) --
+  // MP note (flag): "a player controls an entity that is not their character" — same input-routing case as
+  // vehicle driving. Solo drives it via the manager loop; in MP the RC car would be a server-owned vehicle
+  // and the driving input routed like a normal seat (stubbed here: RC car is solo/authoritative only).
+  _deployRc(item) {
+    if (this._rc) return; // one alive
+    const feet = this.player.feetPosition();
+    const yaw = this._yaw();
+    const veh = new GroundVehicle(this.scene, this.world, this.RAPIER, this._rcSpec, this.materials, { x: feet.x, y: feet.y + 0.1, z: feet.z, yaw });
+    veh.water = this.manager.water || null;
+    this.manager.all.push(veh);   // stepped by manager.update; driven flag => reads WASD
+    this.manager.driven = veh;    // walk mode stays; main only uses `driven` in drive mode / cone-skip
+    this._rc = { veh, badT: 0 };
+    void item;
+  }
+
+  _tickRcActive(dt) {
+    const rc = this._rc;
+    if (!rc || !rc.veh || !rc.veh.body) { this._returnRc(false); return; }
+    // Auto-return (no blast) if the car flips or falls off the world for autoReturnTime.
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(rc.veh.quaternion());
+    const pos = rc.veh.centerWorld();
+    if (up.y < W.rcCar.flipDot || pos.y < -5) {
+      rc.badT += dt;
+      if (rc.badT > W.rcCar.autoReturnTime) { this._returnRc(false); return; }
+    } else rc.badT = 0;
+    // RMB or LMB detonates wherever the car is.
+    if (this.input.consumeLMB() || this.input.consumeRMB()) { this._detonateRc(); return; }
+    this.input.consumeDigits(); this.input.consumeWheel(); // don't switch tools while driving the car
+    this._rcChaseCam(rc.veh);
+  }
+  _rcChaseCam(veh) {
+    const pos = veh.centerWorld();
+    const q = veh.quaternion();
+    const fwd = new THREE.Vector3(0, 0, 1).applyQuaternion(q);
+    const camPos = pos.clone().addScaledVector(fwd, -W.rcCar.chaseBack);
+    camPos.y += W.rcCar.chaseUp;
+    this.camera.position.copy(camPos);
+    this.camera.lookAt(pos.x, pos.y + W.rcCar.chaseLook, pos.z);
+  }
+  _detonateRc() {
+    const veh = this._rc ? this._rc.veh : null;
+    const p = veh ? veh.centerWorld() : this.player.feetPosition();
+    this._bigBlast(p, W.rcCar.force, W.rcCar.radius, W.rcCar.budget, false);
+    this.audio.explosion(this._camPos().distanceTo(p));
+    this._returnRc(true);
+  }
+  _returnRc() {
+    const rc = this._rc;
+    this._rc = null;
+    if (rc && rc.veh) {
+      const veh = rc.veh;
+      this.manager.all = this.manager.all.filter((x) => x !== veh);
+      if (this.manager.driven === veh) this.manager.driven = null;
+      veh.despawn();
+    }
+    this.audio.rcMotor(false);
+    // Camera is restored automatically next frame (main re-applies FPP in walk mode).
+  }
+
+  // --- 6a. Airstrike Designator: scripted circling plane, R cycles 3 ammo, LMB designate, RMB plane-cam --
+  // MP note (flag): the plane is a server-owned scripted entity in Phase 6; the plane-camera is purely
+  // local (camera attach), only the designation events would sync. Here it is solo/authoritative.
+  _tickAirstrike(dt, equipped) {
+    const item = equipped ? this._activeItem() : null;
+    const isAir = !!(item && item.kind === "airstrike");
+    if (!isAir) { if (this._airPlane) this._despawnPlane(); this.audio.airPlaneLoop(false); this._prevR = false; return; }
+    if (!this._airPlane) this._spawnPlane();
+    const rDown = this.input.down("KeyR");
+    if (rDown && !this._prevR) { this._airAmmo = (this._airAmmo + 1) % 3; this._showAmmoLabel(); }
+    this._prevR = rDown;
+    this._airCircleT += dt * W.airstrike.circleSpeed;
+    if (this._airRun) this._stepAirRun(dt); else this._flyCircle();
+    this.audio.airPlaneLoop(true);
+  }
+  _spawnPlane() {
+    const mesh = new THREE.Mesh(this._planeGeo, this.materials);
+    mesh.castShadow = false; mesh.receiveShadow = false;
+    mesh.scale.setScalar(W.airstrike.planeScale);
+    this.scene.add(mesh);
+    this._airPlane = mesh;
+    this._flyCircle();
+  }
+  _despawnPlane() {
+    if (this._planeView) this._exitPlaneView();
+    if (this._airPlane) { this.scene.remove(this._airPlane); this._airPlane = null; }
+    this._airRun = null;
+    this._airMarker.visible = false;
+    this.audio.airPlaneLoop(false);
+  }
+  _flyCircle() {
+    if (!this._airPlane) return;
+    const a = this._airCircleT;
+    const R = W.airstrike.circleRadius;
+    const x = Math.cos(a) * R, z = Math.sin(a) * R;
+    this._airPlane.position.set(x, W.airstrike.altitude, z);
+    this._facePlane(new THREE.Vector3(-Math.sin(a), 0, Math.cos(a)));
+  }
+  _facePlane(dir) {
+    const d = dir.clone(); if (d.lengthSq() < 1e-6) d.set(0, 0, 1); else d.normalize();
+    this._airPlane.quaternion.setFromUnitVectors(FWD_Z, d);
+  }
+  _showAmmoLabel() {
+    if (!this._label) return;
+    this._labelNum.textContent = "6";
+    this._labelName.textContent = "Airstrike: " + this._airAmmoNames[this._airAmmo];
+    this._label.style.opacity = "1";
+    clearTimeout(this._labelTimer);
+    this._labelTimer = setTimeout(() => { this._label.style.opacity = "0"; }, VM.labelSeconds * 1000);
+  }
+  _airDesignateFpp(item) {
+    if (this._airRun || !this._airPlane) return;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRay(ray, 300, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    this._airDesignate(origin.clone().addScaledVector(dir, hit.toi));
+    void item;
+  }
+  _airDesignate(target) {
+    if (this._airRun || !this._airPlane) return;
+    this._airRun = { target: target.clone(), t: 0, released: false, start: this._airPlane.position.clone() };
+    this.audio.airFlyby();
+  }
+  _stepAirRun(dt) {
+    const run = this._airRun;
+    const A = W.airstrike;
+    run.t += dt;
+    const u = Math.min(1, run.t / A.runTime);
+    const over = new THREE.Vector3(run.target.x, A.altitude, run.target.z);
+    const dir = over.clone().sub(run.start); dir.y = 0;
+    if (dir.lengthSq() < 1e-3) dir.set(0, 0, 1); else dir.normalize();
+    const start = over.clone().addScaledVector(dir, -60);
+    const end = over.clone().addScaledVector(dir, 60);
+    this._airPlane.position.copy(start).lerp(end, u);
+    this._facePlane(dir);
+    if (!run.released && u >= 0.5) { run.released = true; this._releaseOrdnance(run.target, dir); }
+    if (u >= 1) this._airRun = null; // resume circling
+  }
+  _releaseOrdnance(target, dir) {
+    const A = W.airstrike;
+    if (this._airAmmo === 0) {
+      for (let i = 0; i < A.dropCount; i++) {
+        const off = (i - (A.dropCount - 1) / 2) * A.dropSpacing;
+        const gx = target.x + dir.x * off, gz = target.z + dir.z * off;
+        this._spawnDrop(new THREE.Vector3(gx, A.altitude, gz), new THREE.Vector3(gx, target.y, gz), "bomb");
+      }
+    } else if (this._airAmmo === 1) {
+      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "pen");
+    } else {
+      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "cluster");
+    }
+    this.audio.bombWhistle();
+  }
+  _spawnDrop(top, impact, type) {
+    const mesh = new THREE.Mesh(this._airDropGeo, this.materials);
+    mesh.castShadow = false; mesh.position.copy(top);
+    this.scene.add(mesh);
+    const dir = impact.clone().sub(top);
+    if (dir.lengthSq() < 1e-6) dir.set(0, -1, 0); else dir.normalize();
+    this._airDrops.push({ mesh, pos: top.clone(), dir, impact: impact.clone(), type });
+  }
+  _tickAirDrops(dt) {
+    if (this._airDrops.length === 0) return;
+    const keep = [];
+    for (const d of this._airDrops) {
+      const step = W.airstrike.dropSpeed * dt;
+      const ray = new this.RAPIER.Ray(d.pos, d.dir);
+      const hit = this.world.castRay(ray, step, true, undefined, undefined, undefined, this.player.body);
+      let point = null;
+      if (hit) point = d.pos.clone().addScaledVector(d.dir, hit.toi);
+      else {
+        d.pos.addScaledVector(d.dir, step);
+        d.mesh.position.copy(d.pos);
+        if (d.pos.distanceToSquared(d.impact) < 0.6) point = d.impact.clone();
+      }
+      if (point) { this._strikeOrdnance(d, point); if (d.mesh.parent) d.mesh.parent.remove(d.mesh); continue; }
+      keep.push(d);
+    }
+    this._airDrops = keep;
+  }
+  _strikeOrdnance(d, point) {
+    const A = W.airstrike;
+    const cam = this._camPos();
+    if (d.type === "pen") {
+      // Penetrator: carve down through obstacles above/at the target (the "ordnance penetrates" requirement).
+      this.destruction.carveCylinder(point.clone().add(new THREE.Vector3(0, 6, 0)), new THREE.Vector3(0, -1, 0), A.penThrough, A.penRadius, A.penForce, A.penBudget);
+      this.audio.explosion(cam.distanceTo(point));
+    } else if (d.type === "cluster") {
+      this._spawnClusterAt(point, A.clusterSpread);
+      this.audio.clusterPop();
+    } else {
+      this._bigBlast(point, A.bombForce, A.bombRadius, A.bombBudget, true);
+      this.audio.explosion(cam.distanceTo(point));
+    }
+  }
+  // Reuse the 4c bomblet machinery: seed a cluster already in its "bomblets" phase at `point`.
+  _spawnClusterAt(point, spread) {
+    const cl = W.cluster;
+    const rng = mulberry32(((this._ridCounter++ * 2654435761) ^ 0x9e3779b9) >>> 0);
+    const c = { phase: "bomblets", pos: point.clone(), vel: new THREE.Vector3(), mesh: null, bomblets: [], seed: 0 };
+    for (let i = 0; i < cl.bombletCount; i++) {
+      const ang = (i / cl.bombletCount) * Math.PI * 2 + rng() * 0.6;
+      const spd = spread * (0.6 + 0.6 * rng());
+      const pool = this._acquireBomblet();
+      const pos = c.pos.clone();
+      if (pool) pool.mesh.position.copy(pos);
+      c.bomblets.push({ pos, vel: new THREE.Vector3(Math.cos(ang) * spd, cl.bombletUp * (0.6 + 0.8 * rng()), Math.sin(ang) * spd), pool, age: 0, dead: false });
+    }
+    while (this.clusters.length > cl.maxLive) this._clearCluster(this.clusters.shift());
+    this.clusters.push(c);
+  }
+  _enterPlaneView() {
+    if (!this._airPlane) return;
+    this._planeView = true;
+    this._planeAim.set(0, 0);
+  }
+  _exitPlaneView() { this._planeView = false; this._airMarker.visible = false; }
+  _tickPlaneView(dt) {
+    if (!this._airPlane) { this._exitPlaneView(); return; }
+    const A = W.airstrike;
+    // Slow aim marker from mouse motion (the crosshair, relocated to a ground-projected quad).
+    this._planeAim.x += this.input.mouseDX * A.aimSpeed * 0.0006;
+    this._planeAim.y += this.input.mouseDY * A.aimSpeed * 0.0006;
+    this._planeAim.x = THREE.MathUtils.clamp(this._planeAim.x, -0.7, 0.7);
+    this._planeAim.y = THREE.MathUtils.clamp(this._planeAim.y, -0.25, 0.8);
+    // R cycles ammo in plane view too.
+    const rDown = this.input.down("KeyR");
+    if (rDown && !this._prevR) { this._airAmmo = (this._airAmmo + 1) % 3; this._showAmmoLabel(); }
+    this._prevR = rDown;
+    // Keep the plane flying its circle / run.
+    this._airCircleT += dt * A.circleSpeed;
+    if (this._airRun) this._stepAirRun(dt); else this._flyCircle();
+    // Nose-mounted camera looking down-forward, with the aim offset applied.
+    const pPos = this._airPlane.position.clone();
+    const pFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(this._airPlane.quaternion);
+    const camPos = pPos.clone().addScaledVector(pFwd, 2); camPos.y -= 0.5;
+    const aimDir = pFwd.clone(); aimDir.y -= 0.7; aimDir.normalize();
+    aimDir.applyAxisAngle(new THREE.Vector3(0, 1, 0), this._planeAim.x);
+    const rightAxis = new THREE.Vector3().crossVectors(aimDir, new THREE.Vector3(0, 1, 0)).normalize();
+    aimDir.applyAxisAngle(rightAxis, this._planeAim.y);
+    this.camera.position.copy(camPos);
+    this.camera.lookAt(camPos.clone().add(aimDir));
+    // Ground-projected aim marker.
+    const ray = new this.RAPIER.Ray(camPos, aimDir);
+    const hit = this.world.castRay(ray, 400, true, undefined, undefined, undefined, this.player.body);
+    let point = null;
+    if (hit) { point = camPos.clone().addScaledVector(aimDir, hit.toi); this._airMarker.position.set(point.x, point.y + 0.06, point.z); this._airMarker.scale.setScalar(1.2); this._airMarker.visible = true; }
+    else this._airMarker.visible = false;
+    // LMB designates; RMB returns to first person.
+    if (this.input.consumeLMB() && point && !this._airRun) this._airDesignate(point);
+    if (this.input.consumeRMB()) this._exitPlaneView();
+    this.input.consumeDigits(); this.input.consumeWheel();
+  }
+
+  // --- Public hooks for main.js (camera-detached external-entity control) --------------------------
+  controlsExternalEntity() { return !!this._rc || this._planeView; }
+  freezePlayer() { return !!this._rc || this._planeView; }
+  returnControl() { if (this._rc) this._returnRc(false); else if (this._planeView) this._exitPlaneView(); }
 
   // --- Viewmodel animation ---
   _decayAnim(dt) {

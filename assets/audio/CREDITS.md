@@ -49,6 +49,20 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
 | grapple_anchor.ogg | impactMetal_002.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | grapple_reel.ogg | spaceEngineSmall_003.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | grapple_snap.ogg | impactMetal_004.ogg | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| spray_loop.ogg | spaceEngineSmall_001.ogg (via vacuum_loop.ogg) | Kenney — Sci-Fi Sounds — https://kenney.nl/assets/sci-fi-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| propane_clonk.ogg | impactMetal_heavy_000.ogg (via clang.ogg) | Kenney — Impact Sounds — https://kenney.nl/assets/impact-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| nuke_arm.ogg | confirmation_001.ogg (via detonate_beep.ogg) | Kenney — Interface Sounds — https://kenney.nl/assets/interface-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| nuke_klaxon.ogg | bong_001.ogg (via wire_beep.ogg) | Kenney — Interface Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| nuke_blast.ogg | lowFrequency_explosion_000.ogg (via explosion_1.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| nuke_rumble.ogg | forceField_000.ogg (via hover_loop.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| orbital_charge.ogg | thrusterFire_000.ogg (via rocket_launch.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| orbital_zap.ogg | laserSmall_003.ogg (via grapple_launch.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| carcannon_whoosh.ogg | thrusterFire_000.ogg (via rocket_launch.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| carcannon_crash.ogg | explosionCrunch_000.ogg (via explosion_0.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| rc_motor.ogg | engineCircular_000.ogg (via engine_loop.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| airstrike_plane.ogg | thrusterFire_001.ogg (via plane_loop.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| airstrike_flyby.ogg | lowFrequency_explosion_001.ogg (via wind_whoomp.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| bomb_whistle.ogg | knifeSlice.ogg (via swing.ogg) | Kenney — RPG Audio — https://kenney.nl/assets/rpg-audio | Kenney (kenney.nl) | CC0 1.0 |
 
 ## Runtime usage notes
 - Phase 3 vehicle loops: `rotor_loop.ogg` (helicopter), `plane_loop.ogg` (airplane),
@@ -68,6 +82,13 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
   the grapple reels. `magnet_attract.ogg` + `magnet_repel.ogg` are two DISTINCT force-field files (no
   pitch-shift synthesis) for the attract vs. repel hum. `wind_whoomp.ogg` is a deep one-shot air blast,
   `gravity_throw.ogg` a ~0.5 s thruster slice, and grapple's launch/anchor/snap are one-shots.
+- Phase 7 batch C: the Strike/heavy-ordnance sounds are dedicated CC0 files copied from the same Kenney
+  packs already in this folder (each row above names the original file), so the build stays fully offline
+  and deterministic — no fresh network fetch. `spray_loop.ogg`, `rc_motor.ogg` and `airstrike_plane.ogg`
+  are managed looped sources (Blast Painter spray / RC-car motor / circling plane), driven on/off like the
+  chainsaw and vacuum loops. `nuke_blast.ogg` (the biggest low-frequency CC0 blast we have) is layered with
+  `nuke_rumble.ogg` for the tail. Reused directly (no new file): `explosion_*` (propane/orbital/bomb/rc-car
+  detonations, car-cannon fallback), `detonate_beep.ogg` (accelerating nuke + orbital countdown beeps).
 - `rocket_launch.ogg` (a 5 s thruster loop) is played as a ~0.6 s slice for the launch whoosh.
 - `gunshot.wav` is a single double-barrel trigger blast, pitched down slightly for body.
 - `engine_loop.ogg` is looped with `playbackRate` driven by wheel speed.
