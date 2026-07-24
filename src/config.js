@@ -56,12 +56,14 @@ export const CONFIG = {
     detachKick: 0.5,
     neighborDetachMultiplier: 2.0,
     // Phase 1 props (skin/wall/crate/shed) unchanged. Phase 4 map materials appended (brief section 4).
-    density: { skin: 1600, wall: 1400, crate: 350, shed: 700, brick: 1400, concrete: 2000, wood: 600, plank: 600, roofWood: 600, roofTile: 900, metal: 1200, glass: 250, sand: 1600, rock: 2200 },
-    forceThreshold: { skin: 9000, wall: 5000, shed: 5000, crate: 1500, brick: 5000, concrete: 8000, wood: 3000, plank: 3000, roofWood: 3000, roofTile: 4000, metal: 6000, glass: 800, sand: 9000, rock: 14000 },
+    // Phase 7 batch D: `foam` = the constructive-voxel material sprayed by the Foam Cannon — light density,
+    // low-ish threshold so every weapon breaks it through the normal pipeline, yet high enough to stand/drive on.
+    density: { skin: 1600, wall: 1400, crate: 350, shed: 700, brick: 1400, concrete: 2000, wood: 600, plank: 600, roofWood: 600, roofTile: 900, metal: 1200, glass: 250, sand: 1600, rock: 2200, foam: 120 },
+    forceThreshold: { skin: 9000, wall: 5000, shed: 5000, crate: 1500, brick: 5000, concrete: 8000, wood: 3000, plank: 3000, roofWood: 3000, roofTile: 4000, metal: 6000, glass: 800, sand: 9000, rock: 14000, foam: 2200 },
     // Chunk sizes tuned UP from the section-4 starting values so map-scale chunk totals clear the
     // <=2500 gate on the Radeon 5500M (voxel size is fixed at 0.15). Chunkier pieces also match the
     // brief's "fewer pieces over fine dust" directive. Deviation documented in the phase report.
-    matChunkSize: { brick: 1.1, concrete: 1.4, wood: 1.1, plank: 1.1, roofWood: 1.4, roofTile: 1.4, metal: 1.3, glass: 0.5, sand: 3.0, rock: 1.4 },
+    matChunkSize: { brick: 1.1, concrete: 1.4, wood: 1.1, plank: 1.1, roofWood: 1.4, roofTile: 1.4, metal: 1.3, glass: 0.5, sand: 3.0, rock: 1.4, foam: 0.6 },
     boatWaterDamping: 1.2,
     carWaterDamping: 1.0,
     restitution: 0.12,
@@ -343,6 +345,34 @@ export const CONFIG = {
       clusterSpread: 8, aimSpeed: 0.9,
     },
 
+    // ---- Phase 7 batch D: category 7 "Builders" (constructive-voxel subsystem B) --------------
+    // Cycle order (DoD layout table): Foam Cannon -> Rebuild Gun -> Size Ray.
+    // Foam blobs are FIRST-CLASS destructible volumes (materialClass "foam", tuned in CONFIG.destruction):
+    // every existing weapon breaks them through the normal chunk pipeline with ZERO special-casing.
+    // reattachChunk (Rebuild) + addVolume (Foam) are the two halves of subsystem B. All solo/authoritative;
+    // MP behaviour is a flagged stub (see the destruction/weapons comments + the batch D report).
+
+    // 7a. Foam Cannon — hold LMB sprays pooled blobby projectiles that accrete into a foam grid, hardening
+    // ~1.5 s after the last spray into a destructible volume. cell = grid spacing (m); caps bound memory.
+    foam: {
+      sprayInterval: 0.05, projSpeed: 15, projUp: 2.6, projGravity: 20, projLife: 1.4, projRange: 16,
+      cell: 0.3, brush: 1, accreteDist: 0.42, mergeCells: 12,
+      hardenDelay: 1.5, maxCells: 600, maxVolumes: 12, maxSoftBlobs: 6,
+      projPool: 40, markerPool: 200, softColor: 0xe6eaec,
+    },
+    // 7b. Rebuild Gun — hold LMB aimed at a damaged volume; detached chunks within `range` of the aim point
+    // restore oldest-damage-first at `rate` chunks/s via reattachChunk, each after a brief ghost preview.
+    rebuild: {
+      range: 5, aimRange: 40, rate: 4, ghostTime: 0.2, maxGhosts: 3, ghostColor: 0x9fe0b0, ghostOpacity: 0.4,
+    },
+    // 7c. Size Ray — LMB shrink x0.6 / RMB enlarge x1.6 per zap, clamped 0.25x-3x of original. Targets:
+    // debris chunks + dynamic props (propane / rc car) ONLY; collider is REPLACED at the new scale (Rapier
+    // colliders don't rescale in place), density const => mass ~ scale^3, velocity preserved.
+    sizeRay: {
+      shrink: 0.6, grow: 1.6, min: 0.25, max: 3.0, range: 40,
+      cooldown: 0.5, maxTracked: 20, lerpTime: 0.15,
+    },
+
     viewmodel: {
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
       // Batch C held devices: painter/nuke/orbital/airstrike/carcannon/rccar/propane share the base grip.
@@ -362,6 +392,10 @@ export const CONFIG = {
       grappleOffset: { x: 0.24, y: -0.28, z: -0.44 },
       windOffset: { x: 0.24, y: -0.28, z: -0.42 },
       vacuumOffset: { x: 0.24, y: -0.28, z: -0.42 },
+      // Builders family: emitter devices held slightly lower/forward so the muzzle reads.
+      foamOffset: { x: 0.24, y: -0.28, z: -0.42 },
+      rebuildOffset: { x: 0.24, y: -0.28, z: -0.44 },
+      sizerayOffset: { x: 0.24, y: -0.28, z: -0.44 },
       armsOffset: { x: 0.16, y: -0.34, z: -0.30 },
       armsOffsetSledge: { x: 0.10, y: -0.36, z: -0.34 },
       inwardYaw: -0.08,

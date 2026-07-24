@@ -642,6 +642,87 @@ const rccar = {
   anchors: {},
 };
 
+// ============================ Phase 7 batch D held-models (Builders) ==========================
+// Shared "device with a business-end emitter" language (like Grab & Force), but a constructive read:
+// pale/white foam tank, a green constructor emitter, a purple sci-fi ray gun.
+
+// --- 7a. Foam Cannon: white pressure tank at the back, wide light-blue funnel nozzle at the front ---
+const FCX = 8, FCY = 9, FCZ = 18;
+const foamcannon = {
+  name: "foamcannon", voxelSize: 0.055, palette: [white, lightBlue, gray],
+  parts: [{
+    name: "main", size: [FCX, FCY, FCZ], originOffset: [0, 0, 0],
+    pivot: [FCX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(FCX, FCY, FCZ, (x, y, z) => {
+      const cx = 3.5, cy = 4;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // fat white tank body at the back
+      if (z >= 2 && z <= 9 && r2 <= 3.0 * 3.0) return 1;
+      // flaring funnel nozzle: radius grows toward the front, hollow bore
+      if (z >= 9) {
+        const rad = 2.2 + (z - 9) * 0.32;
+        if (r2 <= rad * rad) return (r2 >= (rad - 1.0) * (rad - 1.0) ? 2 : 0);
+      }
+      // gray breech cap
+      if (z <= 1 && r2 <= 3.0 * 3.0) return 3;
+      // grip
+      if ((x === 3 || x === 4) && y <= 0 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 7b. Rebuild Gun: gray body, glowing green core, an open steel constructor frame at the muzzle ---
+const RBX = 6, RBY = 9, RBZ = 18;
+const rebuildgun = {
+  name: "rebuildgun", voxelSize: 0.055, palette: [gray, green, steel],
+  parts: [{
+    name: "main", size: [RBX, RBY, RBZ], originOffset: [0, 0, 0],
+    pivot: [RBX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(RBX, RBY, RBZ, (x, y, z) => {
+      const cx = 2.5, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // main body block
+      if (z >= 3 && z <= 11 && r2 <= 2.5 * 2.5) return (r2 >= 1.9 * 1.9 ? 1 : 2); // green glowing core inside
+      // open constructor frame at the muzzle: a square outline of steel prongs (inverse-of-destruction read)
+      if (z >= 12 && z <= 16) {
+        const edge = (x === 0 || x === RBX - 1 || y === 1 || y === RBY - 1);
+        const corner = (x === 0 || x === RBX - 1) || (y === 1 || y === RBY - 1);
+        if (edge && corner && (z === 12 || z === 16 || x === 0 || x === RBX - 1 || y === 1 || y === RBY - 1)) return 3;
+      }
+      // grip
+      if ((x === 2 || x === 3) && y <= 1 && z >= 4 && z <= 7) return 3;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
+// --- 7c. Size Ray: dark sci-fi ray gun +Z, purple emitter lens, a yellow calibration dial on top ---
+const SZX = 5, SZY = 9, SZZ = 16;
+const sizeray = {
+  name: "sizeray", voxelSize: 0.055, palette: [darkSteel, purple, yellow],
+  parts: [{
+    name: "main", size: [SZX, SZY, SZZ], originOffset: [0, 0, 0],
+    pivot: [SZX * 0.055 / 2, 2 * 0.055, 6 * 0.055],
+    data: vol(SZX, SZY, SZZ, (x, y, z) => {
+      const cx = 2, cy = 4.5;
+      const r2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+      // ray-gun barrel
+      if (z >= 3 && z <= 12 && r2 <= 2.0 * 2.0) return (r2 >= 1.4 * 1.4 ? 1 : 2); // glowing purple emitter core
+      // purple lens ring at the muzzle
+      if (z >= 12 && z <= 14 && r2 <= 1.6 * 1.6) return 2;
+      // yellow calibration dial on top
+      if (y >= 7 && y <= 8 && x >= 1 && x <= 3 && z >= 5 && z <= 7) return 3;
+      // grip
+      if ((x === 1 || x === 3) && y <= 1 && z >= 4 && z <= 7) return 1;
+      return 0;
+    }).data,
+  }],
+  anchors: {},
+};
+
 // --- First-person arms: two forearm+hand columns straddling the grip; skin hands (+Z front), orange sleeves behind. Palette matches character.js. ---
 const skinTone = { color: "#c9986b", roughness: 0.9, metalness: 0.0 };
 const sleeve = { color: "#d6702a", roughness: 0.9, metalness: 0.0 };
@@ -675,4 +756,6 @@ export default {
   gravitygun, magnetgun, grapplegun, windcannon, vacuum,
   // Phase 7 batch C (Strikes + heavy/vehicular ordnance)
   blastpainter, propane, propanetank, nuke, orbital, airstrike, carcannon, rccar,
+  // Phase 7 batch D (Builders)
+  foamcannon, rebuildgun, sizeray,
 };

@@ -45,6 +45,7 @@ export class Destruction {
     // { pos():Vector3, explode(), chainR, exploded, queued }. NOT in allowedImpactors (never cascades).
     this.damageableProps = new Map(); // colliderHandle -> rec
     this._propChain = [];      // scheduled chain-reaction explosions: [{ rec, at }] (staged 1 beat apart)
+    this._detachSeq = 0;       // Phase 7 batch D: monotonic detach counter -> chunk.detachSeq = "damage age" (Rebuild Gun restores oldest-first)
     this._time = 0;
     // Only these collider handles (player, vehicle) may trigger contact-based detach.
     this.allowedImpactors = new Set();
@@ -73,6 +74,7 @@ export class Destruction {
     for (const d of this.debris) this._removeDebrisBody(d);
     this.debris = [];
     for (const vol of this.volumes) {
+      if (vol.removed) continue; // Phase 7 batch D: despawned foam husk stays gone across a reset
       const dirtyTiles = new Set();
       for (const chunk of vol.chunks) {
         if (chunk.active) continue;
@@ -427,6 +429,7 @@ export class Destruction {
   // Always records an onDetach event (server broadcasts it). Never called in replica mode.
   _detach(vol, chunk, dir, force) {
     chunk.active = false;
+    chunk.detachSeq = ++this._detachSeq; // damage age for the Rebuild Gun (oldest-damage-first restore)
     chunk.body.setBodyType(this.RAPIER.RigidBodyType.Dynamic, true);
     const c = chunk.centroid;
     let mag = D.detachKick * force * CONFIG.fixedDt;
@@ -470,6 +473,110 @@ export class Destruction {
   _flushDetach() {
     if (this._pendingDetach.length && this.onDetach) this.onDetach(this._pendingDetach.slice());
     this._pendingDetach.length = 0;
+  }
+
+  // ---- Phase 7 batch D: constructive-voxel subsystem B (Rebuild Gun + Foam Cannon) ------------
+
+  // reattachChunk (Rebuild Gun): the exact INVERSE of _detach. Snap an inactive chunk back into the
+  // structure as a FIXED body at its original centroid/orientation, re-register its collider, rebuild the
+  // owning tiles. Works whether the flying/settled debris body still exists OR already despawned — only the
+  // original vol.idx / chunkOf / centroid is needed. Authoritative-only: on a replica the server owns
+  // reattach (it mirrors detach events on the same channel — flagged MP stub, see the batch D report).
+  reattachChunk(vol, chunk) {
+    if (this.mode === "replica") return false;
+    if (!chunk || chunk.active) return false;
+    // If the debris body for this chunk is still alive, dispose it (body + mesh + registry entry).
+    const di = this.debris.findIndex((d) => d.chunk === chunk);
+    if (di >= 0) {
+      this._removeDebrisBody(this.debris[di]); // deletes registry[colliderHandle] + removes body/mesh
+      this.debris.splice(di, 1);
+      this._replicaIndex = null;
+    } else {
+      // Debris already despawned: its body/registry are gone. Nothing to remove — just resurrect the chunk.
+      this.registry.delete(chunk.colliderHandle); // idempotent safety
+    }
+    chunk.mesh = null;
+    createChunkBody(vol, chunk, this); // fresh FIXED body + collider + registry entry at the original centroid
+    chunk.active = true;
+    chunk.detachSeq = undefined;
+    if (this.scene) for (const tid of chunk.tileIds) rebuildTile(vol, tid, this.scene, this.materials);
+    return true;
+  }
+
+  // Foam Cannon adds new volumes via addVolume(); despawnVolume retires the oldest hardened foam blob when
+  // the live-foam cap is hit. Removes this volume's debris + chunk bodies + colliders + tile meshes and marks
+  // the volume a husk (id preserved so no reindex). resetAll/snapshot skip husks (vol.removed).
+  despawnVolume(vol) {
+    if (!vol || vol.removed) return;
+    this.debris = this.debris.filter((d) => {
+      if (d.vol === vol) { this._removeDebrisBody(d); return false; }
+      return true;
+    });
+    this._replicaIndex = null;
+    for (const chunk of vol.chunks) {
+      this.registry.delete(chunk.colliderHandle); // idempotent (debris path may have removed it already)
+      if (chunk.active && chunk.body) { try { this.world.removeRigidBody(chunk.body); } catch (e) {} }
+      chunk.active = false;
+      chunk.body = null;
+    }
+    if (this.scene) for (const tile of vol.tiles) {
+      if (tile.mesh) { this.scene.remove(tile.mesh); tile.mesh.geometry.dispose(); tile.mesh = null; }
+    }
+    vol.removed = true;
+  }
+
+  // Public wrapper: build a centered geometry for one chunk (used by the Rebuild Gun's ghost preview).
+  chunkGeometry(vol, chunk) { return meshChunk(vol, chunk); }
+
+  // Rebuild Gun target scan: pick the inactive chunk to restore next. The nearest inactive chunk to the aim
+  // point selects the target VOLUME (so a hole heals as one structure); within that volume, restore
+  // oldest-damage-first (smallest chunk.detachSeq) among inactive chunks whose centroid is within `radius`
+  // of the aim point. `isBusy(vol,chunk)` skips chunks already queued as ghosts. Returns { vol, chunk } | null.
+  rebuildCandidate(aim, radius, isBusy) {
+    if (this.mode === "replica") return null;
+    let target = null, bestD = Infinity;
+    for (const vol of this.volumes) {
+      if (vol.removed) continue;
+      for (const chunk of vol.chunks) {
+        if (chunk.active) continue;
+        if (isBusy && isBusy(vol, chunk)) continue;
+        const d = chunk.centroid.distanceTo(aim);
+        if (d < bestD) { bestD = d; target = vol; }
+      }
+    }
+    if (!target || bestD > radius) return null;
+    let pick = null, pickSeq = Infinity;
+    for (const chunk of target.chunks) {
+      if (chunk.active) continue;
+      if (isBusy && isBusy(target, chunk)) continue;
+      if (chunk.centroid.distanceTo(aim) > radius) continue;
+      const seq = chunk.detachSeq != null ? chunk.detachSeq : 0;
+      if (seq < pickSeq) { pickSeq = seq; pick = chunk; }
+    }
+    return pick ? { vol: target, chunk: pick } : null;
+  }
+
+  // Size Ray: replace a DEBRIS chunk's collider with a scaled cuboid (Rapier colliders don't rescale in
+  // place). Keeps the same dynamic body (velocity preserved); density is constant so mass ~ scale^3. Updates
+  // the registry so debris lookups (vacuum/gravity/size) keep resolving. `half` = target half-extents (m).
+  rescaleDebris(entry, half, center) {
+    if (!entry || !entry.chunk || !entry.body) return false;
+    const chunk = entry.chunk;
+    const oldH = chunk.colliderHandle;
+    const oldCol = this.world.getCollider(oldH);
+    this.registry.delete(oldH);
+    if (oldCol) { try { this.world.removeCollider(oldCol, true); } catch (e) {} }
+    const density = (entry.vol && entry.vol.spec) ? entry.vol.spec.density : 1000;
+    const cd = this.RAPIER.ColliderDesc.cuboid(Math.max(half.x, 0.02), Math.max(half.y, 0.02), Math.max(half.z, 0.02))
+      .setDensity(density).setFriction(D.friction).setRestitution(D.restitution);
+    if (center) cd.setTranslation(center.x, center.y, center.z);
+    const col = this.world.createCollider(cd, entry.body);
+    chunk.colliderHandle = col.handle;
+    this.registry.set(col.handle, { volume: entry.vol, chunk });
+    if (typeof entry.body.recomputeMassPropertiesFromColliders === "function") {
+      try { entry.body.recomputeMassPropertiesFromColliders(); } catch (e) {}
+    }
+    return true;
   }
 
   _enforceCap() {
@@ -579,6 +686,7 @@ export class Destruction {
       live.add(d.vol.id + ":" + d.chunk.id);
     }
     for (const vol of this.volumes) {
+      if (vol.removed) continue; // Phase 7 batch D: removed foam husk isn't part of the world snapshot
       const cids = [];
       for (const chunk of vol.chunks) if (!chunk.active) cids.push(chunk.id);
       if (cids.length) detached.push([vol.id, cids]);
@@ -690,6 +798,7 @@ export class Destruction {
 
   _resetReplica() {
     for (const vol of this.volumes) {
+      if (vol.removed) continue; // Phase 7 batch D: despawned foam husk stays gone across a reset
       const dirtyTiles = new Set();
       for (const chunk of vol.chunks) {
         if (chunk.active) continue;

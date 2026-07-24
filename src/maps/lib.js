@@ -10,6 +10,7 @@ const MAT_CLASS = {
   brick: "concrete", concrete: "concrete", rock: "concrete", roofTile: "concrete", glass: "concrete",
   wood: "wood", plank: "wood", roofWood: "wood",
   metal: "metal", sand: "dirt", skin: "dirt",
+  foam: "foam", // Phase 7 batch D: constructive-voxel foam is its own coarse class (default tool mult 1.0).
 };
 export function matClass(key) { return MAT_CLASS[key] || "concrete"; }
 
@@ -40,6 +41,9 @@ export const MAT = {
   glass: mkMat("glass", "#9fc4d6", "#c2e2ef", 0.25, 0.3),
   sand: mkMat("sand", "#c8a86b", "#b09a62", 0.95, 0.0),
   rock: mkMat("rock", "#9c8b73", "#7f705c", 0.95, 0.0),
+  // Phase 7 batch D: matte pale foam. Runtime foam blobs (Foam Cannon) build their own addVolume spec from
+  // CONFIG.destruction tuning; this entry keeps foam a first-class §4 material for completeness/consistency.
+  foam: mkMat("foam", "#e6eaec", "#c6cace", 0.95, 0.0),
 };
 
 const LEAF = localMat("#4f7a3f", "#3c6030", 0.92, 0.0, "wood");

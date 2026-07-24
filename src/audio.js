@@ -61,6 +61,13 @@ const FILES = {
   airPlane: ["airstrike_plane.ogg"],
   airFlyby: ["airstrike_flyby.ogg"],
   bombWhistle: ["bomb_whistle.ogg"],
+  // ---- Phase 7 batch D: Builders (CC0 Kenney reuse, see CREDITS.md) ----
+  foamSpray: ["foam_spray.ogg"],
+  foamSplat: ["foam_splat.ogg"],
+  foamHarden: ["foam_harden.ogg"],
+  rebuildSettle: ["rebuild_settle.ogg"],
+  sizeShrink: ["size_shrink.ogg"],
+  sizeGrow: ["size_grow.ogg"],
 };
 
 export class GameAudio {
@@ -363,4 +370,31 @@ export class GameAudio {
   // Airstrike: attack-run flyby whoosh + falling-bomb whistle (impacts reuse the explosion voices).
   airFlyby() { this._play("airFlyby", { gain: 0.55, rate: 0.9 }); }
   bombWhistle() { this._play("bombWhistle", { gain: 0.5, rate: 0.8 }); }
+
+  // ---- Phase 7 batch D: Builders -------------------------------------------------------------
+  // Foam Cannon wet-spray loop (managed source, on while holding LMB) + squelchy splat on each landing
+  // (rate-limited by the caller) + a subtle hardening "crack-set" when a blob sets into a volume.
+  foamSpray(active) { this._setLoop("foamSpray", active ? 0.26 : 0); }
+  foamSplat(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("foamSplat", { gain: 0.5 * atten, rate: 0.9 + Math.random() * 0.2 });
+  }
+  foamHarden(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("foamHarden", { gain: 0.45 * atten, rate: this._jitter() });
+  }
+  // Rebuild Gun: reverse-crumble / stone-settling per restored chunk (rate-limited by the caller).
+  rebuildSettle(dist) {
+    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
+    this._play("rebuildSettle", { gain: 0.45 * atten, rate: 0.85 + Math.random() * 0.2 });
+  }
+  // Size Ray: two DISTINCT sci-fi zaps (shrink vs. grow) — separate files, never a pitch-shifted single one.
+  sizeShrink(dist) {
+    const atten = Math.max(0.25, Math.min(1, 1 / (1 + dist * 0.12)));
+    this._play("sizeShrink", { gain: 0.55 * atten, rate: this._jitter() });
+  }
+  sizeGrow(dist) {
+    const atten = Math.max(0.25, Math.min(1, 1 / (1 + dist * 0.12)));
+    this._play("sizeGrow", { gain: 0.55 * atten, rate: this._jitter() });
+  }
 }

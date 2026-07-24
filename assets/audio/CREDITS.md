@@ -63,6 +63,12 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
 | airstrike_plane.ogg | thrusterFire_001.ogg (via plane_loop.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | airstrike_flyby.ogg | lowFrequency_explosion_001.ogg (via wind_whoomp.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 | bomb_whistle.ogg | knifeSlice.ogg (via swing.ogg) | Kenney — RPG Audio — https://kenney.nl/assets/rpg-audio | Kenney (kenney.nl) | CC0 1.0 |
+| foam_spray.ogg | spaceEngineSmall_001.ogg (via spray_loop.ogg) | Kenney — Sci-Fi Sounds — https://kenney.nl/assets/sci-fi-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| foam_splat.ogg | slime_000.ogg (via stick_splat.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| foam_harden.ogg | impactTin_medium_000.ogg (via bounce_clink.ogg) | Kenney — Impact Sounds — https://kenney.nl/assets/impact-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| rebuild_settle.ogg | impactWood_heavy_000.ogg (via impact_1.ogg) | Kenney — Impact Sounds | Kenney (kenney.nl) | CC0 1.0 |
+| size_shrink.ogg | laserSmall_003.ogg (via grapple_launch.ogg) | Kenney — Sci-Fi Sounds — https://kenney.nl/assets/sci-fi-sounds | Kenney (kenney.nl) | CC0 1.0 |
+| size_grow.ogg | forceField_003.ogg (via magnet_repel.ogg) | Kenney — Sci-Fi Sounds | Kenney (kenney.nl) | CC0 1.0 |
 
 ## Runtime usage notes
 - Phase 3 vehicle loops: `rotor_loop.ogg` (helicopter), `plane_loop.ogg` (airplane),
@@ -89,6 +95,11 @@ project and loaded locally at runtime (no hotlinking), so the game works offline
   chainsaw and vacuum loops. `nuke_blast.ogg` (the biggest low-frequency CC0 blast we have) is layered with
   `nuke_rumble.ogg` for the tail. Reused directly (no new file): `explosion_*` (propane/orbital/bomb/rc-car
   detonations, car-cannon fallback), `detonate_beep.ogg` (accelerating nuke + orbital countdown beeps).
+- Phase 7 batch D (Builders): CC0 files copied from the same Kenney packs already committed here (each row
+  above names the original). `foam_spray.ogg` is a managed looped source (Foam Cannon wet-spray, on/off like
+  the vacuum/spray loops). `foam_splat.ogg` (squelch) + `foam_harden.ogg` (crack-set) + `rebuild_settle.ogg`
+  (reverse-crumble stone settling) are rate-limited one-shots. `size_shrink.ogg` (laser) and `size_grow.ogg`
+  (force-field) are two DISTINCT CC0 files for the Size Ray — never one pitch-shifted source.
 - `rocket_launch.ogg` (a 5 s thruster loop) is played as a ~0.6 s slice for the launch whoosh.
 - `gunshot.wav` is a single double-barrel trigger blast, pitched down slightly for body.
 - `engine_loop.ogg` is looped with `playbackRate` driven by wheel speed.

@@ -298,6 +298,44 @@ export class Weapons {
     this._airMarker = new THREE.Mesh(this._splatGeo, this._airMarkMat);
     this._airMarker.rotation.x = -Math.PI / 2; this._airMarker.visible = false; scene.add(this._airMarker);
 
+    // --- Phase 7 batch D: Builders (constructive-voxel subsystem B) shared resources -----------
+    // Foam Cannon: pooled spray-projectile spheres (fly a short arc) + pooled soft-cell markers (visual only
+    // pre-harden) + soft blobs (grids accreting on the global 0.3 m lattice) + hardened foam volume refs.
+    this._foamSphereGeo = new THREE.SphereGeometry(W.foam.cell * 0.55, 6, 5);
+    this._foamProjMat = new THREE.MeshStandardMaterial({ color: W.foam.softColor, roughness: 0.95, metalness: 0.0 });
+    this._foamProjPool = [];
+    for (let i = 0; i < W.foam.projPool; i++) {
+      const m = new THREE.Mesh(this._foamSphereGeo, this._foamProjMat);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._foamProjPool.push({ mesh: m, used: false });
+    }
+    this._foamMarkerGeo = new THREE.BoxGeometry(W.foam.cell, W.foam.cell, W.foam.cell);
+    this._foamMarkerMat = new THREE.MeshStandardMaterial({ color: W.foam.softColor, roughness: 0.98, metalness: 0.0, transparent: true, opacity: 0.85 });
+    this._foamMarkerPool = [];
+    for (let i = 0; i < W.foam.markerPool; i++) {
+      const m = new THREE.Mesh(this._foamMarkerGeo, this._foamMarkerMat);
+      m.castShadow = false; m.receiveShadow = false; m.visible = false;
+      scene.add(m);
+      this._foamMarkerPool.push({ mesh: m, used: false });
+    }
+    this._foamProj = [];         // in-flight spray projectiles { pool, pos, vel, life }
+    this._foamBlobs = [];        // soft (pre-harden) blobs { cells:Map(key->marker), min[], max[], lastSpray, id }
+    this._foamVols = [];         // hardened foam volume refs (oldest despawns first at the cap)
+    this._foamSprayTimer = 0;
+    this._foamBlobSeq = 0;
+    this._foamSplatT = 0;        // splat-audio rate limiter
+
+    // Rebuild Gun: translucent ghost-preview meshes (chunk mesh at 40% opacity ~0.2 s before solidifying).
+    this._ghostMat = new THREE.MeshBasicMaterial({ color: W.rebuild.ghostColor, transparent: true, opacity: W.rebuild.ghostOpacity, depthWrite: false });
+    this._rebuildGhosts = [];    // { vol, chunk, mesh, t }
+    this._rebuildAcc = 0;
+    this._rebuildSettleT = 0;    // settle-audio rate limiter
+
+    // Size Ray: per-object scale-lerp animations + cooldown/track bookkeeping (caps the tracked set at 20).
+    this._sizeAnims = [];        // { mesh, from, to, t }
+    this._sizeTracked = [];      // objects zapped this session (oldest silently dropped past the cap)
+
     // Label DOM.
     this._label = document.getElementById("tool-label");
     this._labelNum = document.getElementById("tool-label-num");
@@ -334,6 +372,10 @@ export class Weapons {
       { num: 6, catLabel: "Strikes", id: "airstrike", name: "Airstrike Designator", kind: "airstrike", model: toolModels.airstrike, base: VM.airstrikeOffset },
       { num: 6, catLabel: "Strikes", id: "orbital", name: "Orbital Laser Designator", kind: "orbital", model: toolModels.orbital, base: VM.orbitalOffset },
       { num: 6, catLabel: "Strikes", id: "nuke", name: "Nuke", kind: "nuke", model: toolModels.nuke, base: VM.nukeOffset },
+      // Category 7 "Builders" (Batch D) — cycle order: Foam Cannon -> Rebuild Gun -> Size Ray. 8-9 stay reserved.
+      { num: 7, catLabel: "Builders", id: "foamcannon", name: "Foam Cannon", kind: "foamcannon", model: toolModels.foamcannon, base: VM.foamOffset },
+      { num: 7, catLabel: "Builders", id: "rebuildgun", name: "Rebuild Gun", kind: "rebuildgun", model: toolModels.rebuildgun, base: VM.rebuildOffset },
+      { num: 7, catLabel: "Builders", id: "sizeray", name: "Size Ray", kind: "sizeray", model: toolModels.sizeray, base: VM.sizerayOffset },
     ];
     const meleeKinds = new Set(["melee", "crowbar", "chainsaw"]);
     this.categories = [];
@@ -445,6 +487,11 @@ export class Weapons {
     this._tickAirDrops(dt);
     this._tickScreenFlash(dt);
     this._tickDustColumn(dt);
+    // Batch D: foam projectiles fly + accrete + harden on their own timers (like rockets); rebuild ghosts
+    // solidify and size-lerps finish even after a tool-switch.
+    this._tickFoam(dt);
+    this._tickRebuildGhosts(dt);
+    this._tickSizeAnims(dt);
     this.audio.rcMotor(!!this._rc); // RC-car electric motor loop (on only while a car is deployed)
 
     const driving = mode !== "walk";
@@ -458,6 +505,7 @@ export class Weapons {
       if (this._grappleFoot || this._grappleHook) this._detachFootGrapple();
       this._silenceGrabForceAudio();
       this.audio.blastSpray(false);
+      this.audio.foamSpray(false); // Batch D: foam spray loop is a foot-only tool
       if (this._airPlane) this._despawnPlane(); // designator's scripted plane exists only on foot/equipped
       // Grapple is the one tool usable while driving (the wall-tearing fantasy). No-op for any other tool.
       this._tickVehicleGrapple(dt);
@@ -491,6 +539,8 @@ export class Weapons {
     // Blast Painter hold-spray + Airstrike scripted plane / R-cycle (spawn while equipped, despawn otherwise).
     this._tickBlastPainter(dt, equipped);
     this._tickAirstrike(dt, equipped);
+    // Builders: Foam Cannon hold-spray spawn + Rebuild Gun hold-heal (Size Ray fires on LMB/RMB edges above).
+    this._tickBuilders(dt, equipped);
     // Demolition-wire line visuals follow their (possibly vehicle-parented) charges every frame.
     if (this.wireCharges.length) this._rebuildWireLines();
 
@@ -565,6 +615,10 @@ export class Weapons {
       case "nuke": if (lmb) this._throwNuke(item); break;
       case "orbital": if (lmb) this._plantOrbital(item); break;
       case "airstrike": if (lmb) this._airDesignateFpp(item); if (rmb) this._enterPlaneView(); break;
+      // Batch D Builders:
+      case "foamcannon": break;  // hold-LMB spray handled in _tickBuilders
+      case "rebuildgun": break;  // hold-LMB heal handled in _tickBuilders
+      case "sizeray": if (lmb) this._sizeZap(false); if (rmb) this._sizeZap(true); break; // LMB shrink / RMB enlarge
       // Vacuum / Magnet / Gravity / Grapple are continuous or hold-based — handled in _tickGrabForce.
     }
   }
@@ -806,6 +860,8 @@ export class Weapons {
     this._flashT = 0; this._shakeT = 0; this._dustColT = 0;
     this._flashDiv.style.opacity = "0"; this._dustCol.visible = false;
     this.audio.blastSpray(false); this.audio.rcMotor(false); this.audio.airPlaneLoop(false);
+    // Phase 7 batch D: Builders transient state (foam projectiles/blobs/volumes, rebuild ghosts, size lerps).
+    this._clearBuilders();
   }
 
   // --- MP rocket relay hooks (called by replication.js) --------------------------------------
@@ -2344,6 +2400,319 @@ export class Weapons {
     if (this.input.consumeLMB() && point && !this._airRun) this._airDesignate(point);
     if (this.input.consumeRMB()) this._exitPlaneView();
     this.input.consumeDigits(); this.input.consumeWheel();
+  }
+
+  // ============================ Phase 7 batch D: Builders (constructive-voxel subsystem B) =====
+  // MP note (flag): all three builders are solo/authoritative. On a replica client (this.net set) foam
+  // stays cosmetic (spray projectiles fade, no accretion/harden — server would author blob grids and sync
+  // one compact voxel-grid message per hardened blob), and Rebuild/Size are no-ops (reattachChunk mirrors
+  // the detach channel; size scale is one synced float). Deliberate stubs, NOT a netcode redesign.
+
+  // Walk-mode dispatcher: Foam Cannon hold-spray spawn + Rebuild Gun hold-heal. (Size Ray fires on the
+  // LMB/RMB edges routed through _handleFire.) Manages the foam spray loop audio every frame.
+  _tickBuilders(dt, equipped) {
+    const item = equipped ? this._activeItem() : null;
+    const kind = item ? item.kind : null;
+    const foamHold = kind === "foamcannon" && this.input.lmbDown;
+    this.audio.foamSpray(foamHold);
+    if (foamHold) {
+      this._foamSprayTimer += dt;
+      while (this._foamSprayTimer >= W.foam.sprayInterval) {
+        this._foamSprayTimer -= W.foam.sprayInterval;
+        this._spawnFoamProjectile(item);
+      }
+    } else this._foamSprayTimer = 0;
+    if (kind === "rebuildgun" && this.input.lmbDown && !this.net) this._tickRebuild(dt);
+    else this._rebuildAcc = 0;
+  }
+
+  // --- 7a. Foam Cannon: pooled spray projectiles that accrete into foam blobs, hardening into volumes -----
+  _acquireFoamProj() { for (const e of this._foamProjPool) if (!e.used) { e.used = true; e.mesh.visible = true; return e; } return null; }
+  _releaseFoamProj(e) { if (e) { e.used = false; e.mesh.visible = false; } }
+  _acquireFoamMarker() { for (const e of this._foamMarkerPool) if (!e.used) { e.used = true; return e; } return null; }
+  _releaseFoamMarker(e) { if (e) { e.used = false; e.mesh.visible = false; } }
+
+  _spawnFoamProjectile(item) {
+    const dir = this._aimDir();
+    const origin = this._muzzleWorld(item);
+    const vel = dir.clone().multiplyScalar(W.foam.projSpeed);
+    vel.y += W.foam.projUp;
+    const pool = this._acquireFoamProj();
+    if (pool) { pool.mesh.position.copy(origin); pool.mesh.scale.setScalar(0.7 + Math.random() * 0.6); } // slight wobble
+    this._foamProj.push({ pool, pos: origin.clone(), vel, life: W.foam.projLife });
+    this._recoilZ -= 0.008;
+  }
+
+  // Always-on: fly the spray arc (short-range, ray-stepped), land on world hits OR when close to an existing
+  // foam cell (mid-air accretion => bridges), then harden idle blobs. Runs regardless of the equipped tool.
+  _tickFoam(dt) {
+    const fm = W.foam;
+    if (this._foamProj.length) {
+      const down = new THREE.Vector3(0, -1, 0);
+      const keep = [];
+      for (const p of this._foamProj) {
+        p.life -= dt;
+        if (p.life <= 0) { this._releaseFoamProj(p.pool); continue; }
+        p.vel.y -= fm.projGravity * dt;
+        const step = p.vel.clone().multiplyScalar(dt);
+        const dist = step.length();
+        const dir = dist > 1e-6 ? step.clone().multiplyScalar(1 / dist) : down;
+        const ray = new this.RAPIER.Ray(p.pos, dir);
+        const hit = this.world.castRay(ray, Math.max(dist, 0.02), true, undefined, undefined, undefined, this.player.body);
+        let land = null;
+        if (hit) land = p.pos.clone().addScaledVector(dir, hit.toi);
+        else { p.pos.add(step); if (this._foamNear(p.pos)) land = p.pos.clone(); }
+        if (land) { this._landFoam(land); this._releaseFoamProj(p.pool); continue; }
+        if (p.pool) p.pool.mesh.position.copy(p.pos);
+        keep.push(p);
+      }
+      this._foamProj = keep;
+    }
+    // Harden blobs idle for hardenDelay (solo only — MP foam is cosmetic, so no soft blobs ever exist there).
+    if (this._foamBlobs.length) {
+      const due = [];
+      for (const b of this._foamBlobs) if (this._time - b.lastSpray > fm.hardenDelay) due.push(b);
+      for (const b of due) this._hardenFoamBlob(b);
+    }
+  }
+
+  // Is `pos` adjacent (within one lattice cell) to any existing soft-foam cell? Enables mid-air bridge growth.
+  _foamNear(pos) {
+    if (!this._foamBlobs.length) return false;
+    const cell = W.foam.cell;
+    const gx = Math.floor(pos.x / cell), gy = Math.floor(pos.y / cell), gz = Math.floor(pos.z / cell);
+    for (const b of this._foamBlobs) {
+      for (let dz = -1; dz <= 1; dz++)
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++)
+            if (b.cells.has((gx + dx) + "," + (gy + dy) + "," + (gz + dz))) return true;
+    }
+    return false;
+  }
+
+  _landFoam(point) {
+    this._foamSplat(point);
+    if (this.net) return; // MP stub (flagged): foam is cosmetic on a replica — no accretion / no harden
+    const cell = W.foam.cell;
+    const gx = Math.floor(point.x / cell), gy = Math.floor(point.y / cell), gz = Math.floor(point.z / cell);
+    const blob = this._foamTargetBlob(gx, gy, gz);
+    this._addFoamCells(blob, gx, gy, gz);
+    blob.lastSpray = this._time;
+  }
+
+  _foamTargetBlob(gx, gy, gz) {
+    const M = W.foam.mergeCells;
+    for (const b of this._foamBlobs) {
+      if (gx >= b.min[0] - M && gx <= b.max[0] + M && gy >= b.min[1] - M && gy <= b.max[1] + M && gz >= b.min[2] - M && gz <= b.max[2] + M) return b;
+    }
+    const b = { id: this._foamBlobSeq++, cells: new Map(), min: [gx, gy, gz], max: [gx, gy, gz], lastSpray: this._time };
+    this._foamBlobs.push(b);
+    // Bound concurrent soft blobs: force-harden the oldest if we exceed the cap (never harden the fresh one).
+    while (this._foamBlobs.length > W.foam.maxSoftBlobs && this._foamBlobs[0] !== b) this._hardenFoamBlob(this._foamBlobs[0]);
+    return b;
+  }
+
+  // Accrete a small plus-brush at the landing cell + one cell below (thickness). Capped at fm.maxCells/blob.
+  _addFoamCells(blob, gx, gy, gz) {
+    const cell = W.foam.cell;
+    const add = (x, y, z) => {
+      if (blob.cells.size >= W.foam.maxCells) return;
+      const key = x + "," + y + "," + z;
+      if (blob.cells.has(key)) return;
+      const mk = this._acquireFoamMarker();
+      if (mk) { mk.mesh.position.set((x + 0.5) * cell, (y + 0.5) * cell, (z + 0.5) * cell); mk.mesh.visible = true; }
+      blob.cells.set(key, mk || null);
+      if (x < blob.min[0]) blob.min[0] = x; if (x > blob.max[0]) blob.max[0] = x;
+      if (y < blob.min[1]) blob.min[1] = y; if (y > blob.max[1]) blob.max[1] = y;
+      if (z < blob.min[2]) blob.min[2] = z; if (z > blob.max[2]) blob.max[2] = z;
+    };
+    add(gx, gy, gz);
+    const r = W.foam.brush;
+    for (let d = 1; d <= r; d++) { add(gx + d, gy, gz); add(gx - d, gy, gz); add(gx, gy, gz + d); add(gx, gy, gz - d); }
+    add(gx, gy - 1, gz); // thicken downward so it reads as a slab, not a film
+  }
+
+  _hardenFoamBlob(blob) {
+    const i = this._foamBlobs.indexOf(blob);
+    if (i >= 0) this._foamBlobs.splice(i, 1);
+    for (const mk of blob.cells.values()) this._releaseFoamMarker(mk);
+    if (blob.cells.size === 0) return;
+    const D = CONFIG.destruction;
+    const cell = W.foam.cell;
+    const [minx, miny, minz] = blob.min;
+    const nx = blob.max[0] - minx + 1, ny = blob.max[1] - miny + 1, nz = blob.max[2] - minz + 1;
+    const cells = blob.cells;
+    const spec = {
+      name: "foam", voxelSize: cell, dims: [nx, ny, nz], origin: [minx * cell, miny * cell, minz * cell],
+      palette: [
+        { color: "#e6eaec", roughness: 0.95, metalness: 0.0 },
+        { color: "#c6cace", roughness: 0.95, metalness: 0.0 },
+      ],
+      fill: (x, y, z) => cells.has((minx + x) + "," + (miny + y) + "," + (minz + z)) ? 1 : 0,
+      density: D.density.foam, threshold: D.forceThreshold.foam, chunkSize: D.matChunkSize.foam,
+      kind: "single", materialClass: "foam",
+    };
+    const vol = this.destruction.addVolume(spec);
+    this._foamVols.push(vol);
+    while (this._foamVols.length > W.foam.maxVolumes) this.destruction.despawnVolume(this._foamVols.shift());
+    this.audio.foamHarden(this._camPos().distanceTo(new THREE.Vector3((minx + nx / 2) * cell, (miny + ny / 2) * cell, (minz + nz / 2) * cell)));
+  }
+
+  _foamSplat(point) {
+    if (this._time - this._foamSplatT < 0.06) return; // rate-limit the squelch
+    this._foamSplatT = this._time;
+    this.audio.foamSplat(this._camPos().distanceTo(point));
+  }
+
+  // --- 7b. Rebuild Gun: hold LMB aimed at a damaged volume; reattach detached chunks oldest-first ---------
+  _tickRebuild(dt) {
+    const rb = W.rebuild;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRay(ray, rb.aimRange, true, undefined, undefined, undefined, this.player.body);
+    const aim = hit ? origin.clone().addScaledVector(dir, hit.toi) : origin.clone().addScaledVector(dir, rb.aimRange);
+    this._rebuildAcc += dt;
+    const per = 1 / rb.rate;
+    while (this._rebuildAcc >= per && this._rebuildGhosts.length < rb.maxGhosts) {
+      const cand = this.destruction.rebuildCandidate(aim, rb.range, (vol, chunk) => this._ghostBusy(chunk));
+      if (!cand) { this._rebuildAcc = 0; break; }
+      this._rebuildAcc -= per;
+      this._startGhost(cand.vol, cand.chunk);
+    }
+  }
+  _ghostBusy(chunk) { for (const g of this._rebuildGhosts) if (g.chunk === chunk) return true; return false; }
+  _startGhost(vol, chunk) {
+    const geo = this.destruction.chunkGeometry(vol, chunk);
+    geo.clearGroups(); // one flat translucent material, ignore the rough/shiny/emissive groups
+    const mesh = new THREE.Mesh(geo, this._ghostMat);
+    mesh.position.copy(chunk.centroid);
+    this.scene.add(mesh);
+    this._rebuildGhosts.push({ vol, chunk, mesh, t: W.rebuild.ghostTime });
+  }
+  // Always-on: age each ghost; when it expires, reattach the chunk (subsystem B) and play a settling sound.
+  _tickRebuildGhosts(dt) {
+    if (!this._rebuildGhosts.length) return;
+    const keep = [];
+    for (const g of this._rebuildGhosts) {
+      g.t -= dt;
+      if (g.t <= 0) {
+        this.scene.remove(g.mesh); g.mesh.geometry.dispose();
+        if (this.destruction.reattachChunk(g.vol, g.chunk)) this._rebuildSettle(g.chunk.centroid);
+        continue;
+      }
+      keep.push(g);
+    }
+    this._rebuildGhosts = keep;
+  }
+  _rebuildSettle(pos) {
+    if (this._time - this._rebuildSettleT < 0.12) return; // rate-limit
+    this._rebuildSettleT = this._time;
+    this.audio.rebuildSettle(this._camPos().distanceTo(pos));
+  }
+
+  // --- 7c. Size Ray: LMB shrink x0.6 / RMB enlarge x1.6 on debris chunks + dynamic props only -------------
+  _sizeZap(grow) {
+    if (this.net) return; // MP stub (flagged): scale would be one synced float on a server-owned body
+    const sr = W.sizeRay;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const ray = new this.RAPIER.Ray(origin, dir);
+    const hit = this.world.castRay(ray, sr.range, true, undefined, undefined, undefined, this.player.body);
+    if (!hit) return;
+    const handle = hit.collider.handle;
+    const entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
+    if (entry) { this._sizeApplyDebris(entry, grow); return; }
+    const tank = this.findPropByCollider(handle); // dynamic prop (propane tank)
+    if (tank) { this._sizeApplyProp(tank, grow); return; }
+    // Refused: ground / attached structure / vehicle / player — brief strain feedback, no scaling.
+    this._strainT = W.gravityGun.strainTime; this._recoilPitch += 0.03;
+  }
+  // Local half-extents (unscaled mesh bbox * scale) + its center offset, for the replacement cuboid collider.
+  _meshHalfCenter(mesh, scale) {
+    const geo = mesh.geometry;
+    if (!geo.boundingBox) geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+    return {
+      half: { x: Math.max((bb.max.x - bb.min.x) / 2, 0.02) * scale, y: Math.max((bb.max.y - bb.min.y) / 2, 0.02) * scale, z: Math.max((bb.max.z - bb.min.z) / 2, 0.02) * scale },
+      center: { x: (bb.max.x + bb.min.x) / 2 * scale, y: (bb.max.y + bb.min.y) / 2 * scale, z: (bb.max.z + bb.min.z) / 2 * scale },
+    };
+  }
+  _sizeApplyDebris(entry, grow) {
+    const sr = W.sizeRay;
+    if (this._time - (entry.sizeCd != null ? entry.sizeCd : -1e9) < sr.cooldown) return;
+    const cur = entry.sizeScale || 1;
+    const ns = THREE.MathUtils.clamp(cur * (grow ? sr.grow : sr.shrink), sr.min, sr.max);
+    if (Math.abs(ns - cur) < 1e-3) return; // already at a clamp limit
+    entry.sizeCd = this._time;
+    const hc = this._meshHalfCenter(entry.mesh, ns);
+    this.destruction.rescaleDebris(entry, hc.half, hc.center);
+    entry.sizeScale = ns;
+    this._startSizeLerp(entry.mesh, ns);
+    this._trackSized(entry);
+    this.audio[grow ? "sizeGrow" : "sizeShrink"](this._camPos().distanceTo(entry.mesh.position));
+  }
+  _sizeApplyProp(tank, grow) {
+    const sr = W.sizeRay;
+    if (this._time - (tank.sizeCd != null ? tank.sizeCd : -1e9) < sr.cooldown) return;
+    const cur = tank.sizeScale || 1;
+    const ns = THREE.MathUtils.clamp(cur * (grow ? sr.grow : sr.shrink), sr.min, sr.max);
+    if (Math.abs(ns - cur) < 1e-3) return;
+    tank.sizeCd = this._time;
+    const hc = this._meshHalfCenter(tank.mesh, ns);
+    this.destruction.unregisterDamageableProp(tank.collider.handle);
+    try { this.world.removeCollider(tank.collider, true); } catch (e) {}
+    const cd = this.RAPIER.ColliderDesc.cuboid(hc.half.x, hc.half.y, hc.half.z)
+      .setTranslation(hc.center.x, hc.center.y, hc.center.z)
+      .setDensity(W.propane.density).setFriction(0.85).setRestitution(0.2);
+    const col = this.world.createCollider(cd, tank.body);
+    tank.collider = col;
+    this.destruction.registerDamageableProp(col.handle, tank);
+    if (typeof tank.body.recomputeMassPropertiesFromColliders === "function") { try { tank.body.recomputeMassPropertiesFromColliders(); } catch (e) {} }
+    tank.sizeScale = ns;
+    this._startSizeLerp(tank.mesh, ns);
+    this._trackSized(tank);
+    this.audio[grow ? "sizeGrow" : "sizeShrink"](this._camPos().distanceTo(tank.mesh.position));
+  }
+  _startSizeLerp(mesh, to) {
+    const from = mesh.scale.x || 1;
+    this._sizeAnims = this._sizeAnims.filter((a) => a.mesh !== mesh);
+    this._sizeAnims.push({ mesh, from, to, t: 0 });
+  }
+  _tickSizeAnims(dt) {
+    if (!this._sizeAnims.length) return;
+    const keep = [];
+    for (const a of this._sizeAnims) {
+      a.t += dt;
+      const u = Math.min(1, a.t / W.sizeRay.lerpTime);
+      if (a.mesh) a.mesh.scale.setScalar(a.from + (a.to - a.from) * u);
+      if (u < 1) keep.push(a);
+    }
+    this._sizeAnims = keep;
+  }
+  _trackSized(obj) {
+    const i = this._sizeTracked.indexOf(obj);
+    if (i >= 0) this._sizeTracked.splice(i, 1);
+    this._sizeTracked.push(obj);
+    while (this._sizeTracked.length > W.sizeRay.maxTracked) this._sizeTracked.shift(); // oldest untracked (debris despawns normally)
+  }
+
+  // Map-reset companion for the Builders category: drop spray projectiles, soft blobs, hardened foam volumes,
+  // rebuild ghosts and size-lerps; silence the spray loop.
+  _clearBuilders() {
+    for (const p of this._foamProj) this._releaseFoamProj(p.pool);
+    this._foamProj.length = 0;
+    for (const b of this._foamBlobs) for (const mk of b.cells.values()) this._releaseFoamMarker(mk);
+    this._foamBlobs.length = 0;
+    for (const vol of this._foamVols) this.destruction.despawnVolume(vol);
+    this._foamVols.length = 0;
+    this._foamSprayTimer = 0;
+    for (const g of this._rebuildGhosts) { this.scene.remove(g.mesh); g.mesh.geometry.dispose(); }
+    this._rebuildGhosts.length = 0;
+    this._rebuildAcc = 0;
+    this._sizeAnims.length = 0;
+    this._sizeTracked.length = 0;
+    this.audio.foamSpray(false);
   }
 
   // --- Public hooks for main.js (camera-detached external-entity control) --------------------------
