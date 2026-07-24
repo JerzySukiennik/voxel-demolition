@@ -25,14 +25,16 @@ const ground = groundSpec({ x: 80, z: 64 }, "#8a8d90", [
 // walls), aligned -> straight crane route along X at z=-7 (5 m clear).
 // Footprint x[-32,-10] z[-14,0]. Built from explicit wall endpoints.
 // =====================================================================
-const WH = { x0: -32, z0: -14, x1: -10, z1: 0, h: 7 };
+// doorH < h leaves a lintel row above each drive-through so the wall stays ONE connected piece
+// (a full-height opening would split it into two free-standing pillars). 6.4 m clears the crane/excavator.
+const WH = { x0: -32, z0: -14, x1: -10, z1: 0, h: 7, doorAt: 7, doorW: 5, doorH: 6.4 };
 const warehouse = [
   // long walls (N/S, 22 m, solid)
   wall({ from: [WH.x0, WH.z0], to: [WH.x1, WH.z0], height: WH.h, mat: MAT.metal }),
   wall({ from: [WH.x0, WH.z1], to: [WH.x1, WH.z1], height: WH.h, mat: MAT.metal }),
-  // short walls (W/E, 14 m) each with a centered full-height drive-through (at=7 on a 14 m wall -> z=-7, width 5)
-  wall({ from: [WH.x0, WH.z0], to: [WH.x0, WH.z1], height: WH.h, mat: MAT.metal, openings: [{ at: 7, width: 5, height: WH.h, sill: 0 }] }),
-  wall({ from: [WH.x1, WH.z0], to: [WH.x1, WH.z1], height: WH.h, mat: MAT.metal, openings: [{ at: 7, width: 5, height: WH.h, sill: 0 }] }),
+  // short walls (W/E, 14 m) each with a centered lintel-bridged drive-through (at=7 on a 14 m wall -> z=-7, width 5)
+  wall({ from: [WH.x0, WH.z0], to: [WH.x0, WH.z1], height: WH.h, mat: MAT.metal, openings: [{ at: WH.doorAt, width: WH.doorW, height: WH.doorH, sill: 0 }] }),
+  wall({ from: [WH.x1, WH.z0], to: [WH.x1, WH.z1], height: WH.h, mat: MAT.metal, openings: [{ at: WH.doorAt, width: WH.doorW, height: WH.doorH, sill: 0 }] }),
   // flat metal roof
   roof({ origin: [WH.x0, WH.z0], size: [22, 14], base: WH.h, kind: "flat", mat: MAT.metal }),
   // ---- interior: 3 shelf rows (metal frame + crates on two levels), lane z[-9.5,-4.5] kept clear ----

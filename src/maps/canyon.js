@@ -1,5 +1,36 @@
 // Redgate Basin — desert canyon outpost + pond map (Phase 4, Author C). All names/props invented; origins are MIN-CORNER (engine addVolume convention), wall/fence/cliff from→to are centerlines.
 import { MAT, groundSpec, wall, box, roof, building, tree, fence, cratePile, rockPile, cliffRun } from "./lib.js";
+import { CONFIG } from "../config.js";
+
+// ---- pond jetty ------------------------------------------------------------
+// A plank pier standing IN the excavated basin: a raised deck (surface just above water.level 0.28) carried
+// on plank pilings that drop from the deck underside to the basin floor (CONFIG.world.basinFloorY = -2.6),
+// so the walkway visibly rests on posts in the water instead of floating over it.
+const JETTY = {
+  x: -14,                 // deck centerline X (runs along Z)
+  z0: -18, z1: -9,        // deck span in Z (landward -> out over the pond)
+  width: 2,               // deck width (X), matches the retaining thickness
+  deckBase: 0.45,         // deck plank underside Y (top ~0.6, clears the 0.28 waterline)
+  deckH: 0.15,            // deck plank thickness
+  pileT: 0.3,             // square plank piling side
+  pileZ: [-9.6, -11.8, -13.8], // 3 piling rows, all inside the basin rect (z > z0=-14)
+};
+function jettyPilings() {
+  // Two rows of pilings down the deck's long edges, from the basin floor up to the deck underside.
+  const bottom = CONFIG.world.basinFloorY;
+  const height = JETTY.deckBase - bottom;
+  const inset = JETTY.width / 2 - JETTY.pileT / 2; // sit posts under the deck edges
+  const specs = [];
+  for (const z of JETTY.pileZ) {
+    for (const ex of [-inset, inset]) {
+      specs.push(box({
+        origin: [JETTY.x + ex - JETTY.pileT / 2, bottom, z - JETTY.pileT / 2],
+        size: [JETTY.pileT, height, JETTY.pileT], mat: MAT.plank,
+      }));
+    }
+  }
+  return specs;
+}
 
 // ---- local composites (spec[] via box/wall/roof only) ----
 function watchtower(x, z) {
@@ -93,8 +124,9 @@ export default {
     ...watchtower(-36, -6),   // west side, footprint x[-36..-33] z[-6..-3]
     ...windpump(13.3, -25.4), // north-center-east, legs reach ground
 
-    // Plank walkway deck out over the pond's north edge (base 0.9, thin).
-    wall({ from: [-14, -18], to: [-14, -9], base: 0.9, height: 0.15, thickness: 2, mat: MAT.plank }),
+    // Plank jetty: raised deck out over the pond's north edge, standing on plank pilings down to the basin floor.
+    wall({ from: [JETTY.x, JETTY.z0], to: [JETTY.x, JETTY.z1], base: JETTY.deckBase, height: JETTY.deckH, thickness: JETTY.width, mat: MAT.plank }),
+    ...jettyPilings(),
 
     // ---- interior rock formations (destructible MAT.rock) ----
     ...hoodoo(36, 18),

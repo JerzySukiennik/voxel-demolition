@@ -142,12 +142,63 @@ export function createCore(scene, world, RAPIER, materials, size, color, waterRe
   scene.add(mesh);
 
   // Basin visual: a single voxel volume over the rect = floor layer (top at basinFloorY) + perimeter walls.
-  let basinMesh = null;
+  let basinMesh = null, rampMesh = null;
   if (rect) {
     basinMesh = buildBasinMesh(scene, materials, rect, vs);
+    rampMesh = buildBasinRamp(scene, world, RAPIER, body, materials, rect, vs);
   }
 
-  return { body, mesh, basinMesh };
+  return { body, mesh, basinMesh, rampMesh };
+}
+
+// SE-corner entry ramp: one sloped indestructible plate (collider on the shared core body + a matching voxel
+// mesh) anchored at the rect's (x1,z1) corner. Its top surface runs from (x1, skinThickness) at the sand rim
+// down to (x1 - run, basinFloorY) inside the basin, spanning `width` of the edge in Z. Only this corner is
+// filled, so the basin center still raycasts to the deep floor — a beached boat can drive in and a waded-in
+// player can climb back out. Fixed body, not destructible, never in allowedImpactors.
+function buildBasinRamp(scene, world, RAPIER, body, materials, rect, vs) {
+  const skinTop = W.skinThickness, floorY = W.basinFloorY;
+  const run = W.basinRampRun, width = W.basinRampWidth, thick = W.basinRampThickness;
+  const drop = skinTop - floorY;
+  const theta = Math.atan2(drop, run);          // slope angle (about +Z)
+  const s = Math.sin(theta), c = Math.cos(theta);
+  const slopeLen = Math.hypot(run, drop);
+  const hx = slopeLen / 2, hy = thick / 2, hz = width / 2;
+
+  // Plate center: midpoint of the top-surface line, pushed DOWN along the top normal by hy so the top face
+  // lands exactly on that line. Local +x -> up-slope toward the rim (world (c,s,0)); top normal = (-s,c,0).
+  const midX = rect.x1 - run / 2, midY = (skinTop + floorY) / 2, cz = rect.z1 - width / 2;
+  const cx = midX + s * hy, cy = midY - c * hy;
+  const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), theta);
+
+  const cd = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+    .setTranslation(cx, cy, cz)
+    .setRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w })
+    .setFriction(0.9)
+    .setRestitution(0.0);
+  world.createCollider(cd, body);
+
+  // Matching coarse voxel mesh (basin material), centered at the local origin then transformed like the collider.
+  const nX = Math.max(1, Math.round((2 * hx) / vs));
+  const nY = Math.max(1, Math.round((2 * hy) / vs));
+  const nZ = Math.max(1, Math.round((2 * hz) / vs));
+  const base = new THREE.Color().setStyle(W.basinColor);
+  const geo = buildGeometry({
+    dims: [nX, nY, nZ],
+    voxelSize: vs,
+    origin: [-(nX * vs) / 2, -(nY * vs) / 2, -(nZ * vs) / 2],
+    get: () => 1,
+    mergeKey: (x, y, z) => jitterBucket(x, y, z),
+    colorAt: (x, y, z, pidx, out) => jitteredColor(base, x, y, z, out),
+    groupAt: () => 0,
+  });
+  const mesh = new THREE.Mesh(geo, materials);
+  mesh.castShadow = false;
+  mesh.receiveShadow = true;
+  mesh.position.set(cx, cy, cz);
+  mesh.quaternion.copy(quat);
+  scene.add(mesh);
+  return mesh;
 }
 
 // Submerged basin visual: one voxel volume spanning the rect from (basinFloorY - vs) up to skinThickness.

@@ -24,6 +24,14 @@ export const CONFIG = {
     basinFloorThickness: 1.0,
     basinWallThickness: 0.4,
     basinColor: "#8a7350",
+    // SE-corner entry ramp into the excavated basin: one sloped indestructible plate anchored at the rect's
+    // (x1,z1) corner (the open boat-apron side), sloping from the sand rim (skinThickness) down to basinFloorY.
+    // basinRampRun = how far it reaches into the basin (X); basinRampWidth = its span along the edge (Z);
+    // only this corner is filled so the boat-floating center of the basin stays deep. Boats drive in over it,
+    // waded-in players walk back out. Fixed core geometry — never destructible / never an allowedImpactor.
+    basinRampRun: 6.0,
+    basinRampWidth: 5.0,
+    basinRampThickness: 0.4,
     skyColor: 0x8fb7e0,
     fogColor: 0x9cc0e6,
     fogNear: 40,
