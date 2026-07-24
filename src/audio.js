@@ -235,8 +235,8 @@ export class GameAudio {
     if (!this._saw) this._buildSaw();
     if (!this._saw) return;
     const t = this.ctx.currentTime;
-    this._saw.idle.gain.setTargetAtTime(equipped ? 0.32 : 0, t, 0.05);
-    this._saw.cut.gain.setTargetAtTime(equipped && cutting ? 0.5 : 0, t, 0.05);
+    this._saw.idle.gain.gain.setTargetAtTime(equipped ? 0.32 : 0, t, 0.05);
+    this._saw.cut.gain.gain.setTargetAtTime(equipped && cutting ? 0.5 : 0, t, 0.05);
   }
   _buildSaw() {
     const mk = (cat) => {

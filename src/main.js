@@ -345,6 +345,7 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
   let last = performance.now() / 1000;
   let elapsed = 0;
   let drawLogged = false;
+  let frameErrLogged = false; // guard the rAF loop: a stray per-frame throw logs once but never freezes the game
 
   function stepPhysics(dt, menuOpen) {
     const forward = rig.getForward();
@@ -373,6 +374,7 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
     if (dt > 0.1) dt = 0.1;
     elapsed += dt;
 
+    try {
     if (entered && hasLockedOnce && !input.locked && !pendingLock && !gameMenu.isOpen && !menu.isOpen) {
       gameMenu.open();
     }
@@ -436,6 +438,9 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
     if (!drawLogged && elapsed > 5) {
       drawLogged = true;
       console.log(`[QA] draw calls after 5 s: ${renderer.info.render.calls} (gate < 300) · triangles: ${renderer.info.render.triangles}`);
+    }
+    } catch (err) {
+      if (!frameErrLogged) { frameErrLogged = true; console.error("[frame] recovered from a runtime error — loop continues:", err); }
     }
     requestAnimationFrame(frame);
   }
