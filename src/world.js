@@ -69,25 +69,69 @@ export function makeShadowFollower(sun, offset) {
   };
 }
 
-// Indestructible core: fixed cuboid collider (top at y=0) + a static jittered visual layer, map-sized.
-export function createCore(scene, world, RAPIER, materials, size, color) {
-  const halfX = size.x / 2, halfZ = size.z / 2;
-  const bodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(0, -W.coreThickness / 2, 0);
-  const body = world.createRigidBody(bodyDesc);
-  const colDesc = RAPIER.ColliderDesc.cuboid(halfX, W.coreThickness / 2, halfZ)
-    .setFriction(0.9)
-    .setRestitution(0.0);
-  const collider = world.createCollider(colDesc, body);
+// Normalize a water rect (min/max ordered) or return null.
+function normRect(r) {
+  if (!r) return null;
+  return {
+    x0: Math.min(r.x0, r.x1), x1: Math.max(r.x0, r.x1),
+    z0: Math.min(r.z0, r.z1), z1: Math.max(r.z0, r.z1),
+  };
+}
 
-  // Visual: one static voxel layer, top surface at y=0, same look as the destructible skin.
+// Indestructible core: fixed collider(s) with their top surface at y=0 + a static jittered visual layer.
+// Dry maps (no waterRect) build ONE flat cuboid, byte-identical to before. With a waterRect the core is a
+// "picture frame" of up to 4 cuboids around the rect (a single Rapier cuboid can't have a hole), and the
+// rect opening becomes an excavated basin: a deep floor cuboid (top at basinFloorY) + 4 retaining walls
+// (basinFloorY -> skinThickness) so the pond reads as a real recessed bowl and boats float at true depth.
+export function createCore(scene, world, RAPIER, materials, size, color, waterRect) {
+  const halfX = size.x / 2, halfZ = size.z / 2;
+  const rect = normRect(waterRect);
+
+  // All core geometry hangs off one fixed body; colliders carry their own offsets (top surface at y=0).
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0));
+  const halfT = W.coreThickness / 2;
+  const slab = (cx, cz, hx, hz, cy, hy) => {
+    if (hx <= 1e-4 || hz <= 1e-4 || hy <= 1e-4) return;
+    const cd = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+      .setTranslation(cx, cy, cz)
+      .setFriction(0.9)
+      .setRestitution(0.0);
+    world.createCollider(cd, body);
+  };
+
+  if (!rect) {
+    // Flat map-sized core cuboid, top at y=0 (unchanged behavior).
+    slab(0, 0, halfX, halfZ, -halfT, halfT);
+  } else {
+    // Picture frame: west/east strips span full depth; north/south strips fill the rect's x-span only.
+    slab((-halfX + rect.x0) / 2, 0, (rect.x0 + halfX) / 2, halfZ, -halfT, halfT);                                  // west
+    slab((rect.x1 + halfX) / 2, 0, (halfX - rect.x1) / 2, halfZ, -halfT, halfT);                                   // east
+    slab((rect.x0 + rect.x1) / 2, (-halfZ + rect.z0) / 2, (rect.x1 - rect.x0) / 2, (rect.z0 + halfZ) / 2, -halfT, halfT); // north
+    slab((rect.x0 + rect.x1) / 2, (rect.z1 + halfZ) / 2, (rect.x1 - rect.x0) / 2, (halfZ - rect.z1) / 2, -halfT, halfT);  // south
+
+    // Excavated basin under the rect: indestructible floor + 4 retaining walls (all fixed core geometry).
+    const floorY = W.basinFloorY, ft = W.basinFloorThickness, wt = W.basinWallThickness, wallTop = W.skinThickness;
+    const cx = (rect.x0 + rect.x1) / 2, cz = (rect.z0 + rect.z1) / 2;
+    const hx = (rect.x1 - rect.x0) / 2, hz = (rect.z1 - rect.z0) / 2;
+    slab(cx, cz, hx, hz, floorY - ft / 2, ft / 2);                                    // basin floor (top at floorY)
+    const wallHy = (wallTop - floorY) / 2, wallCy = (wallTop + floorY) / 2, wh = wt / 2;
+    slab(cx, rect.z0, hx + wh, wh, wallCy, wallHy);                                    // north wall (z0)
+    slab(cx, rect.z1, hx + wh, wh, wallCy, wallHy);                                    // south wall (z1)
+    slab(rect.x0, cz, wh, hz, wallCy, wallHy);                                         // west wall (x0)
+    slab(rect.x1, cz, wh, hz, wallCy, wallHy);                                         // east wall (x1)
+  }
+
+  // Visual: one static voxel layer, top surface at y=0, same look as the destructible skin. Carved out of
+  // the pond rect (the basin supplies its own submerged floor/wall mesh below).
   const vs = W.skinVoxel;
   const nX = Math.round(size.x / vs), nZ = Math.round(size.z / vs);
   const base = new THREE.Color().setStyle(color || W.groundColor);
+  const inRect = (wx, wz) => rect && wx > rect.x0 && wx < rect.x1 && wz > rect.z0 && wz < rect.z1;
   const geo = buildGeometry({
     dims: [nX, 1, nZ],
     voxelSize: vs,
     origin: [-halfX, -vs, -halfZ],
-    get: () => 1,
+    get: (x, y, z) => (inRect(-halfX + (x + 0.5) * vs, -halfZ + (z + 0.5) * vs) ? 0 : 1),
     mergeKey: (x, y, z) => jitterBucket(x, y, z),
     colorAt: (x, y, z, pidx, out) => jitteredColor(base, x, y, z, out),
     groupAt: () => 0,
@@ -97,7 +141,42 @@ export function createCore(scene, world, RAPIER, materials, size, color) {
   mesh.receiveShadow = true;
   scene.add(mesh);
 
-  return { body, colliderHandle: collider.handle, mesh };
+  // Basin visual: a single voxel volume over the rect = floor layer (top at basinFloorY) + perimeter walls.
+  let basinMesh = null;
+  if (rect) {
+    basinMesh = buildBasinMesh(scene, materials, rect, vs);
+  }
+
+  return { body, mesh, basinMesh };
+}
+
+// Submerged basin visual: one voxel volume spanning the rect from (basinFloorY - vs) up to skinThickness.
+// The bottom layer is the full floor; perimeter columns are the retaining-wall faces; the interior is hollow.
+function buildBasinMesh(scene, materials, rect, vs) {
+  const floorY = W.basinFloorY, wallTop = W.skinThickness;
+  const oy = floorY - vs; // bottom of the floor layer -> floor top lands at floorY
+  const bnX = Math.max(1, Math.round((rect.x1 - rect.x0) / vs));
+  const bnZ = Math.max(1, Math.round((rect.z1 - rect.z0) / vs));
+  const bnY = Math.max(2, Math.round((wallTop - oy) / vs));
+  const wallCols = Math.max(1, Math.round(W.basinWallThickness / vs));
+  const base = new THREE.Color().setStyle(W.basinColor);
+  const geo = buildGeometry({
+    dims: [bnX, bnY, bnZ],
+    voxelSize: vs,
+    origin: [rect.x0, oy, rect.z0],
+    get: (x, y, z) => {
+      if (y === 0) return 1; // floor layer
+      return (x < wallCols || x >= bnX - wallCols || z < wallCols || z >= bnZ - wallCols) ? 1 : 0; // walls
+    },
+    mergeKey: (x, y, z) => jitterBucket(x, y, z),
+    colorAt: (x, y, z, pidx, out) => jitteredColor(base, x, y, z, out),
+    groupAt: () => 0,
+  });
+  const mesh = new THREE.Mesh(geo, materials);
+  mesh.castShadow = false;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
 }
 
 // Visual-only animated water plane over water.rect at water.level (brief section 2.4). Silent.

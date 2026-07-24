@@ -15,6 +15,15 @@ export const CONFIG = {
     skinThickness: 0.3,
     skinVoxel: 0.3,
     structureVoxel: 0.15,
+    // Excavated water basin (createCore). On a map with a `water.rect`, the indestructible core is
+    // rebuilt as a "picture frame" of cuboids around the rect (a single cuboid can't have a hole) and
+    // the rect opening is lined with a recessed bowl: an indestructible floor at basinFloorY plus four
+    // retaining walls from basinFloorY up to skinThickness. Water then sits FLUSH with the sand surface
+    // and boats float at real depth. basinFloorY relative to the y=0 core top; depth = skinThickness - basinFloorY.
+    basinFloorY: -2.6,
+    basinFloorThickness: 1.0,
+    basinWallThickness: 0.4,
+    basinColor: "#8a7350",
     skyColor: 0x8fb7e0,
     fogColor: 0x9cc0e6,
     fogNear: 40,

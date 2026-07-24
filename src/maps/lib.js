@@ -68,7 +68,9 @@ function rawSpec(name, mat, dims, origin, fill, override) {
 
 // ---- ground (grid) ---------------------------------------------------------
 // kind:"grid" skin, 0.3 voxel, 8 m tiles. patches = [{rect, color}] visual-only recolor (unclamped).
-export function groundSpec(size, color, patches = []) {
+// waterRect (optional): carve the sand skin OUT of the pond footprint (fill -> 0) so the excavated basin
+// built by createCore is the only solid geometry under the water.
+export function groundSpec(size, color, patches = [], waterRect = null) {
   const vs = CONFIG.world.skinVoxel;
   const halfX = size.x / 2, halfZ = size.z / 2;
   const nx = Math.round(size.x / vs), nz = Math.round(size.z / vs);
@@ -86,9 +88,13 @@ export function groundSpec(size, color, patches = []) {
     const r = p.rect;
     list.push({ x0: Math.min(r.x0, r.x1), x1: Math.max(r.x0, r.x1), z0: Math.min(r.z0, r.z1), z1: Math.max(r.z0, r.z1), pi });
   }
+  const hole = waterRect
+    ? { x0: Math.min(waterRect.x0, waterRect.x1), x1: Math.max(waterRect.x0, waterRect.x1), z0: Math.min(waterRect.z0, waterRect.z1), z1: Math.max(waterRect.z0, waterRect.z1) }
+    : null;
   const fill = (x, y, z) => {
-    if (list.length) {
+    if (hole || list.length) {
       const wx = -halfX + (x + 0.5) * vs, wz = -halfZ + (z + 0.5) * vs;
+      if (hole && wx > hole.x0 && wx < hole.x1 && wz > hole.z0 && wz < hole.z1) return 0;
       for (let i = list.length - 1; i >= 0; i--) {
         const q = list[i];
         if (wx >= q.x0 && wx <= q.x1 && wz >= q.z0 && wz <= q.z1) return q.pi;

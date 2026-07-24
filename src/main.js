@@ -142,7 +142,7 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
   const world = new RAPIER.World(CONFIG.gravity);
   const eventQueue = new RAPIER.EventQueue(true);
 
-  createCore(scene, world, RAPIER, materials, map.size, env.groundColor);
+  createCore(scene, world, RAPIER, materials, map.size, env.groundColor, map.water ? map.water.rect : null);
 
   // Destruction mode (brief section 3): solo = authoritative + gfx; MP client = replica + gfx, with
   // point/radial damage forwarded to the server as intents instead of detaching locally.

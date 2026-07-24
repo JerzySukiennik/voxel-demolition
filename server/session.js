@@ -54,7 +54,7 @@ export class Session {
     this.eventQueue = new RAPIER.EventQueue(true);
 
     const env = resolveEnv(map.env);
-    createCore(this.scene, this.world, RAPIER, this.materials, map.size, env.groundColor);
+    createCore(this.scene, this.world, RAPIER, this.materials, map.size, env.groundColor, map.water ? map.water.rect : null);
 
     this.destruction = new Destruction(this.world, RAPIER, {
       mode: "authoritative",

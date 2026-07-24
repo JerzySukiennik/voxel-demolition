@@ -52,7 +52,9 @@ export default {
     sunIntensity: 2.0,
     groundColor: "#c8a86b",
   },
-  water: { rect: { x0: -24, z0: -14, x1: -2, z1: 2 }, level: 0.9 },
+  // Water sits a hair below the sand surface (skinThickness 0.3) so the shoreline reads as a waterline;
+  // createCore excavates a real basin under this rect (floor ~basinFloorY) so boats float at true depth.
+  water: { rect: { x0: -24, z0: -14, x1: -2, z1: 2 }, level: 0.28 },
   decorVehicles: [],
 
   // Indestructible terraced boundary cliffs (h 8-12) ringing the bowl, one south gap (x -15..15).
@@ -67,10 +69,10 @@ export default {
   ],
 
   volumes: [
-    // ---- ground: warm sand + darker pond-area patch (visual only) ----
+    // ---- ground: warm sand + darker pond-area patch (visual only); sand skin carved out of the pond rect ----
     groundSpec({ x: 96, z: 80 }, "#c8a86b", [
       { rect: { x0: -28, z0: -18, x1: 2, z1: 6 }, color: "#b09a62" },
-    ]),
+    ], { x0: -24, z0: -14, x1: -2, z1: 2 }),
 
     // ---- outpost structures (all destructible) ----
     // Barn 10x7 h5.5 wood, big west door.
