@@ -1,9 +1,10 @@
-// voxel.js - decode contract models, greedy meshing to BufferGeometry with jittered vertex colors
+// voxel.js - decode contract models, greedy meshing to BufferGeometry with baked per-voxel AO + jittered vertex colors
 import * as THREE from "three";
 import { CONFIG } from "./config.js";
 
 const BUCKETS = CONFIG.voxel.jitterBuckets;
 const JIT = CONFIG.voxel.jitterLightness;
+const AO = CONFIG.voxel.ao;
 
 export function hashCoord(x, y, z) {
   let h = (Math.imul(x | 0, 73856093) ^ Math.imul(y | 0, 19349663) ^ Math.imul(z | 0, 83492791)) >>> 0;
@@ -43,11 +44,39 @@ export function decodeModel(model) {
   return { name: model.name, voxelSize: model.voxelSize, palette, parts, anchors: model.anchors || {} };
 }
 
+// Classic voxel AO for one face vertex, as occlusion in 0..1 (0 = wide open, 1 = fully tucked in).
+function ringOcclusion(side1, side2, corner) {
+  if (side1 !== 0 && side2 !== 0) return 1;
+  return (side1 + side2 + corner) / 3;
+}
+
+// Occlusion -> vertex-colour multiplier. Voxels here are 0.15 m, so a single-ring AO term would be a
+// 15 cm hairline; sampling a second (and optionally third) ring out and weighting it down spreads the
+// same crease over ~0.3 m, which is what actually reads as contact shading at play distance.
+const AO_RINGS = AO.ringWeights || [1];
+const AO_WEIGHT_SUM = AO_RINGS.reduce((a, b) => a + b, 0);
+const AO_STEPS = 15;                                    // 4 bits of AO per vertex in the merge key
+const AO_TABLE = new Float32Array(AO_STEPS + 1);
+for (let i = 0; i <= AO_STEPS; i++) {
+  AO_TABLE[i] = 1 - AO.strength * Math.pow(i / AO_STEPS, AO.curve ?? 1);
+}
+
 // Greedy mesh a voxel volume.
 // opts: { dims:[nx,ny,nz], voxelSize, origin:[ox,oy,oz], get(x,y,z)->0|pidx,
 //         mergeKey(x,y,z,pidx), colorAt(x,y,z,pidx,out:THREE.Color), groupAt(pidx)->0|1|2 }
 // Returns THREE.BufferGeometry with position/normal/color attributes and up to three groups
 // (0 rough, 1 shiny, 2 emissive/unlit). Groups 1 and 2 are only added when non-empty.
+//
+// Ambient occlusion: every emitted vertex samples the neighbours that touch it in the layer on the AIR
+// side of the face (side1/side2/corner, over CONFIG.voxel.ao.ringWeights rings) and darkens its vertex
+// colour. It is baked at mesh time, so it costs exactly nothing per frame. The mesher stays greedy: the
+// four corner AO values are packed into the low 16 bits of the merge key, so a run only merges where
+// the AO field is CONSTANT across it — and where it is constant the merged quad interpolates to the
+// identical result as per-voxel quads (a run's shared vertices carry the same AO by construction).
+// Quads whose diagonal would smear a single dark corner are re-triangulated along the other diagonal.
+// NOTE: this leaves 15 bits for the caller's own key, i.e. mergeKey() must stay below ~32000.
+// `get` is never called outside [0,dims): out-of-volume neighbours count as air, which is the correct
+// answer for the flat-surface case and keeps callers that index raw arrays (destruction tiles) safe.
 export function buildGeometry(opts) {
   const [nx, ny, nz] = opts.dims;
   const vs = opts.voxelSize;
@@ -57,6 +86,7 @@ export function buildGeometry(opts) {
   const colorAt = opts.colorAt;
   const groupAt = opts.groupAt;
   const dimsArr = [nx, ny, nz];
+  const aoOn = AO.enabled !== false;
 
   const positions = [];
   const normals = [];
@@ -66,42 +96,89 @@ export function buildGeometry(opts) {
   const idxEmissive = [];
   const tmpCol = new THREE.Color();
 
-  const maskKey = new Int32Array(Math.max(nx * ny, ny * nz, nz * nx));
-  const maskVox = new Array(maskKey.length);
+  const planeMax = Math.max(nx * ny, ny * nz, nz * nx);
+  const maskKey = new Int32Array(planeMax);
+  const maskVox = new Int32Array(planeMax * 4); // x,y,z,pidx of the face's owning voxel
+  // Two cached occupancy slices so `get` is called once per voxel per axis (was twice) and AO
+  // neighbour sampling is a plain array read instead of a callback.
+  let planeA = new Int32Array(planeMax);
+  let planeB = new Int32Array(planeMax);
+
+  const x = [0, 0, 0];
 
   for (let d = 0; d < 3; d++) {
     const u = (d + 1) % 3;
     const v = (d + 2) % 3;
-    const x = [0, 0, 0];
     const q = [0, 0, 0];
     q[d] = 1;
     const du = dimsArr[u];
     const dv = dimsArr[v];
     const dd = dimsArr[d];
+    const area = du * dv;
 
-    for (x[d] = -1; x[d] < dd; ) {
+    // Fill `plane` with the occupancy of slice `s` along d (all air when out of range).
+    const fillPlane = (plane, s) => {
+      if (s < 0 || s >= dd) { plane.fill(0, 0, area); return; }
+      x[d] = s;
       let n = 0;
       for (x[v] = 0; x[v] < dv; x[v]++) {
-        for (x[u] = 0; x[u] < du; x[u]++, n++) {
-          const a = x[d] >= 0 ? get(x[0], x[1], x[2]) : 0;
-          const b = x[d] < dd - 1 ? get(x[0] + q[0], x[1] + q[1], x[2] + q[2]) : 0;
+        for (x[u] = 0; x[u] < du; x[u]++, n++) plane[n] = get(x[0], x[1], x[2]);
+      }
+    };
+
+    // Solid test inside a cached slice, out-of-plane counts as air.
+    const solidAt = (plane, i, j) =>
+      (i < 0 || j < 0 || i >= du || j >= dv) ? 0 : (plane[i + j * du] !== 0 ? 1 : 0);
+
+    // Occlusion of one face corner, summed over the weighted rings, quantised to 4 bits.
+    const cornerAO = (plane, i, j, su, sv) => {
+      let occ = 0;
+      for (let k = 0; k < AO_RINGS.length; k++) {
+        const r = k + 1;
+        occ += AO_RINGS[k] * ringOcclusion(
+          solidAt(plane, i + su * r, j),
+          solidAt(plane, i, j + sv * r),
+          solidAt(plane, i + su * r, j + sv * r)
+        );
+      }
+      return Math.round((occ / AO_WEIGHT_SUM) * AO_STEPS);
+    };
+
+    // Pack the four corner AO levels (u0v0, u1v0, u1v1, u0v1) of cell (i,j) into 16 bits,
+    // sampling the layer on the air side of the face.
+    const aoCodeAt = (plane, i, j) =>
+      cornerAO(plane, i, j, -1, -1) | (cornerAO(plane, i, j, 1, -1) << 4) |
+      (cornerAO(plane, i, j, 1, 1) << 8) | (cornerAO(plane, i, j, -1, 1) << 12);
+
+    planeA.fill(0, 0, area);   // slice -1 is outside the volume
+    fillPlane(planeB, 0);
+
+    for (let s = -1; s < dd; s++) {
+      // planeA = slice s, planeB = slice s+1. A face lives between them, on the plane s+1.
+      let n = 0;
+      for (let j = 0; j < dv; j++) {
+        for (let i = 0; i < du; i++, n++) {
+          const a = planeA[n];
+          const b = planeB[n];
           if (a !== 0 && b === 0) {
+            x[u] = i; x[v] = j; x[d] = s;
             const k = mergeKey(x[0], x[1], x[2], a);
-            maskKey[n] = k + 1;
-            maskVox[n] = [x[0], x[1], x[2], a];
+            const code = aoOn ? aoCodeAt(planeB, i, j) : 0;
+            maskKey[n] = (k * 65536 + code) + 1;
+            maskVox[n * 4] = x[0]; maskVox[n * 4 + 1] = x[1]; maskVox[n * 4 + 2] = x[2]; maskVox[n * 4 + 3] = a;
           } else if (a === 0 && b !== 0) {
-            const bx = x[0] + q[0], by = x[1] + q[1], bz = x[2] + q[2];
-            const k = mergeKey(bx, by, bz, b);
-            maskKey[n] = -(k + 1);
-            maskVox[n] = [bx, by, bz, b];
+            x[u] = i; x[v] = j; x[d] = s + 1;
+            const k = mergeKey(x[0], x[1], x[2], b);
+            const code = aoOn ? aoCodeAt(planeA, i, j) : 0;
+            maskKey[n] = -((k * 65536 + code) + 1);
+            maskVox[n * 4] = x[0]; maskVox[n * 4 + 1] = x[1]; maskVox[n * 4 + 2] = x[2]; maskVox[n * 4 + 3] = b;
           } else {
             maskKey[n] = 0;
-            maskVox[n] = null;
           }
         }
       }
 
-      x[d]++;
+      const slice = s + 1; // the grid plane the quads sit on
 
       n = 0;
       for (let j = 0; j < dv; j++) {
@@ -122,15 +199,23 @@ export function buildGeometry(opts) {
             h++;
           }
 
-          const owner = maskVox[n];
-          const pidx = owner[3];
+          const pidx = maskVox[n * 4 + 3];
           const group = groupAt(pidx);
-          colorAt(owner[0], owner[1], owner[2], pidx, tmpCol);
+          colorAt(maskVox[n * 4], maskVox[n * 4 + 1], maskVox[n * 4 + 2], pidx, tmpCol);
+
+          // Unpack the four corner AO levels this run shares. Emissive faces are unlit, so they
+          // keep their full colour (an unlit lamp must not pick up contact shadows).
+          const code = (key > 0 ? key - 1 : -key - 1) & 0xffff;
+          const l0 = code & 15, l1 = (code >> 4) & 15, l2 = (code >> 8) & 15, l3 = (code >> 12) & 15;
+          const m0 = group === 2 ? 1 : AO_TABLE[l0];
+          const m1 = group === 2 ? 1 : AO_TABLE[l1];
+          const m2 = group === 2 ? 1 : AO_TABLE[l2];
+          const m3 = group === 2 ? 1 : AO_TABLE[l3];
 
           const pos = [0, 0, 0];
           pos[u] = i;
           pos[v] = j;
-          pos[d] = x[d];
+          pos[d] = slice;
           const dux = [0, 0, 0]; dux[u] = w;
           const dvx = [0, 0, 0]; dvx[v] = h;
 
@@ -146,16 +231,23 @@ export function buildGeometry(opts) {
             [pos[0] + dux[0] + dvx[0], pos[1] + dux[1] + dvx[1], pos[2] + dux[2] + dvx[2]],
             [pos[0] + dvx[0], pos[1] + dvx[1], pos[2] + dvx[2]],
           ];
-          for (const c of corners) {
-            positions.push(ox + c[0] * vs, oy + c[1] * vs, oz + c[2] * vs);
+          const mul = [m0, m1, m2, m3];
+          for (let c = 0; c < 4; c++) {
+            const cc = corners[c], m = mul[c];
+            positions.push(ox + cc[0] * vs, oy + cc[1] * vs, oz + cc[2] * vs);
             normals.push(nrm[0], nrm[1], nrm[2]);
-            colors.push(tmpCol.r, tmpCol.g, tmpCol.b);
+            colors.push(tmpCol.r * m, tmpCol.g * m, tmpCol.b * m);
           }
+          // Split the quad along the diagonal that does NOT smear a lone dark corner across it.
+          // l* are OCCLUSION (higher = darker), so the classic "brighter diagonal" test inverts.
+          const flip = (l0 + l2) < (l1 + l3);
           const tgt = group === 2 ? idxEmissive : group === 1 ? idxShiny : idxRough;
           if (nSign > 0) {
-            tgt.push(base, base + 1, base + 2, base, base + 2, base + 3);
+            if (flip) tgt.push(base + 1, base + 2, base + 3, base + 1, base + 3, base);
+            else tgt.push(base, base + 1, base + 2, base, base + 2, base + 3);
           } else {
-            tgt.push(base, base + 2, base + 1, base, base + 3, base + 2);
+            if (flip) tgt.push(base + 1, base + 3, base + 2, base + 1, base, base + 3);
+            else tgt.push(base, base + 2, base + 1, base, base + 3, base + 2);
           }
 
           for (let hh = 0; hh < h; hh++) {
@@ -167,6 +259,10 @@ export function buildGeometry(opts) {
           n += w;
         }
       }
+
+      // Slide the window: next iteration's A is this iteration's B.
+      const tmp = planeA; planeA = planeB; planeB = tmp;
+      fillPlane(planeB, s + 2);
     }
   }
 
@@ -186,12 +282,15 @@ export function buildGeometry(opts) {
 }
 
 // Three shared materials: index 0 rough, index 1 shiny, index 2 emissive (unlit/bright).
+// envMapIntensity feeds off scene.environment (the procedural sky IBL built in world.js), which is
+// what makes metal and glass read as metal and glass instead of flat grey.
 export function makeMaterials() {
+  const R = CONFIG.voxel.roughMat, S = CONFIG.voxel.shinyMat;
   const rough = new THREE.MeshStandardMaterial({
-    vertexColors: true, roughness: CONFIG.voxel.roughMat.roughness, metalness: CONFIG.voxel.roughMat.metalness,
+    vertexColors: true, roughness: R.roughness, metalness: R.metalness, envMapIntensity: R.envMapIntensity ?? 1,
   });
   const shiny = new THREE.MeshStandardMaterial({
-    vertexColors: true, roughness: CONFIG.voxel.shinyMat.roughness, metalness: CONFIG.voxel.shinyMat.metalness,
+    vertexColors: true, roughness: S.roughness, metalness: S.metalness, envMapIntensity: S.envMapIntensity ?? 1,
   });
   const emissive = new THREE.MeshBasicMaterial({ vertexColors: true });
   return [rough, shiny, emissive];

@@ -126,8 +126,14 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, CONFIG.render.pixelRatioCap));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  // ACES filmic tone mapping: the daylight rig in CONFIG.render is tuned for it (bright sun, weak hemi,
+  // sky IBL). Highlights roll off instead of clipping, so pale concrete and the sky keep their gradient.
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = CONFIG.render.toneMappingExposure;
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFShadowMap;
+  // PCFSoft over PCF: same 2048 map, one extra bilinear weighting per tap. It kills the stair-stepping
+  // on shadow edges without blurring them into mush, which keeps the hard-shadow art direction.
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(

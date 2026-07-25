@@ -10,6 +10,13 @@
      hard pool of light) and a pale cement work-order on the right (the form you
      fill in). Two materials, one structure.
 
+     Everything downstream of the lobby is drawn from the same kit:
+       · the vehicle menu is the plant yard — one lit bay per machine, each drawn
+         as a block elevation in its own paint, standing on a floor rule;
+       · the pause screen is the same work-order clipped to a board, hazard tape
+         along the top edge;
+       · the enter gate is a notice nailed to the hoarding.
+
      Type: heavy system sans for names (tight negative tracking), mono for every
      label, code and hint (wide positive tracking). No webfonts — zero network
      requests at play time.
@@ -36,6 +43,11 @@
     --hivis-deep: #C13C05;
     --hazard: #F2C10E;
 
+    /* Vehicle bay: the one surface darker than the panel it sits on, so a machine
+       drawn in its own paint reads as lit from the front. */
+    --bay: #1A212A;
+    --bay-2: #0D1116;
+
     --r: 2px;
     /* --ease is a critically damped settle: no overshoot, because nothing here is thrown — a menu
        that fades in has no momentum to carry, so bounce would be a lie. The one place real momentum
@@ -50,33 +62,69 @@
   #app { position: fixed; inset: 0; display: block; }
 
   .kbd {
-    display: inline-block; padding: 2px 5px; margin: 0 2px; border-radius: var(--r);
+    display: inline-block; padding: 3px 6px; border-radius: var(--r);
     font: 600 0.625rem/1 var(--mono); letter-spacing: 0.08em;
     background: rgba(228, 224, 215, 0.10); color: var(--cement);
-    box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.16);
+  }
+
+  /* Hazard tape. One gradient, three jobs: the lobby hoarding, the top edge of the
+     pause board, and the head of the enter notice. */
+  .tape {
+    height: 7px; border-radius: 1px; flex: none;
+    background: repeating-linear-gradient(135deg, var(--hazard) 0 7px, #14171B 7px 14px);
   }
 
   /* ============================ In-game HUD =================================
      Deliberately minimal and deliberately cheap: no blur, no perpetual
-     animation, nothing that repaints while the game is rendering. */
+     animation, nothing that repaints while the game is rendering. Four elements
+     exist and no more — dot, tool readout, site tag, offline marker. */
+
+  /* The tool readout is the only feedback for 25 tools across 7 categories, so it
+     answers three questions at once — which category (number + word), which item
+     (name), and where in that category's cycle you are (the segment rail). Then it
+     gets out of the way after 1.5 s. It carries its own plate rather than leaning on
+     text-shadow, because "unreadable over a bright sky" is not a tradeoff worth
+     making for an element that is invisible 95% of the time. */
   #tool-label {
-    position: fixed; left: 22px; bottom: 22px; z-index: 5;
-    display: flex; align-items: center; gap: 9px;
-    font-family: var(--sans);
-    opacity: 0; transition: opacity 0.3s var(--ease); pointer-events: none;
+    position: fixed; left: 20px; bottom: 20px; z-index: 5;
+    display: flex; align-items: stretch;
+    font-family: var(--sans); pointer-events: none;
+    border-radius: var(--r); overflow: hidden;
+    background: rgba(9, 12, 16, 0.66);
+    box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.13), 0 4px 16px rgba(0, 0, 0, 0.45);
+    opacity: 0; transition: opacity 0.3s var(--ease);
   }
   #tool-label-num {
-    min-width: 20px; height: 20px; padding: 0 4px; box-sizing: border-box;
-    text-align: center; border-radius: var(--r);
+    display: flex; align-items: center; justify-content: center;
+    width: 28px; padding: 0 3px; box-sizing: border-box; flex: none;
     background: var(--hivis); color: #1A0D05;
-    font: 800 0.6875rem/20px var(--mono); letter-spacing: 0.04em;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    font: 800 0.8125rem/1 var(--mono); letter-spacing: 0.02em;
   }
+  .tl-text { display: block; padding: 7px 12px 8px; min-width: 128px; }
+  .tl-cat {
+    display: block; margin-bottom: 3px;
+    font: 600 0.5625rem/1 var(--mono); letter-spacing: 0.19em; text-transform: uppercase;
+    color: rgba(228, 224, 215, 0.62);
+  }
+  .tl-cat:empty { display: none; }
   #tool-label-name {
-    color: #fff; font: 800 0.8125rem/1 var(--sans);
-    letter-spacing: 0.02em; text-transform: uppercase;
-    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8), 0 0 2px rgba(0, 0, 0, 0.7);
+    display: block; color: #fff;
+    font: 800 0.8125rem/1.1 var(--sans); letter-spacing: 0.005em; text-transform: uppercase;
   }
+  /* Cycle rail: one segment per item in the category, the equipped one hi-vis.
+     Hidden for single-item categories, where "1 of 1" is noise. */
+  .tl-rail { display: flex; gap: 3px; margin-top: 7px; }
+  .tl-rail:empty { display: none; }
+  .tl-seg { display: block; width: 12px; height: 3px; border-radius: 1px; background: rgba(228, 224, 215, 0.32); }
+  .tl-seg.is-on { background: var(--hivis); }
+  /* Replayed on every switch so a change registers even when the plate is already up. */
+  #tool-label.tl-bump { animation: tl-bump 0.18s var(--ease); }
+  @keyframes tl-bump {
+    from { transform: translateX(-7px); }
+    to   { transform: none; }
+  }
+
   /* Square dot with a dark halo so it survives both bright sky and dark brick. */
   #crosshair {
     position: fixed; left: 50%; top: 50%; width: 5px; height: 5px;
@@ -86,9 +134,9 @@
   }
   #map-label {
     position: fixed; right: 18px; top: 16px; z-index: 5;
-    font: 600 0.625rem/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
-    color: rgba(255, 255, 255, 0.88); pointer-events: none;
-    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.65);
+    font: 700 0.625rem/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.92); pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.75), 0 0 10px rgba(0, 0, 0, 0.45);
   }
   #map-label::before {
     content: ""; display: inline-block; width: 6px; height: 6px;
@@ -100,17 +148,20 @@
      Scrim is a vignette, not a blur: the game keeps rendering underneath and a
      backdrop-filter over a live canvas is the one thing a 2019 Intel MBP can't
      afford. Solid-enough darkness also guarantees legibility over the daylight
-     scene. */
+     scene.
+     `overflow:auto` + `margin:auto` on the panel (rather than centring with
+     align-items) keeps the top of a tall panel reachable on a short window
+     instead of clipping it. */
   .ov {
     position: fixed; inset: 0; display: none;
-    align-items: center; justify-content: center;
+    overflow: auto; padding: 18px; box-sizing: border-box;
     font-family: var(--sans); color: var(--cement); user-select: none;
     background:
       radial-gradient(120% 90% at 50% 42%, rgba(8, 10, 13, 0.60), rgba(8, 10, 13, 0.88) 100%);
     animation: ov-in 0.18s ease-out both;
   }
   .panel {
-    position: relative;
+    position: relative; margin: auto; overflow: hidden;
     background: linear-gradient(180deg, var(--graphite) 0%, var(--graphite-2) 100%);
     border-radius: 3px;
     box-shadow:
@@ -120,6 +171,7 @@
     animation: panel-in 0.34s var(--ease) both;
   }
   .kicker {
+    display: block;
     font: 600 0.625rem/1 var(--mono); letter-spacing: 0.2em; text-transform: uppercase;
     color: rgba(228, 224, 215, 0.55);
   }
@@ -129,22 +181,35 @@
     to   { opacity: 1; transform: none; }
   }
 
-  /* ============================ Vehicle menu ================================ */
+  /* ============================ Vehicle menu ================================
+     The plant yard. Sixteen lit bays; each machine is a block elevation drawn in
+     its own paint (built in lobby.js from the colour menu.js puts on the swatch),
+     standing on a floor rule. Selecting one marks its floor hi-vis — the same
+     "marked for clearance" line the lobby's map cards use. */
   #vehicle-menu { z-index: 8; }
-  #vehicle-menu .vm-panel { padding: 22px 24px 18px; }
-  #vehicle-menu .vm-head { margin: 0 0 18px; }
-  #vehicle-menu .vm-head .vm-kicker {
-    display: block; margin: 0 0 5px;
+  #vehicle-menu .vm-panel { padding: 20px 22px 16px; }
+  #vehicle-menu .vm-head {
+    display: flex; align-items: flex-end; justify-content: space-between; gap: 16px;
+    margin: 0 0 16px; padding-bottom: 13px;
+    border-bottom: 1px solid rgba(228, 224, 215, 0.09);
+  }
+  #vehicle-menu .vm-kicker {
+    display: block; margin: 0 0 6px;
     font: 600 0.625rem/1 var(--mono); letter-spacing: 0.2em; text-transform: uppercase;
     color: rgba(228, 224, 215, 0.55);
   }
   #vehicle-menu #vm-selected {
-    display: block; font: 800 1.375rem/1 var(--sans); letter-spacing: -0.02em; color: var(--cement);
+    display: block; font: 800 1.375rem/1.05 var(--sans); letter-spacing: -0.022em; color: var(--cement);
   }
-  #vehicle-menu .vm-grid { display: grid; grid-template-columns: repeat(4, 94px); gap: 10px; }
+  #vehicle-menu #vm-selected-cat {
+    display: block; padding-bottom: 3px;
+    font: 600 0.625rem/1 var(--mono); letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--hivis); text-align: right; white-space: nowrap;
+  }
+  #vehicle-menu .vm-grid { display: grid; grid-template-columns: repeat(4, 112px); gap: 9px; }
   #vehicle-menu .vm-tile {
-    display: flex; flex-direction: column; align-items: center; gap: 8px; cursor: pointer;
-    padding: 9px 6px 8px; border-radius: var(--r);
+    display: flex; flex-direction: column; align-items: stretch; gap: 8px; cursor: pointer;
+    padding: 8px 8px 9px; border-radius: var(--r);
     background: rgba(228, 224, 215, 0.035);
     box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.07);
     transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease), background 0.2s var(--ease);
@@ -155,44 +220,81 @@
     background: rgba(255, 91, 20, 0.10); transform: translateY(-2px);
     box-shadow: inset 0 0 0 2px var(--hivis), 0 8px 20px rgba(0, 0, 0, 0.35);
   }
-  /* Painted voxel block: the swatch colour comes from JS as an inline
-     background, so the light/shade faces are drawn with pseudo-elements. */
+  /* The bay. Kept as `.vm-swatch` because menu.js writes the vehicle's paint colour
+     into it as an inline background; lobby.js lifts that colour off, hands it to the
+     drawing, and repaints the box as the bay behind it. */
   #vehicle-menu .vm-swatch {
-    position: relative; width: 64px; height: 64px; border-radius: var(--r);
-    display: flex; align-items: center; justify-content: center;
-    font: 800 1.625rem/1 var(--sans); letter-spacing: -0.03em;
-    color: rgba(0, 0, 0, 0.20); text-shadow: 0 1px 0 rgba(255, 255, 255, 0.20);
-    transition: transform 0.2s var(--ease);
+    position: relative; width: 100%; height: 56px; box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center; overflow: hidden;
+    border-radius: var(--r);
+    font: 800 1.375rem/1 var(--sans); letter-spacing: -0.03em;
+    color: rgba(228, 224, 215, 0.5);
   }
   #vehicle-menu .vm-swatch::before,
   #vehicle-menu .vm-swatch::after {
     content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
   }
+  /* Light falling into the bay from above-front. */
   #vehicle-menu .vm-swatch::before {
-    background: linear-gradient(158deg, rgba(255, 255, 255, 0.26) 0%, rgba(255, 255, 255, 0) 45%, rgba(0, 0, 0, 0.24) 100%);
+    background: radial-gradient(88% 120% at 50% -18%, rgba(190, 214, 242, 0.16) 0%, rgba(190, 214, 242, 0) 62%);
   }
-  #vehicle-menu .vm-swatch::after {
-    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.32), inset 0 2px 0 rgba(255, 255, 255, 0.20);
+  #vehicle-menu .vm-swatch::after { box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.42); }
+  #vehicle-menu .vm-draw {
+    position: relative; display: block; width: 100%; height: 100%;
+    transition: transform 0.2s var(--ease);
   }
-  #vehicle-menu .vm-tile.vm-selected .vm-swatch { transform: scale(1.04); }
+  #vehicle-menu .vm-tile:hover .vm-draw,
+  #vehicle-menu .vm-tile.vm-selected .vm-draw { transform: translateY(-2px); }
+  .vm-floor { fill: rgba(228, 224, 215, 0.22); transition: fill 0.2s var(--ease); }
+  #vehicle-menu .vm-tile.vm-selected .vm-floor { fill: var(--hivis); }
+  #vehicle-menu .vm-cat {
+    font: 600 0.5rem/1 var(--mono); letter-spacing: 0.18em; text-transform: uppercase;
+    color: rgba(228, 224, 215, 0.45);
+    transition: color 0.2s var(--ease);
+  }
+  #vehicle-menu .vm-tile.vm-selected .vm-cat { color: var(--hivis); }
   #vehicle-menu .vm-label {
-    font: 600 0.625rem/1.25 var(--mono); letter-spacing: 0.06em; text-transform: uppercase;
-    text-align: center; max-width: 84px; min-height: 2.5em; color: rgba(228, 224, 215, 0.7);
+    margin-top: -3px; min-height: 2.3em;
+    font: 700 0.75rem/1.15 var(--sans); letter-spacing: -0.008em;
+    color: rgba(228, 224, 215, 0.74);
+    transition: color 0.2s var(--ease);
   }
   #vehicle-menu .vm-tile.vm-selected .vm-label { color: var(--cement); }
+
+  /* ====================== Shared key legend ================================
+     Same object in the vehicle menu, the pause board and the enter notice, so a
+     control means the same thing wherever you meet it. */
+  .keys {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+    gap: 6px 18px; margin: 0; padding: 0; list-style: none;
+  }
+  .keys li {
+    display: flex; align-items: center; gap: 7px;
+    font: 500 0.6875rem/1 var(--mono); letter-spacing: 0.04em;
+    color: rgba(228, 224, 215, 0.6);
+  }
   #vehicle-menu .vm-hint {
-    margin: 18px 0 0; padding-top: 14px; text-align: center;
+    margin: 16px 0 0; padding-top: 13px;
     border-top: 1px solid rgba(228, 224, 215, 0.08);
-    font: 500 0.6875rem/1.6 var(--mono); letter-spacing: 0.04em;
-    color: rgba(228, 224, 215, 0.58);
   }
 
-  /* ============================ ESC menu ==================================== */
+  /* ============================ ESC menu ====================================
+     A pause board, not three buttons on a rectangle: hazard tape along the top
+     edge, the site you are standing in named above the state you are in, then the
+     three ways out ranked by how much they cost you. */
   #game-menu { z-index: 8; }
-  #game-menu .gm-panel { width: 300px; padding: 22px 22px 18px; }
-  #game-menu .gm-head { margin: 0 0 18px; }
+  #game-menu .gm-panel { width: 328px; }
+  #game-menu .gm-body { padding: 20px 20px 16px; }
+  #game-menu .gm-head {
+    margin: 0 0 16px; padding-bottom: 14px;
+    border-bottom: 1px solid rgba(228, 224, 215, 0.09);
+  }
+  #game-menu .gm-site {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: rgba(228, 224, 215, 0.6);
+  }
   #game-menu .gm-title {
-    margin: 5px 0 0; font: 800 1.5rem/1 var(--sans); letter-spacing: -0.025em; color: var(--cement);
+    margin: 7px 0 0; font: 800 1.5rem/1 var(--sans); letter-spacing: -0.025em; color: var(--cement);
   }
   #game-menu .gm-btn {
     display: block; width: 100%; box-sizing: border-box; text-align: left;
@@ -210,65 +312,97 @@
   }
   #game-menu .gm-btn-primary:hover { background: #FF6C2C; }
   #game-menu .gm-btn-primary:active { transform: translateY(3px); box-shadow: 0 0 0 var(--hivis-deep); }
+  /* The one door that throws the site away gets a hazard edge — a warning, not a
+     confirmation dialog, because it is one reload to get back. */
+  #game-menu .gm-btn-exit { box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.10), inset 3px 0 0 rgba(242, 193, 14, 0.55); }
+  #game-menu .gm-btn-exit:hover { box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.10), inset 3px 0 0 var(--hazard); }
   #game-menu .gm-b-t { display: block; font: 700 0.875rem/1.2 var(--sans); letter-spacing: -0.005em; }
   #game-menu .gm-b-s {
     display: block; margin-top: 3px;
     font: 500 0.625rem/1.3 var(--mono); letter-spacing: 0.04em;
     color: rgba(228, 224, 215, 0.56);
   }
-  #game-menu .gm-btn-primary .gm-b-s { color: rgba(26, 13, 5, 0.55); }
+  #game-menu .gm-btn-primary .gm-b-s { color: rgba(26, 13, 5, 0.62); }
+  /* One reserved strip for both status lines, so the buttons never jump. No rule above it: empty
+     most of the time, a divider would just draw a box around nothing. */
+  #game-menu .gm-status { margin-top: 13px; min-height: 17px; }
   #game-menu .gm-hint {
+    display: flex; gap: 8px;
     font: 500 0.6875rem/1.35 var(--mono); letter-spacing: 0.03em; color: var(--hazard);
-    opacity: 0; min-height: 18px; margin-top: 8px;
-    transition: opacity 0.2s var(--ease);
+    opacity: 0; transition: opacity 0.2s var(--ease);
   }
+  #game-menu .gm-hint::before {
+    content: ""; flex: none; width: 6px; height: 6px; margin-top: 3px;
+    background: var(--hazard);
+  }
+  #game-menu .gm-hint:empty { display: none; }
   #game-menu .gm-flash {
-    font: 500 0.6875rem/1.35 var(--mono); letter-spacing: 0.1em; text-transform: uppercase;
-    color: rgba(228, 224, 215, 0.75);
-    opacity: 0; min-height: 16px; transition: opacity 0.15s ease;
+    display: flex; align-items: center; gap: 8px;
+    font: 600 0.6875rem/1.35 var(--mono); letter-spacing: 0.1em; text-transform: uppercase;
+    color: rgba(228, 224, 215, 0.8);
+    opacity: 0; transition: opacity 0.2s var(--ease);
   }
+  #game-menu .gm-flash::before {
+    content: ""; flex: none; width: 6px; height: 6px; background: var(--hivis);
+  }
+  #game-menu .gm-flash[data-state="done"] { color: var(--cement); }
+  #game-menu .gm-flash[data-state="done"]::before { background: var(--cement); }
+  #game-menu .gm-flash:empty { display: none; }
 
   /* ====================== Post-load pointer-lock gesture ====================
-     A gate, not a modal task — so it dims noticeably less than the pause menus.
-     You should be able to see the site you're about to walk into. */
+     A gate, not a modal task. The scrim is deliberately light — you should be able
+     to see the site you are about to walk into — so legibility comes from the
+     notice plate rather than from drowning the scene. */
   #enter-overlay {
     z-index: 9; cursor: pointer;
-    background: radial-gradient(120% 90% at 50% 46%, rgba(8, 10, 13, 0.28), rgba(8, 10, 13, 0.68) 100%);
+    background: radial-gradient(130% 96% at 50% 46%, rgba(8, 10, 13, 0.16), rgba(8, 10, 13, 0.58) 100%);
   }
-  #enter-overlay .eo-card { text-align: center; padding: 0 24px; animation: panel-in 0.3s var(--ease) both; }
+  #enter-overlay .eo-card {
+    margin: auto; width: min(620px, 100%); text-align: center;
+    animation: panel-in 0.3s var(--ease) both;
+  }
+  /* The notice is sized by its message, not by the viewport — "Joining Fallbrook" should not be
+     stranded in the middle of a letterbox. A boot error still wraps inside the card's max width. */
+  #enter-overlay .eo-plate {
+    display: inline-block; max-width: 100%; box-sizing: border-box;
+    overflow: hidden; border-radius: 3px;
+    background: linear-gradient(180deg, rgba(20, 25, 32, 0.90) 0%, rgba(11, 14, 19, 0.92) 100%);
+    box-shadow: 0 0 0 1px rgba(228, 224, 215, 0.12), 0 26px 60px rgba(0, 0, 0, 0.5);
+  }
+  #enter-overlay .eo-body { padding: 22px 34px 24px; }
   #enter-overlay .eo-msg {
-    font: 800 1.625rem/1.15 var(--sans); letter-spacing: -0.025em; color: var(--cement);
-    text-shadow: 0 2px 14px rgba(0, 0, 0, 0.6);
+    font: 800 1.625rem/1.15 var(--sans); letter-spacing: -0.028em; color: var(--cement);
   }
   #enter-overlay .eo-msg::before {
     content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 13px;
     vertical-align: 3px; background: var(--hivis);
-    animation: blip 1.7s ease-in-out infinite;
+    animation: blip 2.2s ease-in-out infinite;
   }
-  /* Legible over whatever the map happens to put behind it — the scrim is light here, so the type
-     carries its own shadow instead of leaning on a plate. */
-  #enter-overlay .eo-sub {
-    margin-top: 18px; font: 500 0.6875rem/2 var(--mono); letter-spacing: 0.04em;
-    color: rgba(232, 229, 222, 0.78); text-shadow: 0 1px 4px rgba(0, 0, 0, 0.75);
+  /* The legend sits on the scrim, not on the plate, so its chips carry their own
+     ground — the sky behind them can be anything from noon to dusk. */
+  #enter-overlay .eo-sub { margin-top: 18px; }
+  #enter-overlay .keys { gap: 8px 16px; }
+  #enter-overlay .keys li {
+    color: rgba(240, 237, 231, 0.9); text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
   }
   #enter-overlay .kbd {
-    background: rgba(12, 15, 19, 0.62); color: #fff;
-    box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.28);
+    background: rgba(12, 15, 19, 0.7); color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(228, 224, 215, 0.3);
   }
-  @keyframes blip { 0%, 100% { opacity: 1 } 50% { opacity: 0.25 } }
+  @keyframes blip { 0%, 100% { opacity: 1 } 50% { opacity: 0.3 } }
 
   /* ================================ Lobby ==================================
      Not a dialog over the game — the game does not exist yet. A full-bleed
      board, and the panel is the only thing on it. */
   #lobby {
-    z-index: 10; overflow: auto; padding: 20px; box-sizing: border-box;
+    z-index: 10; padding: 20px;
     background:
       radial-gradient(130% 100% at 50% -10%, #202730 0%, #0C0F13 62%, #05070A 100%);
     animation: none;
   }
   .lb-panel {
     display: grid; grid-template-columns: 320px 1fr;
-    width: min(1060px, 100%); margin: auto;
+    width: min(1080px, 100%); margin: auto;
     border-radius: 3px; overflow: hidden;
     box-shadow: 0 0 0 1px rgba(228, 224, 215, 0.08), 0 44px 90px rgba(0, 0, 0, 0.6);
     animation: panel-in 0.42s var(--ease) both;
@@ -292,10 +426,7 @@
     color: transparent; -webkit-text-stroke: 1.5px rgba(228, 224, 215, 0.62);
   }
   .lb-t2 { color: var(--cement); }
-  .lb-tape {
-    height: 7px; margin: 14px 0 0; border-radius: 1px;
-    background: repeating-linear-gradient(135deg, var(--hazard) 0 7px, #14171B 7px 14px);
-  }
+  .lb-tape { margin: 14px 0 0; }
   .lb-stage { position: relative; flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; margin: 8px 0 0; }
   /* Sharp key light falling on the operator — the same light the game uses. */
   .lb-light {
@@ -350,6 +481,7 @@
     font: 700 0.9375rem/1 var(--sans); letter-spacing: -0.01em;
     padding: 10px 12px; border-radius: var(--r); color: var(--ink);
     background: rgba(255, 255, 255, 0.55); border: 0; outline: none;
+    text-overflow: ellipsis;
     box-shadow: inset 0 0 0 1px rgba(21, 24, 28, 0.18), inset 0 2px 3px rgba(21, 24, 28, 0.07);
     transition: box-shadow 0.18s var(--ease), background 0.18s var(--ease);
   }
@@ -394,7 +526,7 @@
     text-align: left; font: inherit; color: var(--ink); cursor: pointer;
     border: 0; border-radius: var(--r); background: var(--cement-2);
     box-shadow: inset 0 0 0 1px rgba(21, 24, 28, 0.14);
-    transition: transform 0.22s var(--ease), box-shadow 0.22s var(--ease), background 0.22s var(--ease);
+    transition: transform 0.22s var(--ease), box-shadow 0.22s var(--ease), background 0.22s var(--ease), opacity 0.22s var(--ease);
   }
   .lb-card:hover {
     transform: translateY(-3px); background: var(--cement-3);
@@ -427,31 +559,64 @@
     font: 500 0.5625rem/1.45 var(--mono); letter-spacing: 0.07em; text-transform: uppercase;
     color: var(--ink-58);
   }
+  /* Locked by a running LAN session. Hatched out like a closed-off site rather than
+     faded to 35% — the name has to stay readable, because it explains why the card
+     is unavailable. */
+  .lb-card:disabled { cursor: default; }
+  .lb-card-locked {
+    background: var(--cement-2); opacity: 0.72; filter: saturate(0.35);
+  }
+  .lb-card-locked:hover { transform: none; background: var(--cement-2); box-shadow: inset 0 0 0 1px rgba(21, 24, 28, 0.14); }
+  .lb-card-locked .lb-card-swatch::before {
+    content: ""; position: absolute; inset: 0; z-index: 1;
+    background: repeating-linear-gradient(135deg, rgba(21, 24, 28, 0.20) 0 5px, rgba(21, 24, 28, 0) 5px 10px);
+  }
 
   /* --- Session banner (built in lobby.js) + PLAY -------------------------- */
   .lb-foot { margin-top: auto; }
   .lb-session {
-    margin: 0 0 12px; padding: 10px 12px; border-radius: var(--r);
-    border-left: 3px solid var(--hazard); background: rgba(242, 193, 14, 0.16);
+    display: flex; gap: 10px; align-items: flex-start;
+    margin: 0 0 12px; padding: 10px 12px 10px 11px; border-radius: var(--r);
+    background: rgba(242, 193, 14, 0.16);
+    box-shadow: inset 3px 0 0 var(--hazard);
     font: 500 0.6875rem/1.45 var(--mono); letter-spacing: 0.02em; color: var(--ink);
   }
+  .lb-session::before {
+    content: ""; flex: none; width: 7px; height: 7px; margin-top: 3px;
+    background: var(--ink);
+  }
   .lb-play {
-    display: block; width: 100%; box-sizing: border-box; cursor: pointer;
-    padding: 17px 12px; border: 0; border-radius: var(--r);
+    position: relative; display: block; width: 100%; box-sizing: border-box; cursor: pointer;
+    padding: 17px 12px; border: 0; border-radius: var(--r); overflow: hidden;
     background: var(--hivis); color: #1A0D05;
     font: 900 1.0625rem/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase;
     box-shadow: 0 4px 0 var(--hivis-deep), 0 12px 26px rgba(255, 91, 20, 0.22);
-    transition: transform 0.12s var(--press), box-shadow 0.12s var(--press), background 0.2s var(--ease);
+    transition: transform 0.12s var(--press), box-shadow 0.12s var(--press), background 0.2s var(--ease), color 0.2s var(--ease);
   }
   .lb-play:hover { background: #FF6C2C; }
   .lb-play:active {
     transform: translateY(4px);
     box-shadow: 0 0 0 var(--hivis-deep), 0 4px 10px rgba(255, 91, 20, 0.18);
   }
-  .lb-play:disabled {
-    cursor: default; transform: none; background: var(--cement-3); color: var(--ink-58);
+  .lb-play:disabled { cursor: default; transform: none; }
+  /* Idle disabled (nothing to do) is grey. Loading is a different state and says so:
+     the button keeps its hi-vis identity and a hazard band crawls across it, which is
+     the only "we are working" signal between PLAY and the first frame. */
+  .lb-play:disabled:not(.is-loading) {
+    background: var(--cement-3); color: var(--ink-58);
     box-shadow: 0 4px 0 rgba(21, 24, 28, 0.14);
   }
+  .lb-play.is-loading:disabled {
+    background: var(--hivis-deep); color: rgba(255, 240, 232, 0.94);
+    box-shadow: 0 4px 0 rgba(21, 24, 28, 0.22);
+  }
+  .lb-play.is-loading:disabled::before {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
+    background: repeating-linear-gradient(135deg, var(--hazard) 0 8px, rgba(21, 24, 28, 0.35) 8px 16px);
+    background-size: 22.7px 100%;
+    animation: crawl 0.7s linear infinite;
+  }
+  @keyframes crawl { to { background-position: 22.7px 0; } }
 
   /* ============================ Focus + states ============================== */
   :focus { outline: none; }
@@ -462,7 +627,15 @@
   .lb-swatch:focus-visible { outline-offset: 4px; }
   #lb-nick:focus-visible { outline-offset: 2px; }
 
-  /* ============================ Responsive ================================= */
+  /* ============================ Responsive =================================
+     Two shapes only: side-by-side, and stacked. Between them the work-order stays
+     the same width it wants to be — the board is what gives. */
+  @media (max-width: 1040px) {
+    .lb-panel { grid-template-columns: 280px 1fr; }
+    #lb-preview { width: 240px; height: 344px; }
+    .lb-light { width: 260px; height: 330px; }
+    .lb-placard { padding: 24px 22px 22px; }
+  }
   @media (max-width: 900px) {
     .lb-panel { grid-template-columns: 1fr; width: min(560px, 100%); }
     .lb-hoard { padding-bottom: 22px; }
@@ -473,8 +646,25 @@
     .lb-placard { padding: 22px 20px; gap: 20px; }
     #lb-maps { grid-template-columns: repeat(2, 1fr); }
     .lb-row { grid-template-columns: 68px 1fr; gap: 10px; }
-    #vehicle-menu .vm-grid { grid-template-columns: repeat(4, 74px); }
-    #vehicle-menu .vm-swatch { width: 54px; height: 54px; }
+    #vehicle-menu .vm-grid { grid-template-columns: repeat(4, 88px); gap: 7px; }
+    #vehicle-menu .vm-swatch { height: 46px; }
+    #vehicle-menu .vm-panel { padding: 16px 16px 14px; }
+  }
+  @media (max-width: 560px) {
+    .lb-panel { width: 100%; }
+    .lb-row { grid-template-columns: 1fr; gap: 6px; min-height: 0; padding: 10px 0; align-items: start; }
+    #lb-maps { grid-template-columns: 1fr; }
+    .lb-card-name, .lb-card-sub { min-height: 0; }
+    #vehicle-menu .vm-grid { grid-template-columns: repeat(4, 1fr); }
+    #vehicle-menu .vm-panel { width: 100%; box-sizing: border-box; }
+    #game-menu .gm-panel { width: 100%; }
+  }
+  /* Short windows: the vehicle yard is the only panel tall enough to run out of room.
+     Shrink the bays first, and only once that is not enough does the grid take its own
+     scrollbar — the header and the key legend stay put either way. */
+  @media (max-height: 700px) {
+    #vehicle-menu .vm-swatch { height: 46px; }
+    #vehicle-menu .vm-grid { max-height: calc(100vh - 200px); overflow-y: auto; }
   }
 
   /* ============================ Accessibility =============================== */
@@ -486,31 +676,61 @@
     .ov, .panel, .lb-panel, #enter-overlay .eo-card { animation: ov-in 0.001ms both; }
     .lb-card:hover .lb-blk-t, .lb-card.lb-card-sel .lb-blk-t { transform: none; }
     .lb-card:hover, .lb-swatch:hover, #vehicle-menu .vm-tile:hover { transform: none; }
+    #vehicle-menu .vm-tile:hover .vm-draw, #vehicle-menu .vm-tile.vm-selected .vm-draw { transform: none; }
+    /* The loading band is the only "still working" signal, so it stays — as a static
+       hazard bar rather than a crawl. */
+    .lb-play.is-loading:disabled::before { animation: none; }
+  }
+  /* No backdrop-filter anywhere (it cannot be afforded over a live canvas), but the plates that sit
+     on the scene are still semi-transparent — make those solid when asked. */
+  @media (prefers-reduced-transparency: reduce) {
+    #tool-label { background: #0B0E12; }
+    #enter-overlay .eo-plate { background: linear-gradient(180deg, #141922 0%, #0B0E13 100%); }
+    #enter-overlay { background: rgba(8, 10, 13, 0.72); }
   }
   @media (prefers-contrast: more) {
     .ov { background: rgba(6, 8, 11, 0.94); }
     .panel { box-shadow: 0 0 0 2px var(--cement), 0 30px 70px rgba(0, 0, 0, 0.7); }
+    #enter-overlay { background: rgba(6, 8, 11, 0.8); }
+    #enter-overlay .eo-plate { box-shadow: 0 0 0 2px var(--cement), 0 26px 60px rgba(0, 0, 0, 0.6); }
+    #tool-label { background: rgba(6, 8, 11, 0.92); box-shadow: inset 0 0 0 1px var(--cement); }
+    .tl-cat, .keys li { color: var(--cement); }
     .lb-card { box-shadow: inset 0 0 0 2px rgba(21, 24, 28, 0.5); }
     .lb-card-sub, .lb-row-label { color: var(--ink-70); }
+    #vehicle-menu .vm-label, #vehicle-menu .vm-cat { color: var(--cement); }
+    .vm-floor { fill: rgba(228, 224, 215, 0.5); }
   }
 </style>
 <canvas id="app"></canvas>
 <div id="crosshair"></div>
 <div id="map-label"></div>
-<div id="tool-label"><span id="tool-label-num"></span><span id="tool-label-name"></span></div>
+<!-- Tool readout. weapons.js writes #tool-label-num (category number) and
+     #tool-label-name (item name) and flips #tool-label's opacity; lobby.js fills the
+     category word and the cycle rail from those two. -->
+<div id="tool-label">
+  <span id="tool-label-num"></span>
+  <span class="tl-text">
+    <span id="tool-label-cat" class="tl-cat"></span>
+    <span id="tool-label-name"></span>
+    <span id="tool-label-rail" class="tl-rail" aria-hidden="true"></span>
+  </span>
+</div>
 
 <div id="vehicle-menu" class="ov">
   <div class="vm-panel panel">
     <div class="vm-head">
-      <span class="vm-kicker">Select vehicle</span>
-      <span id="vm-selected">Hatchback</span>
+      <div>
+        <span class="vm-kicker">Motor pool</span>
+        <span id="vm-selected">Hatchback</span>
+      </div>
+      <span id="vm-selected-cat"></span>
     </div>
-    <div class="vm-grid" id="vm-grid"></div>
-    <div class="vm-hint">
-      <span class="kbd">W A S D</span> move
-      <span class="kbd">Enter</span> spawn
-      <span class="kbd">Tab</span> close
-    </div>
+    <div class="vm-grid" id="vm-grid" role="radiogroup" aria-label="Vehicle"></div>
+    <ul class="vm-hint keys">
+      <li><span class="kbd">W A S D</span> Move</li>
+      <li><span class="kbd">Enter</span> Spawn</li>
+      <li><span class="kbd">Tab</span> Close</li>
+    </ul>
   </div>
 </div>
 
@@ -518,7 +738,7 @@
   <div class="lb-panel">
     <section class="lb-hoard">
       <h1 class="lb-title"><span class="lb-t1">Voxel</span><span class="lb-t2">Demolition</span></h1>
-      <div class="lb-tape" aria-hidden="true"></div>
+      <div class="lb-tape tape" aria-hidden="true"></div>
       <div class="lb-stage">
         <div class="lb-light" aria-hidden="true"></div>
         <canvas id="lb-preview" aria-label="Character preview"></canvas>
@@ -550,37 +770,49 @@
 
 <div id="enter-overlay" class="ov">
   <div class="eo-card">
-    <div class="eo-msg">Click to enter</div>
-    <div class="eo-sub">
-      <span class="kbd">W A S D</span> move
-      <span class="kbd">Mouse</span> look
-      <span class="kbd">1&ndash;9</span> tools
-      <span class="kbd">Tab</span> vehicles
-      <span class="kbd">Esc</span> pause
+    <div class="eo-plate">
+      <div class="tape" aria-hidden="true"></div>
+      <div class="eo-body">
+        <!-- main.js rewrites .eo-msg: the enter prompt, "Joining <map>", or a boot error. -->
+        <div class="eo-msg">Click to enter</div>
+      </div>
     </div>
+    <ul class="eo-sub keys">
+      <li><span class="kbd">W A S D</span> Move</li>
+      <li><span class="kbd">Mouse</span> Look</li>
+      <li><span class="kbd">1&ndash;9</span> Tools</li>
+      <li><span class="kbd">Tab</span> Vehicles</li>
+      <li><span class="kbd">Esc</span> Pause</li>
+    </ul>
   </div>
 </div>
 
 <div id="game-menu" class="ov">
   <div class="gm-panel panel">
-    <div class="gm-head">
-      <span class="kicker">Voxel Demolition</span>
-      <h2 class="gm-title">Paused</h2>
+    <div class="tape" aria-hidden="true"></div>
+    <div class="gm-body">
+      <div class="gm-head">
+        <!-- lobby.js mirrors the site name off #map-label so the board answers "where am I". -->
+        <span id="gm-site" class="kicker gm-site">Voxel Demolition</span>
+        <h2 class="gm-title">Paused</h2>
+      </div>
+      <button id="gm-resume" class="gm-btn gm-btn-primary" type="button">
+        <span class="gm-b-t">Resume</span>
+        <span class="gm-b-s">Grabs the mouse again</span>
+      </button>
+      <button id="gm-reset" class="gm-btn" type="button">
+        <span class="gm-b-t">Reset map</span>
+        <span class="gm-b-s">Rebuilds everything you broke</span>
+      </button>
+      <button id="gm-lobby" class="gm-btn gm-btn-exit" type="button">
+        <span class="gm-b-t">Back to lobby</span>
+        <span class="gm-b-s">Reloads the game — the site is lost</span>
+      </button>
+      <div class="gm-status">
+        <div id="gm-hint" class="gm-hint"></div>
+        <div id="gm-flash" class="gm-flash"></div>
+      </div>
     </div>
-    <button id="gm-resume" class="gm-btn gm-btn-primary" type="button">
-      <span class="gm-b-t">Resume</span>
-      <span class="gm-b-s">Grabs the mouse again</span>
-    </button>
-    <button id="gm-reset" class="gm-btn" type="button">
-      <span class="gm-b-t">Reset map</span>
-      <span class="gm-b-s">Rebuilds everything you broke</span>
-    </button>
-    <button id="gm-lobby" class="gm-btn" type="button">
-      <span class="gm-b-t">Back to lobby</span>
-      <span class="gm-b-s">Reloads the game</span>
-    </button>
-    <div id="gm-hint" class="gm-hint"></div>
-    <div id="gm-flash" class="gm-flash"></div>
   </div>
 </div>
 

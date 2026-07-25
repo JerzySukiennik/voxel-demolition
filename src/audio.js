@@ -1,74 +1,148 @@
-// audio.js - real CC0 sound-file playback (fetched AudioBuffers); engine loop, footsteps, impacts, weapons. Assets are CC0, see assets/audio/CREDITS.md.
+// audio.js - CC0 sound-file playback (fetched AudioBuffers): buses + limiter, material-aware impacts, managed loops. Assets are CC0, see assets/audio/CREDITS.md.
 import { CONFIG } from "./config.js";
 
 const A = CONFIG.audio;
-// Persistent looping vehicle categories: one always-on source each, gain 0 until selected.
-const LOOP_CATS = ["engine", "rotor", "plane", "hover", "boat"];
 const BASE = new URL("../assets/audio/", import.meta.url);
+
+// ---------------------------------------------------------------------------------------------
+// Mix constants. These live here on purpose: config.js is shared/owned elsewhere, and everything
+// below is pure mixing detail (bus trims, voice caps, attenuation refs) with no gameplay meaning.
+// ---------------------------------------------------------------------------------------------
+const BUS_GAIN = {
+  world: 0.85,   // structure impacts, debris, crumble - the constant bed of a demolition game
+  weapon: 0.90,  // guns, explosions, tool one-shots
+  tool: 0.70,    // held-tool loops (chainsaw, vacuum, spray, hums)
+  vehicle: 0.70, // engine / rotor / prop / hover / boat loops
+  player: 0.55,  // footsteps, jump, land, water
+  ui: 0.60,      // beeps, clicks, klaxon
+  amb: 0.30,     // map ambience beds
+};
+// Master limiter: catches stacked explosions + debris storms instead of letting them clip.
+const LIMITER = { threshold: -8, knee: 6, ratio: 12, attack: 0.003, release: 0.22 };
+// Per-category polyphony caps (default DEFAULT_VOICES). Stops a collapsing building eating the mix.
+const VOICES = {
+  impact: 7, impactWood: 5, impactMetal: 5, impactGlass: 4, debris: 5, crumble: 4,
+  explosion: 4, explosionSmall: 5, footstep: 3, land: 2,
+};
+const DEFAULT_VOICES = 4;
+const MAX_TOTAL_VOICES = 26;
+// Inverse-distance attenuation reference (metres): gain = ref / (ref + dist), floored per call.
+const ATT_NEAR = 7, ATT_MID = 12, ATT_FAR = 26;
+const CULL_GAIN = 0.02;      // below this a world sound is skipped entirely (frees a voice)
+const LOOP_FADE = 0.07;      // time-constant for managed loop gain ramps (click-free start/stop)
+const PAN_SPREAD = 0.45;     // random stereo placement for world one-shots
+const IMPACT_TRIM = 0.75;    // the new impact set is hotter than the old Kenney blips
+const FOOT_GAIN = 0.42;
+const FETCH_CONCURRENCY = 8;
+
+// Category -> file list. Several categories share a file on purpose; the loader de-dupes by name,
+// so a shared file is fetched and decoded exactly once.
 const FILES = {
-  footstep: ["footstep_0.ogg", "footstep_1.ogg", "footstep_2.ogg", "footstep_3.ogg"],
-  impact: ["impact_0.ogg", "impact_1.ogg", "impact_2.ogg"],
-  engine: ["engine_loop.ogg"],
+  // ---- player -------------------------------------------------------------------------------
+  footstep: ["footstep_concrete_0.ogg", "footstep_concrete_1.ogg", "footstep_concrete_2.ogg",
+             "footstep_concrete_3.ogg", "footstep_concrete_4.ogg", "footstep_concrete_5.ogg"],
+  footstepSand: ["footstep_sand_0.ogg", "footstep_sand_1.ogg", "footstep_sand_2.ogg", "footstep_sand_3.ogg"],
+  footstepWood: ["footstep_wood_0.ogg", "footstep_wood_1.ogg", "footstep_wood_2.ogg", "footstep_wood_3.ogg"],
+  footstepMetal: ["footstep_metal_0.ogg", "footstep_metal_1.ogg", "footstep_metal_2.ogg", "footstep_metal_3.ogg"],
+  jump: ["jump_0.ogg", "jump_1.ogg"],
+  land: ["land_0.ogg", "land_1.ogg", "land_2.ogg"],
+  splash: ["splash_0.ogg", "splash_1.ogg", "splash_2.ogg"],
+  wade: ["wade_loop.ogg"],
+  ambWind: ["amb_wind.ogg"],
+  ambCity: ["amb_city.ogg"],
+
+  // ---- destruction --------------------------------------------------------------------------
+  impact: ["impact_concrete_0.ogg", "impact_concrete_1.ogg", "impact_concrete_2.ogg",
+           "impact_concrete_3.ogg", "impact_concrete_4.ogg"],
+  impactWood: ["impact_wood_0.ogg", "impact_wood_1.ogg", "impact_wood_2.ogg", "impact_wood_3.ogg", "impact_wood_4.ogg"],
+  impactMetal: ["impact_metal_0.ogg", "impact_metal_1.ogg", "impact_metal_2.ogg", "impact_metal_3.ogg", "impact_metal_4.ogg"],
+  impactGlass: ["impact_glass_0.ogg", "impact_glass_1.ogg", "impact_glass_2.ogg", "impact_glass_3.ogg"],
+  debris: ["debris_0.ogg", "debris_1.ogg", "debris_2.ogg", "debris_3.ogg", "debris_4.ogg"],
+  crumble: ["crumble_0.ogg", "crumble_1.ogg", "crumble_2.ogg"],
+
+  // ---- vehicle loops ------------------------------------------------------------------------
+  engineCar: ["engine_car_loop.ogg"],
+  engineDiesel: ["engine_diesel_loop.ogg"],
   rotor: ["rotor_loop.ogg"],
   plane: ["plane_loop.ogg"],
   hover: ["hover_loop.ogg"],
   boat: ["boat_loop.ogg"],
-  swing: ["swing.ogg"],
-  clang: ["clang.ogg"],
-  thud: ["thud.ogg"],
-  gunshot: ["gunshot.wav"],
+
+  // ---- melee / core weapons -----------------------------------------------------------------
+  swing: ["swing_0.ogg", "swing_1.ogg", "swing_2.ogg", "swing_3.ogg", "swing_4.ogg"],
+  clang: ["clang_0.ogg", "clang_1.ogg", "clang_2.ogg"],
+  thud: ["thud_0.ogg", "thud_1.ogg", "thud_2.ogg"],
+  gunshot: ["shotgun_0.ogg", "shotgun_1.ogg", "shotgun_2.ogg"],
   c4place: ["c4_place.ogg"],
   beep: ["detonate_beep.ogg"],
-  explosion: ["explosion_0.ogg", "explosion_1.ogg"],
+  explosion: ["explosion_0.ogg", "explosion_1.ogg", "explosion_2.ogg", "explosion_3.ogg"],
+  explosionSmall: ["explosion_small_0.ogg", "explosion_small_1.ogg", "explosion_small_2.ogg"],
+  explosionHuge: ["explosion_huge.ogg"],
+  explosionRumble: ["explosion_rumble.ogg"],
   rocket: ["rocket_launch.ogg"],
-  // ---- Phase 7 batch A (all CC0 Kenney, see CREDITS.md) ----
-  crowbarPry: ["crowbar_pry.ogg"],
-  crowbarClang: ["crowbar_clang.ogg"],
+
+  // ---- phase 7 batch A ----------------------------------------------------------------------
+  crowbarPry: ["crowbar_pry_0.ogg", "crowbar_pry_1.ogg", "crowbar_pry_2.ogg"],
+  crowbarClang: ["crowbar_clang_0.ogg", "crowbar_clang_1.ogg", "crowbar_clang_2.ogg"],
   chainsawIdle: ["chainsaw_idle.ogg"],
   chainsawCut: ["chainsaw_cut.ogg"],
-  chainsawScreech: ["chainsaw_screech.ogg"],
+  chainsawScreech: ["chainsaw_screech_0.ogg", "chainsaw_screech_1.ogg", "chainsaw_screech_2.ogg"],
   fuseHiss: ["fuse_hiss.ogg"],
-  bounceClink: ["bounce_clink.ogg"],
+  bounceClink: ["bounce_clink_0.ogg", "bounce_clink_1.ogg", "bounce_clink_2.ogg"],
   wireBeep: ["wire_beep.ogg"],
-  stickyThoomp: ["sticky_thoomp.ogg"],
-  stickSplat: ["stick_splat.ogg"],
-  clusterPop: ["cluster_pop.ogg"],
-  clusterCrump: ["cluster_crump.ogg"],
-  // ---- Phase 7 batch B: Grab & Force (all CC0 Kenney, see CREDITS.md) ----
-  windWhoomp: ["wind_whoomp.ogg"],
+  stickyThoomp: ["sticky_thoomp_0.ogg", "sticky_thoomp_1.ogg"],
+  stickSplat: ["stick_splat_0.ogg", "stick_splat_1.ogg", "stick_splat_2.ogg"],
+  clusterPop: ["cluster_pop_0.ogg", "cluster_pop_1.ogg", "cluster_pop_2.ogg"],
+
+  // ---- phase 7 batch B: grab & force ---------------------------------------------------------
+  windWhoomp: ["wind_whoomp_0.ogg", "wind_whoomp_1.ogg", "wind_whoomp_2.ogg"],
   vacuumLoop: ["vacuum_loop.ogg"],
-  vacuumThup: ["vacuum_thup.ogg"],
+  vacuumThup: ["vacuum_thup_0.ogg", "vacuum_thup_1.ogg", "vacuum_thup_2.ogg"],
   magnetAttract: ["magnet_attract.ogg"],
   magnetRepel: ["magnet_repel.ogg"],
   gravityHum: ["gravity_hum.ogg"],
   gravityThrow: ["gravity_throw.ogg"],
   grappleLaunch: ["grapple_launch.ogg"],
-  grappleAnchor: ["grapple_anchor.ogg"],
+  grappleAnchor: ["grapple_anchor_0.ogg", "grapple_anchor_1.ogg", "grapple_anchor_2.ogg"],
   grappleReel: ["grapple_reel.ogg"],
-  grappleSnap: ["grapple_snap.ogg"],
-  // ---- Phase 7 batch C: Strikes + heavy/vehicular ordnance (CC0 Kenney reuse, see CREDITS.md) ----
+  grappleSnap: ["grapple_snap_0.ogg", "grapple_snap_1.ogg"],
+
+  // ---- phase 7 batch C: strikes + heavy ordnance ----------------------------------------------
   spraySound: ["spray_loop.ogg"],
-  propaneClonk: ["propane_clonk.ogg"],
+  propaneClonk: ["propane_clonk_0.ogg", "propane_clonk_1.ogg"],
   nukeArm: ["nuke_arm.ogg"],
   nukeKlaxon: ["nuke_klaxon.ogg"],
-  nukeBlast: ["nuke_blast.ogg"],
-  nukeRumble: ["nuke_rumble.ogg"],
   orbitalCharge: ["orbital_charge.ogg"],
   orbitalZap: ["orbital_zap.ogg"],
-  carWhoosh: ["carcannon_whoosh.ogg"],
-  carCrash: ["carcannon_crash.ogg"],
+  carWhoosh: ["car_whoosh.ogg"],
+  carCrash: ["car_crash_0.ogg", "car_crash_1.ogg"],
   rcMotor: ["rc_motor.ogg"],
-  airPlane: ["airstrike_plane.ogg"],
+  airPlane: ["plane_loop.ogg"],          // same prop loop as the flyable plane
   airFlyby: ["airstrike_flyby.ogg"],
   bombWhistle: ["bomb_whistle.ogg"],
-  // ---- Phase 7 batch D: Builders (CC0 Kenney reuse, see CREDITS.md) ----
+
+  // ---- phase 7 batch D: builders --------------------------------------------------------------
   foamSpray: ["foam_spray.ogg"],
-  foamSplat: ["foam_splat.ogg"],
-  foamHarden: ["foam_harden.ogg"],
-  rebuildSettle: ["rebuild_settle.ogg"],
+  foamSplat: ["foam_splat_0.ogg", "foam_splat_1.ogg", "foam_splat_2.ogg", "foam_splat_3.ogg"],
+  foamHarden: ["foam_harden_0.ogg", "foam_harden_1.ogg"],
+  rebuildSettle: ["rebuild_settle_0.ogg", "rebuild_settle_1.ogg", "rebuild_settle_2.ogg"],
   sizeShrink: ["size_shrink.ogg"],
   sizeGrow: ["size_grow.ogg"],
 };
+
+// Persistent vehicle loops: one always-on source per entry, gain 0 until its vehicle is piloted.
+// `engine` has two timbres; setEngine() picks by the profile's idle rate (heavy trucks idle low).
+const LOOP_SLOTS = [
+  { key: "engine:car", loop: "engine", cat: "engineCar" },
+  { key: "engine:diesel", loop: "engine", cat: "engineDiesel" },
+  { key: "rotor", loop: "rotor", cat: "rotor" },
+  { key: "plane", loop: "plane", cat: "plane" },
+  { key: "hover", loop: "hover", cat: "hover" },
+  { key: "boat", loop: "boat", cat: "boat" },
+];
+const DIESEL_IDLE_MAX = 0.6;   // profile.rateIdle at or below this -> diesel timbre
+
+const SURFACES = { concrete: "footstep", sand: "footstepSand", wood: "footstepWood", metal: "footstepMetal" };
 
 export class GameAudio {
   constructor() {
@@ -76,93 +150,218 @@ export class GameAudio {
     this.ready = false;
     this.footPhase = 0;
     this.buffers = {};
-    this._impactActive = 0;
-    // Prefetch raw bytes at page load so decode after the first gesture is instant.
-    this._raw = {};
-    for (const [k, list] of Object.entries(FILES)) {
-      this._raw[k] = list.map((f) =>
-        fetch(new URL(f, BASE)).then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null)
-      );
-    }
+    this._voices = {};
+    this._totalVoices = 0;
+    this._throttles = {};
+    this._surface = "concrete";
+    this._raw = null;
+    // Prefetch raw bytes at page load (bounded concurrency) so decode after the first gesture is
+    // instant and the audio never competes with model/texture loads for sockets.
+    this._files = {};
+    const names = [];
+    for (const list of Object.values(FILES)) for (const f of list) if (names.indexOf(f) < 0) names.push(f);
+    this._prefetch = this._fetchAll(names);
+  }
+
+  async _fetchAll(names) {
+    let i = 0;
+    const worker = async () => {
+      while (i < names.length) {
+        const f = names[i++];
+        try {
+          const r = await fetch(new URL(f, BASE));
+          this._files[f] = r.ok ? await r.arrayBuffer() : null;
+        } catch (e) { this._files[f] = null; }
+      }
+    };
+    const pool = [];
+    for (let k = 0; k < FETCH_CONCURRENCY; k++) pool.push(worker());
+    await Promise.all(pool);
   }
 
   async resume() {
     if (this.ready) { if (this.ctx.state === "suspended") this.ctx.resume(); return; }
     if (this._resuming) { if (this.ctx && this.ctx.state === "suspended") this.ctx.resume(); return; }
     this._resuming = true;
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    this.ctx = new Ctx();
-    this.master = this.ctx.createGain();
-    this.master.gain.value = A.masterGain;
-    this.master.connect(this.ctx.destination);
-    await this._decodeAll();
-    this._startLoops();
-    this.ready = true;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      this.ctx = new Ctx();
+      // master -> limiter -> destination; every bus feeds master.
+      this.limiter = this.ctx.createDynamicsCompressor();
+      this.limiter.threshold.value = LIMITER.threshold;
+      this.limiter.knee.value = LIMITER.knee;
+      this.limiter.ratio.value = LIMITER.ratio;
+      this.limiter.attack.value = LIMITER.attack;
+      this.limiter.release.value = LIMITER.release;
+      this.limiter.connect(this.ctx.destination);
+      this.master = this.ctx.createGain();
+      this.master.gain.value = A.masterGain;
+      this.master.connect(this.limiter);
+      this.bus = {};
+      for (const [name, g] of Object.entries(BUS_GAIN)) {
+        const node = this.ctx.createGain();
+        node.gain.value = g;
+        node.connect(this.master);
+        this.bus[name] = node;
+      }
+      await this._decodeAll();
+      this._startLoops();
+      this.ready = true;
+    } catch (e) {
+      this.ready = false;
+    }
   }
 
   async _decodeAll() {
-    for (const [k, proms] of Object.entries(this._raw)) {
-      const arrs = await Promise.all(proms);
-      const bufs = [];
-      for (const a of arrs) {
-        if (!a) continue;
-        try { bufs.push(await this.ctx.decodeAudioData(a.slice(0))); } catch (e) {}
-      }
-      this.buffers[k] = bufs;
+    await this._prefetch;
+    const decoded = {};
+    for (const [name, bytes] of Object.entries(this._files)) {
+      if (!bytes) continue;
+      try { decoded[name] = await this.ctx.decodeAudioData(bytes.slice(0)); } catch (e) {}
     }
-    this._raw = null;
+    for (const [cat, list] of Object.entries(FILES)) {
+      const bufs = [];
+      for (const f of list) if (decoded[f]) bufs.push(decoded[f]);
+      this.buffers[cat] = bufs;
+    }
+    this._files = {};
   }
 
+  // ---- helpers ---------------------------------------------------------------------------------
+
   _jitter() { return 1 + (Math.random() * 2 - 1) * A.pitchJitter; }
+
+  // Inverse-distance falloff with a floor, so distant events stay audible but never dominate.
+  _atten(dist, ref, floor) {
+    const d = dist == null ? 0 : dist;
+    const g = ref / (ref + Math.max(0, d));
+    return Math.max(floor == null ? 0.12 : floor, Math.min(1, g));
+  }
+
+  // Rate-limit a repeating sound. Returns true when the caller should stay silent.
+  _throttled(key, minGap) {
+    const now = this.ctx ? this.ctx.currentTime : 0;
+    const last = this._throttles[key];
+    if (last != null && now - last < minGap) return true;
+    this._throttles[key] = now;
+    return false;
+  }
+
+  _spread() { return (Math.random() * 2 - 1) * PAN_SPREAD; }
 
   _play(cat, opts) {
     if (!this.ready) return null;
     const bufs = this.buffers[cat];
     if (!bufs || !bufs.length) return null;
     const o = opts || {};
-    const buf = bufs[(Math.random() * bufs.length) | 0];
+    const gain = o.gain == null ? 1 : o.gain;
+    if (gain < CULL_GAIN) return null;
+    const cap = VOICES[cat] == null ? DEFAULT_VOICES : VOICES[cat];
+    const used = this._voices[cat] || 0;
+    if (used >= cap || this._totalVoices >= MAX_TOTAL_VOICES) return null;
+
     const src = this.ctx.createBufferSource();
-    src.buffer = buf;
-    src.playbackRate.value = o.rate == null ? 1 : o.rate;
-    const g = this.ctx.createGain();
-    g.gain.value = o.gain == null ? 1 : o.gain;
-    src.connect(g).connect(o.dest || this.master);
+    src.buffer = bufs[(Math.random() * bufs.length) | 0];
+    const rate = o.rate == null ? 1 : o.rate;
+    src.playbackRate.value = rate;
     const t = this.ctx.currentTime;
+    if (o.rateEnd != null) src.playbackRate.linearRampToValueAtTime(o.rateEnd, t + (o.rateTime || 1.5));
+
+    const g = this.ctx.createGain();
+    g.gain.value = gain;
+    let node = g;
+    if (o.pan && this.ctx.createStereoPanner) {
+      const p = this.ctx.createStereoPanner();
+      p.pan.value = Math.max(-1, Math.min(1, o.pan));
+      g.connect(p);
+      node = p;
+    }
+    node.connect(o.dest || this.bus[o.bus || "world"] || this.master);
+    src.connect(g);
     if (o.duration != null) src.start(t, o.offset || 0, o.duration);
     else src.start(t, o.offset || 0);
+
+    this._voices[cat] = used + 1;
+    this._totalVoices++;
+    src.onended = () => {
+      this._voices[cat] = Math.max(0, (this._voices[cat] || 1) - 1);
+      this._totalVoices = Math.max(0, this._totalVoices - 1);
+      try { g.disconnect(); if (node !== g) node.disconnect(); } catch (e) {}
+    };
     return { src, g };
   }
 
-  // One persistent looping source per vehicle category, each at gain 0.
+  // Generic managed looping source: one per category, gain 0 until driven. Built lazily post-decode.
+  _getLoop(cat, busName) {
+    if (!this._mloops) this._mloops = {};
+    if (cat in this._mloops) return this._mloops[cat];
+    const bufs = this.buffers[cat];
+    if (!this.ready || !bufs || !bufs.length) { this._mloops[cat] = null; return null; }
+    const gain = this.ctx.createGain();
+    gain.gain.value = 0;
+    gain.connect(this.bus[busName || "tool"] || this.master);
+    const src = this.ctx.createBufferSource();
+    src.buffer = bufs[0];
+    src.loop = true;
+    src.connect(gain);
+    src.start();
+    const l = { gain, src };
+    this._mloops[cat] = l;
+    return l;
+  }
+  _setLoop(cat, target, tc, busName) {
+    if (!this.ready) return;
+    const l = this._getLoop(cat, busName);
+    if (!l) return;
+    l.gain.gain.setTargetAtTime(target, this.ctx.currentTime, tc == null ? LOOP_FADE : tc);
+  }
+
+  // One persistent source per vehicle loop slot, each at gain 0.
   _startLoops() {
     this.loops = {};
-    for (const cat of LOOP_CATS) {
-      const bufs = this.buffers[cat];
+    for (const slot of LOOP_SLOTS) {
+      const bufs = this.buffers[slot.cat];
       if (!bufs || !bufs.length) continue;
       const gain = this.ctx.createGain();
       gain.gain.value = 0;
-      gain.connect(this.master);
+      gain.connect(this.bus.vehicle || this.master);
       const src = this.ctx.createBufferSource();
       src.buffer = bufs[0];
       src.loop = true;
       src.connect(gain);
       src.start();
-      this.loops[cat] = { src, gain };
+      this.loops[slot.key] = { src, gain };
     }
   }
 
-  // Drive the piloted vehicle's loop category from its profile; ramp every other category to 0.
+  // ---- public: mix control ----------------------------------------------------------------------
+
+  // 0..1 master trim on top of CONFIG.audio.masterGain (for a future options slider / mute key).
+  setMasterVolume(v) {
+    if (!this.ready) return;
+    const g = Math.max(0, Math.min(1, v)) * A.masterGain;
+    this.master.gain.setTargetAtTime(g, this.ctx.currentTime, 0.05);
+  }
+
+  // ---- public: vehicles ---------------------------------------------------------------------------
+
+  // Drive the piloted vehicle's loop slot from its profile; ramp every other slot to 0.
   // profile: { loop, rateIdle, rateMax, gainIdle, gainMax }. speedNorm 0..1. driving: bool.
   setEngine(profile, speedNorm, driving) {
     if (!this.ready || !this.loops) return;
     const t = this.ctx.currentTime;
     const s = Math.min(1, Math.max(0, speedNorm || 0));
-    const active = driving && profile ? profile.loop : null;
-    for (const cat of LOOP_CATS) {
-      const l = this.loops[cat];
+    let active = null;
+    if (driving && profile) {
+      active = profile.loop === "engine"
+        ? (profile.rateIdle <= DIESEL_IDLE_MAX ? "engine:diesel" : "engine:car")
+        : profile.loop;
+    }
+    for (const slot of LOOP_SLOTS) {
+      const l = this.loops[slot.key];
       if (!l) continue;
-      if (cat === active) {
+      if (slot.key === active) {
         const rate = profile.rateIdle + (profile.rateMax - profile.rateIdle) * s;
         const gain = profile.gainIdle + (profile.gainMax - profile.gainIdle) * s;
         l.src.playbackRate.setTargetAtTime(rate, t, A.engineRateSmooth);
@@ -173,228 +372,206 @@ export class GameAudio {
     }
   }
 
-  footstepTick(dt, hspeed, sprint) {
+  // ---- public: player -----------------------------------------------------------------------------
+
+  // Optional: "concrete" | "sand" | "wood" | "metal". Unknown names fall back to concrete.
+  setFootstepSurface(name) { this._surface = SURFACES[name] ? name : "concrete"; }
+
+  footstepTick(dt, hspeed, sprint, surface) {
     if (!this.ready) return;
     if (hspeed < 0.3) { this.footPhase = 0.5; return; }
     const stepsPerMeter = sprint ? 0.75 : 0.95;
     this.footPhase += hspeed * stepsPerMeter * dt;
     if (this.footPhase >= 1) {
       this.footPhase -= 1;
-      this._play("footstep", { gain: (sprint ? 0.5 : 0.35) * 2 * A.footstepGain, rate: this._jitter() });
+      const cat = SURFACES[surface || this._surface] || "footstep";
+      this._play(cat, {
+        gain: (sprint ? 1.25 : 1) * FOOT_GAIN * A.footstepGain,
+        rate: this._jitter(), bus: "player", pan: this._spread() * 0.4,
+      });
     }
   }
 
-  // Debris / structure impact; louder with force, capped polyphony.
-  impact(force) {
-    if (!this.ready) return;
-    if (this._impactActive >= A.impactVoices) return;
-    const gain = Math.min(0.9, A.impactGainBase + A.impactGainScale * Math.log10(Math.max(10, force)));
-    const v = this._play("impact", { gain, rate: this._jitter() });
-    if (!v) return;
-    this._impactActive++;
-    v.src.onended = () => { this._impactActive--; };
+  jump() { this._play("jump", { gain: 0.35, rate: this._jitter(), bus: "player" }); }
+
+  // force: impact speed in m/s (or any positive scalar) - louder the harder you hit the ground.
+  land(force) {
+    const f = Math.max(0, force == null ? 6 : force);
+    this._play("land", { gain: Math.min(0.7, 0.18 + f * 0.035), rate: this._jitter(), bus: "player" });
   }
 
-  // Melee whoosh.
-  swing() { this._play("swing", { gain: A.swingGain, rate: this._jitter() }); }
+  // Entering / leaving water.
+  splash(dist) {
+    this._play("splash", { gain: 0.55 * this._atten(dist, ATT_MID), rate: this._jitter(), bus: "player", pan: this._spread() });
+  }
+  // Continuous wading loop while the player's feet are under the surface.
+  wade(active) { this._setLoop("wade", active ? 0.30 : 0, LOOP_FADE, "player"); }
+
+  // Map ambience bed: "city" | "town" | "wind" | "desert" | null to silence it.
+  ambience(name) {
+    const city = name === "city" || name === "town" || name === "plaza";
+    const wind = name === "wind" || name === "desert" || name === "island" || name === "outdoor";
+    this._setLoop("ambCity", city ? 0.5 : 0, 0.8, "amb");
+    this._setLoop("ambWind", wind ? 0.5 : 0, 0.8, "amb");
+  }
+
+  // ---- public: destruction --------------------------------------------------------------------------
+
+  // Debris / structure impact. force scales loudness; optional material picks the timbre:
+  // "concrete" (default) | "wood" | "metal" | "glass".
+  impact(force, material) {
+    if (!this.ready) return;
+    const cat = material === "wood" ? "impactWood"
+      : material === "metal" ? "impactMetal"
+      : material === "glass" ? "impactGlass" : "impact";
+    const gain = Math.min(0.9, A.impactGainBase + A.impactGainScale * Math.log10(Math.max(10, force))) * IMPACT_TRIM;
+    this._play(cat, { gain, rate: this._jitter(), pan: this._spread() });
+  }
+
+  // Loose rubble scattering / sliding after a collapse.
+  debris(dist) {
+    this._play("debris", { gain: 0.5 * this._atten(dist, ATT_MID), rate: this._jitter(), pan: this._spread() });
+  }
+
+  // Structural crumble (a chunk of concrete letting go). Rate-limited: it is a long, dense sound.
+  crumble(dist) {
+    if (this._throttled("crumble", 0.12)) return;
+    this._play("crumble", { gain: 0.55 * this._atten(dist, ATT_MID), rate: this._jitter(), pan: this._spread() });
+  }
+
+  // ---- public: melee / core weapons -------------------------------------------------------------------
+
+  swing() { this._play("swing", { gain: A.swingGain * 0.7, rate: this._jitter(), bus: "weapon" }); }
 
   // Melee contact: metallic ring if a chunk broke, else a dull thud.
   clang(broke) {
-    this._play(broke ? "clang" : "thud", { gain: A.clangGain, rate: this._jitter() });
+    this._play(broke ? "clang" : "thud", { gain: A.clangGain * 0.8, rate: this._jitter(), bus: "weapon" });
   }
 
-  // Shotgun blast.
-  gunshot() { this._play("gunshot", { gain: A.gunshotGain, rate: A.gunshotRate }); }
+  // 12-gauge blast.
+  gunshot() { this._play("gunshot", { gain: A.gunshotGain, rate: A.gunshotRate * this._jitter(), bus: "weapon" }); }
 
-  // C4 placement click.
-  placeCharge() { this._play("c4place", { gain: A.placeGain, rate: this._jitter() }); }
+  placeCharge() { this._play("c4place", { gain: A.placeGain, rate: this._jitter(), bus: "ui" }); }
+  armBeep() { this._play("beep", { gain: A.beepGain, bus: "ui" }); }
 
-  // Detonator arm blip.
-  armBeep() { this._play("beep", { gain: A.beepGain }); }
-
-  // Explosion boom, attenuated by distance.
-  explosion(dist) {
-    const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("explosion", { gain: A.explosionGain * atten, rate: 0.9 + Math.random() * 0.15 });
+  // Explosion boom, attenuated by distance. size: "small" | "medium" (default) | "huge".
+  explosion(dist, size) {
+    const atten = this._atten(dist, size === "huge" ? ATT_FAR : ATT_MID, 0.15);
+    if (size === "small") { this.clusterCrump(dist); return; }
+    if (size === "huge") { this.nukeBlast(dist); return; }
+    this._play("explosion", { gain: A.explosionGain * atten, rate: 0.92 + Math.random() * 0.14, bus: "weapon", pan: this._spread() * 0.5 });
+    // A short low tail under closer blasts gives the voxel debris something to fall through.
+    if (atten > 0.65) this._play("explosionRumble", { gain: A.explosionGain * 0.28 * atten, rate: 1.0, bus: "weapon" });
   }
 
-  // Rocket launch whoosh (short slice of the thruster loop).
   rocketLaunch() {
-    this._play("rocket", { gain: A.rocketGain, rate: A.rocketRate, offset: 0, duration: A.rocketSlice });
+    this._play("rocket", { gain: A.rocketGain, rate: A.rocketRate, offset: 0, duration: A.rocketSlice + 0.6, bus: "weapon" });
   }
 
-  // ---- Phase 7 batch A ----------------------------------------------------------------------
+  // ---- phase 7 batch A ----------------------------------------------------------------------------------
 
-  // Crowbar contact: metal clang on a break, wood pry/creak otherwise.
-  crowbarHit(broke) { this._play(broke ? "crowbarClang" : "crowbarPry", { gain: A.clangGain, rate: this._jitter() }); }
+  crowbarHit(broke) { this._play(broke ? "crowbarClang" : "crowbarPry", { gain: A.clangGain * 0.8, rate: this._jitter(), bus: "weapon" }); }
 
-  // Managed chainsaw loops (idle always-on while equipped; cut layered while actively chewing a chunk).
-  // Built lazily after decode so the buffers exist. Silences both when equipped=false.
+  // Chainsaw: motor idle always-on while equipped, saw-in-material layer while actively cutting.
   chainsaw(equipped, cutting) {
     if (!this.ready) return;
-    if (!this._saw) this._buildSaw();
-    if (!this._saw) return;
-    const t = this.ctx.currentTime;
-    this._saw.idle.gain.gain.setTargetAtTime(equipped ? 0.32 : 0, t, 0.05);
-    this._saw.cut.gain.gain.setTargetAtTime(equipped && cutting ? 0.5 : 0, t, 0.05);
+    this._setLoop("chainsawIdle", equipped ? 0.30 : 0, 0.05);
+    this._setLoop("chainsawCut", equipped && cutting ? 0.42 : 0, 0.04);
   }
-  _buildSaw() {
-    const mk = (cat) => {
-      const bufs = this.buffers[cat];
-      if (!bufs || !bufs.length) return null;
-      const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
-      const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
-      return { gain, src };
-    };
-    const idle = mk("chainsawIdle"), cut = mk("chainsawCut");
-    if (!idle && !cut) { this._saw = null; return; }
-    this._saw = { idle: idle || { gain: this.ctx.createGain() }, cut: cut || { gain: this.ctx.createGain() } };
-  }
-  // Metallic screech when the chainsaw bites concrete/metal (nothing detaches). Rate-limited.
+  // Metallic screech when the bar bites concrete/metal and nothing detaches. Rate-limited.
   chainsawScreech() {
-    const now = this.ctx ? this.ctx.currentTime : 0;
-    if (this._lastScreech && now - this._lastScreech < 0.18) return;
-    this._lastScreech = now;
-    this._play("chainsawScreech", { gain: 0.4, rate: 0.9 + Math.random() * 0.2 });
+    if (this._throttled("screech", 0.18)) return;
+    this._play("chainsawScreech", { gain: 0.32, rate: 0.9 + Math.random() * 0.2, bus: "weapon" });
   }
 
-  // Shared fuse-hiss loop: on while any pipe bomb / sticky is ticking, off otherwise.
-  fuse(active) {
-    if (!this.ready) return;
-    if (!this._fuse) {
-      const bufs = this.buffers.fuseHiss;
-      if (!bufs || !bufs.length) return;
-      const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
-      const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
-      this._fuse = { gain, src };
-    }
-    this._fuse.gain.gain.setTargetAtTime(active ? 0.22 : 0, this.ctx.currentTime, 0.08);
-  }
+  // Shared fuse-hiss loop: on while any pipe bomb / sticky is ticking.
+  fuse(active) { this._setLoop("fuseHiss", active ? 0.20 : 0, 0.08); }
 
   bounceClink(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("bounceClink", { gain: 0.5 * atten, rate: this._jitter() });
+    this._play("bounceClink", { gain: 0.45 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon", pan: this._spread() });
   }
-  wireBeep() { this._play("wireBeep", { gain: A.beepGain }); }
-  stickyThoomp() { this._play("stickyThoomp", { gain: 0.6, rate: 0.95 }); }
+  wireBeep() { this._play("wireBeep", { gain: A.beepGain, bus: "ui" }); }
+  stickyThoomp() { this._play("stickyThoomp", { gain: 0.5, rate: 0.95, bus: "weapon" }); }
   stickSplat(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("stickSplat", { gain: 0.6 * atten, rate: this._jitter() });
+    this._play("stickSplat", { gain: 0.5 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon", pan: this._spread() });
   }
-  clusterPop() { this._play("clusterPop", { gain: 0.55, rate: this._jitter() }); }
-  // Small bomblet blast, attenuated by distance (lower-gain than the main explosion).
+  clusterPop() { this._play("clusterPop", { gain: 0.45, rate: this._jitter(), bus: "weapon" }); }
+  // Small bomblet blast.
   clusterCrump(dist) {
-    const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.2)));
-    this._play("clusterCrump", { gain: A.explosionGain * 0.6 * atten, rate: 0.95 + Math.random() * 0.15 });
+    const atten = this._atten(dist, ATT_NEAR, 0.15);
+    this._play("explosionSmall", { gain: A.explosionGain * 0.65 * atten, rate: 0.95 + Math.random() * 0.15, bus: "weapon", pan: this._spread() * 0.6 });
   }
 
-  // ---- Phase 7 batch B: Grab & Force ---------------------------------------------------------
-  // Generic managed looping source (one per category, gain 0 until driven), built lazily post-decode.
-  // Same pattern as the chainsaw/fuse loops; used by the vacuum motor, magnet hums and grapple reel.
-  _getLoop(cat) {
-    if (!this._mloops) this._mloops = {};
-    if (cat in this._mloops) return this._mloops[cat];
-    const bufs = this.buffers[cat];
-    if (!this.ready || !bufs || !bufs.length) { this._mloops[cat] = null; return null; }
-    const gain = this.ctx.createGain(); gain.gain.value = 0; gain.connect(this.master);
-    const src = this.ctx.createBufferSource(); src.buffer = bufs[0]; src.loop = true; src.connect(gain); src.start();
-    const l = { gain, src }; this._mloops[cat] = l; return l;
-  }
-  _setLoop(cat, target, tc = 0.05) {
-    if (!this.ready) return;
-    const l = this._getLoop(cat);
-    if (!l) return;
-    l.gain.gain.setTargetAtTime(target, this.ctx.currentTime, tc);
-  }
+  // ---- phase 7 batch B: grab & force -----------------------------------------------------------------
 
-  windWhoomp() { this._play("windWhoomp", { gain: 0.6, rate: 0.9 + Math.random() * 0.15 }); }
-  // Debris Vacuum motor loop (on while holding LMB) + rate-limited low-gain consume "thup".
-  vacuum(active) { this._setLoop("vacuumLoop", active ? 0.3 : 0); }
+  windWhoomp() { this._play("windWhoomp", { gain: 0.5, rate: 0.9 + Math.random() * 0.15, bus: "weapon" }); }
+  vacuum(active) { this._setLoop("vacuumLoop", active ? 0.26 : 0); }
   vacuumThup(dist) {
-    const now = this.ctx ? this.ctx.currentTime : 0;
-    if (this._lastThup && now - this._lastThup < 0.1) return; // rate-limit ~10/s
-    this._lastThup = now;
-    const atten = Math.max(0.15, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("vacuumThup", { gain: 0.28 * atten, rate: this._jitter() });
+    if (this._throttled("thup", 0.1)) return;
+    this._play("vacuumThup", { gain: 0.24 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
-  // Magnet hums: distinct attract vs. repel loop; mode = "attract" | "repel" | null.
+  // mode = "attract" | "repel" | null.
   magnet(mode) {
-    this._setLoop("magnetAttract", mode === "attract" ? 0.32 : 0);
-    this._setLoop("magnetRepel", mode === "repel" ? 0.32 : 0);
+    this._setLoop("magnetAttract", mode === "attract" ? 0.26 : 0);
+    this._setLoop("magnetRepel", mode === "repel" ? 0.26 : 0);
   }
-  // Gravity Gun grab hum (on while a body is held) + throw whump (a short slice of the thruster file).
-  gravityHum(active) { this._setLoop("gravityHum", active ? 0.28 : 0); }
-  gravityThrow() { this._play("gravityThrow", { gain: 0.5, rate: 1.1, offset: 0, duration: 0.5 }); }
-  // Grapple: launch pop, metallic anchor hit, reel loop (on while reeling), rope snap.
-  grappleLaunch() { this._play("grappleLaunch", { gain: 0.5, rate: this._jitter() }); }
+  gravityHum(active) { this._setLoop("gravityHum", active ? 0.24 : 0); }
+  gravityThrow() { this._play("gravityThrow", { gain: 0.45, rate: 1.1, bus: "weapon" }); }
+  grappleLaunch() { this._play("grappleLaunch", { gain: 0.45, rate: this._jitter(), bus: "weapon" }); }
   grappleAnchor(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
-    this._play("grappleAnchor", { gain: 0.55 * atten, rate: this._jitter() });
+    this._play("grappleAnchor", { gain: 0.5 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon", pan: this._spread() });
   }
-  grappleReel(active) { this._setLoop("grappleReel", active ? 0.3 : 0); }
+  grappleReel(active) { this._setLoop("grappleReel", active ? 0.26 : 0); }
   grappleSnap(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
-    this._play("grappleSnap", { gain: 0.6 * atten, rate: this._jitter() });
+    this._play("grappleSnap", { gain: 0.55 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
 
-  // ---- Phase 7 batch C: Strikes + heavy/vehicular ordnance -----------------------------------
-  // Blast Painter spray loop (managed, on while holding LMB); RC-car electric motor + circling plane loops.
-  blastSpray(active) { this._setLoop("spraySound", active ? 0.28 : 0); }
-  rcMotor(active) { this._setLoop("rcMotor", active ? 0.3 : 0); }
-  airPlaneLoop(active) { this._setLoop("airPlane", active ? 0.18 : 0); }
+  // ---- phase 7 batch C: strikes + heavy / vehicular ordnance --------------------------------------------
+
+  blastSpray(active) { this._setLoop("spraySound", active ? 0.24 : 0); }
+  rcMotor(active) { this._setLoop("rcMotor", active ? 0.26 : 0, LOOP_FADE, "vehicle"); }
+  airPlaneLoop(active) { this._setLoop("airPlane", active ? 0.16 : 0, 0.25, "vehicle"); }
 
   propaneClonk(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("propaneClonk", { gain: 0.6 * atten, rate: this._jitter() });
+    this._play("propaneClonk", { gain: 0.5 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
-  // Nuke: arm blip, accelerating countdown beep (reuses the confirm beep), massive layered blast + rumble
-  // tail, and a klaxon. The blast is the biggest CC0 file we have, layered with a low rumble.
-  nukeArm() { this._play("nukeArm", { gain: A.beepGain }); }
-  nukeBeep() { this._play("beep", { gain: A.beepGain, rate: 1.1 }); }
-  nukeKlaxon() { this._play("nukeKlaxon", { gain: 0.5, rate: 0.8 }); }
+  nukeArm() { this._play("nukeArm", { gain: A.beepGain, bus: "ui" }); }
+  nukeBeep() { this._play("beep", { gain: A.beepGain, rate: 1.1, bus: "ui" }); }
+  nukeKlaxon() { this._play("nukeKlaxon", { gain: 0.45, rate: 0.9, bus: "ui" }); }
+  // The full-size blast: near-field crack layered with the long distant rumble tail.
   nukeBlast(dist) {
-    const atten = Math.max(0.3, Math.min(1, 1 / (1 + dist * 0.05)));
-    this._play("nukeBlast", { gain: Math.min(1, A.explosionGain * 1.4) * atten, rate: 0.8 });
-    this._play("nukeRumble", { gain: 0.6 * atten, rate: 0.8 });
+    const atten = this._atten(dist, ATT_FAR, 0.3);
+    this._play("explosionHuge", { gain: Math.min(1, A.explosionGain * 1.15) * atten, rate: 0.85, bus: "weapon" });
+    this._play("explosionRumble", { gain: 0.7 * atten, rate: 0.8, bus: "weapon" });
   }
-  // Orbital laser: rising charge, accelerating marker beep (reuses confirm beep), sustained beam zap.
-  orbitalCharge() { this._play("orbitalCharge", { gain: A.rocketGain, rate: 1.0, offset: 0, duration: 1.2 }); }
-  orbitalBeep() { this._play("beep", { gain: A.beepGain * 0.8, rate: 1.3 }); }
-  orbitalZap() { this._play("orbitalZap", { gain: 0.6, rate: 0.8 }); }
-  // Car Cannon: launch whoosh + heavy crash (chunk impacts also sound via the existing impact voices).
-  carCannonWhoosh() { this._play("carWhoosh", { gain: A.rocketGain, rate: 0.85, offset: 0, duration: 0.6 }); }
+  orbitalCharge() { this._play("orbitalCharge", { gain: A.rocketGain, rate: 0.9, bus: "weapon" }); }
+  orbitalBeep() { this._play("beep", { gain: A.beepGain * 0.8, rate: 1.3, bus: "ui" }); }
+  orbitalZap() { this._play("orbitalZap", { gain: 0.5, rate: 0.85, bus: "weapon" }); }
+  carCannonWhoosh() { this._play("carWhoosh", { gain: A.rocketGain, rate: 0.9, bus: "weapon" }); }
   carCannonCrash(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.12)));
-    this._play("carCrash", { gain: A.explosionGain * atten, rate: 0.85 });
+    this._play("carCrash", { gain: A.explosionGain * 0.85 * this._atten(dist, ATT_MID), rate: 0.9, bus: "weapon", pan: this._spread() * 0.5 });
   }
-  // Airstrike: attack-run flyby whoosh + falling-bomb whistle (impacts reuse the explosion voices).
-  airFlyby() { this._play("airFlyby", { gain: 0.55, rate: 0.9 }); }
-  bombWhistle() { this._play("bombWhistle", { gain: 0.5, rate: 0.8 }); }
+  // Attack-run flyby: the air rush pitches down as it passes (real recording, rate-automated).
+  airFlyby() { this._play("airFlyby", { gain: 0.5, rate: 1.1, rateEnd: 0.85, rateTime: 2.4, bus: "weapon" }); }
+  // Falling bomb: real air-rush recording glided downward while it drops.
+  bombWhistle() { this._play("bombWhistle", { gain: 0.45, rate: 1.35, rateEnd: 0.7, rateTime: 2.2, bus: "weapon" }); }
 
-  // ---- Phase 7 batch D: Builders -------------------------------------------------------------
-  // Foam Cannon wet-spray loop (managed source, on while holding LMB) + squelchy splat on each landing
-  // (rate-limited by the caller) + a subtle hardening "crack-set" when a blob sets into a volume.
-  foamSpray(active) { this._setLoop("foamSpray", active ? 0.26 : 0); }
+  // ---- phase 7 batch D: builders -----------------------------------------------------------------------
+
+  foamSpray(active) { this._setLoop("foamSpray", active ? 0.24 : 0); }
   foamSplat(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("foamSplat", { gain: 0.5 * atten, rate: 0.9 + Math.random() * 0.2 });
+    this._play("foamSplat", { gain: 0.42 * this._atten(dist, ATT_NEAR), rate: 0.9 + Math.random() * 0.2, bus: "weapon" });
   }
   foamHarden(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("foamHarden", { gain: 0.45 * atten, rate: this._jitter() });
+    this._play("foamHarden", { gain: 0.38 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
-  // Rebuild Gun: reverse-crumble / stone-settling per restored chunk (rate-limited by the caller).
   rebuildSettle(dist) {
-    const atten = Math.max(0.2, Math.min(1, 1 / (1 + dist * 0.15)));
-    this._play("rebuildSettle", { gain: 0.45 * atten, rate: 0.85 + Math.random() * 0.2 });
+    this._play("rebuildSettle", { gain: 0.4 * this._atten(dist, ATT_NEAR), rate: 0.85 + Math.random() * 0.2, bus: "weapon" });
   }
-  // Size Ray: two DISTINCT sci-fi zaps (shrink vs. grow) — separate files, never a pitch-shifted single one.
   sizeShrink(dist) {
-    const atten = Math.max(0.25, Math.min(1, 1 / (1 + dist * 0.12)));
-    this._play("sizeShrink", { gain: 0.55 * atten, rate: this._jitter() });
+    this._play("sizeShrink", { gain: 0.5 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
   sizeGrow(dist) {
-    const atten = Math.max(0.25, Math.min(1, 1 / (1 + dist * 0.12)));
-    this._play("sizeGrow", { gain: 0.55 * atten, rate: this._jitter() });
+    this._play("sizeGrow", { gain: 0.5 * this._atten(dist, ATT_NEAR), rate: this._jitter(), bus: "weapon" });
   }
 }

@@ -1,10 +1,11 @@
-// world.js - scene/sun/fog with per-map env, generalized indestructible core, water plane, static cliffs, shadow follow
+// world.js - scene/sun/gradient sky + IBL with per-map env, generalized indestructible core, water plane, static cliffs, shadow follow
 import * as THREE from "three";
 import { CONFIG } from "./config.js";
 import { buildGeometry, jitterBucket, jitteredColor } from "./voxel.js";
 
 const W = CONFIG.world;
 const R = CONFIG.render;
+const SKY = CONFIG.render.sky;
 const ROCK_COLOR = "#9c8b73";
 
 // Merge a map's optional env overrides over the CONFIG defaults.
@@ -21,23 +22,149 @@ export function resolveEnv(env = {}) {
   };
 }
 
+// The sky palette every map derives from its own env: the horizon is EXACTLY the fog colour, so
+// distant geometry fades into the dome with no seam; the zenith is the map's sky colour pushed
+// deeper/more saturated; below the horizon the dome settles onto a haze of the map's ground colour.
+function skyPalette(e) {
+  const horizon = new THREE.Color(e.fogColor);
+  const zenith = new THREE.Color(e.skyColor).offsetHSL(0, SKY.zenithSat, SKY.zenithLight);
+  const ground = new THREE.Color(e.groundColor).lerp(horizon, SKY.groundMix).multiplyScalar(SKY.groundDim);
+  return { horizon, zenith, ground, sun: new THREE.Color(R.sunColor) };
+}
+
+// Shared by the dome shader and the IBL texture below: direction -> linear sky colour.
+function skyColorAt(pal, dy, sunDot, out) {
+  const up = Math.pow(Math.max(dy, 0), SKY.horizonPow);
+  out.copy(pal.horizon).lerp(pal.zenith, up);
+  const down = Math.min(Math.max(-dy / SKY.groundBlend, 0), 1);
+  out.lerp(pal.ground, down);
+  const sd = Math.max(sunDot, 0);
+  const haze = SKY.haze * Math.pow(1 - Math.min(Math.abs(dy), 1), SKY.hazePow) * (0.35 + 0.65 * sd);
+  const glow = SKY.sunGlow * Math.pow(sd, SKY.sunGlowPow);
+  out.r += pal.sun.r * (haze + glow);
+  out.g += pal.sun.g * (haze + glow);
+  out.b += pal.sun.b * (haze + glow);
+  return out;
+}
+
+const SKY_VERT = `
+varying vec3 vWorld;
+void main() {
+  vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+
+const SKY_FRAG = `
+uniform vec3 uZenith, uHorizon, uGround, uSun, uSunDir;
+uniform float uHorizonPow, uGroundBlend, uHaze, uHazePow, uSunGlow, uSunGlowPow;
+varying vec3 vWorld;
+void main() {
+  vec3 d = normalize(vWorld - cameraPosition);
+  vec3 col = mix(uHorizon, uZenith, pow(clamp(d.y, 0.0, 1.0), uHorizonPow));
+  col = mix(col, uGround, clamp(-d.y / uGroundBlend, 0.0, 1.0));
+  float sd = max(dot(d, uSunDir), 0.0);
+  float haze = uHaze * pow(1.0 - min(abs(d.y), 1.0), uHazePow) * (0.35 + 0.65 * sd);
+  col += uSun * (haze + uSunGlow * pow(sd, uSunGlowPow));
+  gl_FragColor = vec4(col, 1.0);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}`;
+
+// Inverted sphere painted by the gradient above. Unfogged (it IS the fog's destination colour),
+// depth-write off and drawn last so early-Z throws away every pixel the world already covers —
+// the whole sky costs one cheap shader over the few thousand background pixels that survive.
+function createSkyDome(scene, pal, sunDir) {
+  const geo = new THREE.SphereGeometry(SKY.radius, 32, 16);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uZenith: { value: pal.zenith },
+      uHorizon: { value: pal.horizon },
+      uGround: { value: pal.ground },
+      uSun: { value: pal.sun },
+      uSunDir: { value: sunDir.clone().normalize() },
+      uHorizonPow: { value: SKY.horizonPow },
+      uGroundBlend: { value: SKY.groundBlend },
+      uHaze: { value: SKY.haze },
+      uHazePow: { value: SKY.hazePow },
+      uSunGlow: { value: SKY.sunGlow },
+      uSunGlowPow: { value: SKY.sunGlowPow },
+    },
+    vertexShader: SKY_VERT,
+    fragmentShader: SKY_FRAG,
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 1000;
+  scene.add(mesh);
+  return mesh;
+}
+
+// Tiny equirect image of the same sky, handed to scene.environment. three PMREM-filters it once at
+// first render and every MeshStandardMaterial then gets real image-based ambient + a sky reflection,
+// which is the difference between "metal" and "dark grey". A 64x32 source is plenty: the sky is a
+// smooth gradient, so there is nothing finer to resolve, and the whole thing is a few KB.
+function createSkyEnv(pal, sunDir) {
+  const w = SKY.envWidth, h = SKY.envHeight;
+  const data = new Uint8Array(w * h * 4);
+  const col = new THREE.Color();
+  const toSRGB = (v) => {
+    const c = Math.min(Math.max(v, 0), 1);
+    const s = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+    return Math.round(s * 255);
+  };
+  for (let y = 0; y < h; y++) {
+    const theta = ((y + 0.5) / h) * Math.PI;          // 0 = up
+    const dy = Math.cos(theta), sinT = Math.sin(theta);
+    for (let x = 0; x < w; x++) {
+      const phi = ((x + 0.5) / w) * Math.PI * 2;
+      const dx = sinT * Math.sin(phi), dz = sinT * Math.cos(phi);
+      const sunDot = dx * sunDir.x + dy * sunDir.y + dz * sunDir.z;
+      skyColorAt(pal, dy, sunDot, col);
+      const i = (y * w + x) * 4;
+      data[i] = toSRGB(col.r); data[i + 1] = toSRGB(col.g); data[i + 2] = toSRGB(col.b); data[i + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, w, h, THREE.RGBAFormat);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 export function setupScene(scene, env) {
   const e = resolveEnv(env);
-  scene.background = new THREE.Color(e.skyColor);
+  const pal = skyPalette(e);
+  scene.background = pal.horizon.clone();  // only ever seen for a frame before the dome draws
   scene.fog = new THREE.Fog(e.fogColor, e.fogNear, e.fogFar);
 
-  const hemi = new THREE.HemisphereLight(R.hemiSky, R.hemiGround, R.hemiIntensity);
-  scene.add(hemi);
-
-  const sun = new THREE.DirectionalLight(R.sunColor, e.sunIntensity);
   const el = (e.sunElevationDeg * Math.PI) / 180;
   const az = (e.sunAzimuthDeg * Math.PI) / 180;
-  const dist = 60;
+  const dist = R.sunDistance;
   const offset = new THREE.Vector3(
     dist * Math.cos(el) * Math.sin(az),
     dist * Math.sin(el),
     dist * Math.cos(el) * Math.cos(az)
   );
+
+  let sky = null;
+  if (SKY.enabled !== false) {
+    sky = createSkyDome(scene, pal, offset);
+    scene.environment = createSkyEnv(pal, offset.clone().normalize());
+  } else {
+    scene.background = new THREE.Color(e.skyColor);
+  }
+
+  // The sky IBL now carries most of the fill light, so the hemisphere light only tints what the
+  // low-res env cannot: it is deliberately weak next to the old flat 0.5.
+  const hemi = new THREE.HemisphereLight(R.hemiSky, R.hemiGround, R.hemiIntensity);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(R.sunColor, e.sunIntensity);
   sun.position.copy(offset);
   sun.target.position.set(0, 0, 0);
   sun.castShadow = true;
@@ -47,13 +174,15 @@ export function setupScene(scene, env) {
   sun.shadow.camera.right = h;
   sun.shadow.camera.top = h;
   sun.shadow.camera.bottom = -h;
-  sun.shadow.camera.near = 1;
-  sun.shadow.camera.far = 200;
+  // A tight near/far around the actual slab of world the box can contain buys depth precision,
+  // which is what lets the bias stay small enough to keep contact shadows attached.
+  sun.shadow.camera.near = R.shadowNear;
+  sun.shadow.camera.far = R.shadowFar;
   sun.shadow.bias = R.shadowBias;
   sun.shadow.normalBias = R.shadowNormalBias;
   scene.add(sun);
   scene.add(sun.target);
-  return { sun, hemi, offset, env: e };
+  return { sun, hemi, sky, offset, env: e };
 }
 
 // Camera-following shadow box: keep the 2048 map, snap the sun target to the shadow texel grid
@@ -231,12 +360,14 @@ function buildBasinMesh(scene, materials, rect, vs) {
 }
 
 // Visual-only animated water plane over water.rect at water.level (brief section 2.4). Silent.
+// Low roughness + the sky IBL means it actually mirrors the dome instead of reading as green paint.
 export function createWater(scene, water) {
   const { x0, z0, x1, z1 } = water.rect;
   const w = Math.abs(x1 - x0), d = Math.abs(z1 - z0);
   const geo = new THREE.PlaneGeometry(w, d);
   const mat = new THREE.MeshStandardMaterial({
-    color: 0x2e4a44, transparent: true, opacity: 0.82, roughness: 0.15, metalness: 0.0,
+    color: W.waterColor, transparent: true, opacity: 0.82,
+    roughness: W.waterRoughness, metalness: W.waterMetalness, envMapIntensity: W.waterEnvIntensity,
   });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.rotation.x = -Math.PI / 2;

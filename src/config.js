@@ -34,32 +34,86 @@ export const CONFIG = {
     basinRampThickness: 0.4,
     skyColor: 0x8fb7e0,
     fogColor: 0x9cc0e6,
-    fogNear: 40,
-    fogFar: 120,
+    fogNear: 32,
+    fogFar: 112,
     groundColor: "#8a8d90",
+    // Water plane (world.createWater). Low roughness + the sky IBL = a real reflection of the dome.
+    waterColor: 0x27423f,
+    waterRoughness: 0.06,
+    waterMetalness: 0.1,
+    waterEnvIntensity: 1.0,
   },
 
   render: {
     pixelRatioCap: 2,
+    // ACES filmic + a touch of exposure: highlights roll off instead of clipping to white, which is what
+    // lets the sun intensity go up without the pale materials blowing out. Retuned light rig below.
+    toneMappingExposure: 0.98,
     shadowMapSize: 2048,
-    shadowBoxHalf: 26,
-    shadowBias: -0.0004,
-    shadowNormalBias: 0.03,
-    sunColor: 0xfff2df,
-    sunIntensity: 2.2,
-    sunElevationDeg: 50,
-    sunAzimuthDeg: 35,
-    hemiIntensity: 0.5,
-    hemiSky: 0xbcd6f2,
+    shadowBoxHalf: 24,
+    // Tight near/far around the slab the follow box can contain -> more depth precision -> a much smaller
+    // bias, so contact shadows stay welded to their caster instead of peter-panning.
+    shadowNear: 12,
+    shadowFar: 110,
+    shadowBias: -0.00018,
+    shadowNormalBias: 0.022,
+    // Warm sun against cool sky fill: the split is what gives a voxel scene its depth once the
+    // highlights stop clipping. Previously 0xfff2df / 2.2 against a flat 0.5 hemisphere.
+    sunColor: 0xffefcf,
+    sunDistance: 60,
+    sunIntensity: 3.2,
+    sunElevationDeg: 44,
+    sunAzimuthDeg: 40,
+    // The procedural sky IBL (scene.environment) now supplies most of the directional ambient, so the
+    // hemisphere light is only a small, deliberately blue extra fill.
+    hemiIntensity: 0.11,
+    hemiSky: 0xa6c8f0,
     hemiGround: 0x6b6f5f,
+
+    // Gradient sky dome + the equirect IBL baked from it (world.js). Every value is derived from the
+    // map's own env palette, so per-map skyColor/fogColor/groundColor overrides keep working.
+    sky: {
+      enabled: true,            // off = flat background colour + no IBL (the old look)
+      radius: 360,              // < camera.far (400); maps are <= 96 m so the camera never leaves it
+      zenithSat: 0.16,          // HSL offsets applied to env.skyColor to get the zenith
+      zenithLight: -0.14,
+      horizonPow: 0.35,         // < 1 = the horizon band stays low and the blue climbs fast
+      groundMix: 0.55,          // below-horizon haze = groundColor mixed this far toward fogColor
+      groundDim: 0.72,
+      groundBlend: 0.35,        // how many units of -dir.y it takes to reach that haze
+      haze: 0.05,               // narrow warm band hugging the horizon (higher = milkier sky)
+      hazePow: 9.0,
+      sunGlow: 0.40,            // tight bloom-ish glow around the sun direction
+      sunGlowPow: 22.0,
+      envWidth: 64,             // equirect IBL source size (PMREM-filtered once by three)
+      envHeight: 32,
+    },
   },
 
   voxel: {
     jitterLightness: 0.04,
     jitterBuckets: 6,
     shinyMetalnessCutoff: 0.1,
-    roughMat: { roughness: 0.86, metalness: 0.0 },
-    shinyMat: { roughness: 0.4, metalness: 0.25 },
+    // envMapIntensity feeds off scene.environment (the sky IBL). Rough surfaces take a moderate dose as
+    // sky ambient; shiny ones take the full amount so metal/glass mirror the dome.
+    roughMat: { roughness: 0.82, metalness: 0.0, envMapIntensity: 0.34 },
+    shinyMat: { roughness: 0.28, metalness: 0.45, envMapIntensity: 1.0 },
+    // Baked per-voxel ambient occlusion (voxel.js buildGeometry). Costs nothing per frame. It is also
+    // free in triangles here: the per-voxel jitter bucket is already in the merge key, so the mesher
+    // never merged across neighbouring voxels anyway and adding AO to that key changes no counts
+    // (verified: identical totals on all four maps and every model, AO on vs off). It costs ~10% of
+    // mesh-build time; drop ringWeights to [1] to halve that if load time ever needs it back.
+    //   strength    - how dark a fully-enclosed vertex gets (LINEAR vertex-colour multiplier 1-strength)
+    //   curve       - >1 keeps light contact soft and only bites in deep corners
+    //   ringWeights - how far out, in voxels, the occluders are sampled. Voxels are 0.15 m, so one ring
+    //                 alone is a 15 cm hairline; the second ring at half weight spreads the crease to
+    //                 ~0.3 m, which is the scale that actually reads as contact shading in play.
+    ao: {
+      enabled: true,
+      strength: 0.62,
+      curve: 1.15,
+      ringWeights: [1, 0.5],
+    },
   },
 
   destruction: {

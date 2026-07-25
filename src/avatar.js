@@ -4,13 +4,14 @@ import { CONFIG } from "./config.js";
 import { decodeModel, meshModelPart } from "./voxel.js";
 import characterModel from "../assets/models/character.js";
 
-// Preset color tables (data). Editable slots only: skin/hair/top/bottom/shoes. Eye + sole are fixed
-// (kept from the base model palette). top and bottom share one 12-color grid. Indices from these
-// arrays are what get serialized over the network in Phase 6 (a handful of small integers).
-const SKIN = ["#c9986b", "#8d5524", "#5b3a24", "#e0ac82", "#f1c9a5", "#3a2a20"];
-const HAIR = ["#3b2a1c", "#111111", "#6b4a2b", "#a8662f", "#d9c27a", "#8a8a8a", "#c0392b", "#2bb3a3"];
-const TOPBOTTOM = ["#d6702a", "#2e3644", "#c0392b", "#27632a", "#2c3e50", "#8e44ad", "#16a085", "#f1c40f", "#e67e22", "#7f8c8d", "#ecf0f1", "#5a3921"];
-const SHOES = ["#eeeeea", "#1a1a1a", "#c0392b", "#2c3e50", "#27ae60", "#2980b9", "#f39c12", "#8e44ad"];
+// Preset color tables (data). Editable slots only: skin/hair/top/bottom/shoes. Pupil, eye white, sole,
+// trim and metal are fixed (kept from the base model palette); the skin/hoodie/jeans shades are derived.
+// top and bottom share one 16-color grid. Indices from these arrays are what get serialized over the
+// network in Phase 6 (a handful of small integers) - appending colors stays backwards compatible.
+const SKIN = ["#c9986b", "#8d5524", "#5b3a24", "#e0ac82", "#f1c9a5", "#3a2a20", "#a9714b", "#6f4630", "#edd0b0", "#7d5a3c"];
+const HAIR = ["#3b2a1c", "#111111", "#6b4a2b", "#a8662f", "#d9c27a", "#8a8a8a", "#c0392b", "#2bb3a3", "#e8e2d0", "#4b2f6b", "#1f3f7a", "#5a1f1f"];
+const TOPBOTTOM = ["#d6702a", "#2e3644", "#c0392b", "#27632a", "#2c3e50", "#8e44ad", "#16a085", "#f1c40f", "#e67e22", "#7f8c8d", "#ecf0f1", "#5a3921", "#1a1a1e", "#b8336a", "#3b6ea5", "#6d7f2f"];
+const SHOES = ["#eeeeea", "#1a1a1a", "#c0392b", "#2c3e50", "#27ae60", "#2980b9", "#f39c12", "#8e44ad", "#d94f2b", "#c8b48a", "#5c4033", "#e8e2d0"];
 
 export const AVATAR_PRESETS = { skin: SKIN, hair: HAIR, top: TOPBOTTOM, bottom: TOPBOTTOM, shoes: SHOES };
 export const HAIR_VARIANTS = ["short", "buzz", "long"];
@@ -20,39 +21,23 @@ export const HAIR_VARIANTS = ["short", "buzz", "long"];
 export const DEFAULT_AVATAR = { v: 1, colors: { skin: 0, hair: 0, top: 0, bottom: 1, shoes: 0 }, hair: "short" };
 
 // --- Head grid + hair variants ---------------------------------------------------------------
-// Head part is 5x6x5 (sx=5, sy=6). Index layout matches meshModelPart: data[x + sx*(y + sy*z)].
-// Grid y increases upward (y5 = crown, y0 = neck; verified against eye anchor at world y 1.62 -> y3).
-// Values: 0 empty, 1 hair, 2 skin, 3 eye. Variants only ever touch values 0/1/2, never eyes.
-const HEAD_SX = 5, HEAD_SY = 6, HEAD_SZ = 5;
-const headIndex = (x, y, z) => x + HEAD_SX * (y + HEAD_SY * z);
+// Head part is 10x16x12 (sx=10, sy=16, sz=12), voxel 0.03 m, origin y 1.32 (eye anchor 1.62 -> y10).
+// Palette values: 1 skin, 2 hair (buzz-proof scalp cap), 3 pupil, 12 eye white, 13 skin shade, and the
+// two shape markers the variants resolve: 10 = long-only drape, 11 = hair volume shaved by the buzz.
+// Every variant only ever rewrites 10 and 11, so the face, eyes and scalp cap are always preserved.
+const V_SKIN = 1, V_HAIR = 2, V_HAIR_LONG = 10, V_HAIR_VOL = 11;
 
 export function buildHeadData(baseData, variant) {
   const src = baseData instanceof Uint8Array ? baseData : Uint8Array.from(baseData);
   const out = Uint8Array.from(src);
-  if (variant === "buzz") {
-    // Keep only the single topmost hair layer; every lower hair voxel becomes skin -> shaved look.
-    let maxHairY = -1;
-    for (let z = 0; z < HEAD_SZ; z++)
-      for (let y = 0; y < HEAD_SY; y++)
-        for (let x = 0; x < HEAD_SX; x++)
-          if (src[headIndex(x, y, z)] === 1 && y > maxHairY) maxHairY = y;
-    for (let z = 0; z < HEAD_SZ; z++)
-      for (let y = 0; y < HEAD_SY; y++)
-        for (let x = 0; x < HEAD_SX; x++) {
-          const i = headIndex(x, y, z);
-          if (src[i] === 1 && y < maxHairY) out[i] = 2;
-        }
-  } else if (variant === "long") {
-    // Drape hair down the back slice (z=0) and both outer x columns to the grid bottom: skin -> hair.
-    for (let z = 0; z < HEAD_SZ; z++)
-      for (let y = 0; y < HEAD_SY; y++)
-        for (let x = 0; x < HEAD_SX; x++) {
-          const i = headIndex(x, y, z);
-          if (src[i] !== 2) continue; // only skin converts; empties, existing hair and eyes untouched
-          if (z === 0 || x === 0 || x === HEAD_SX - 1) out[i] = 1;
-        }
+  // long: the drape becomes hair. buzz: the volume layer is shaved back to scalp skin. short: neither.
+  const longV = variant === "long" ? V_HAIR : 0;
+  const volV = variant === "buzz" ? V_SKIN : V_HAIR;
+  for (let i = 0; i < out.length; i++) {
+    const v = src[i];
+    if (v === V_HAIR_LONG) out[i] = longV;
+    else if (v === V_HAIR_VOL) out[i] = volV;
   }
-  // "short" (and any unknown) returns the base grid unchanged.
   return out;
 }
 
@@ -93,16 +78,24 @@ export function buildAvatarModel(avatar) {
   const c = a.colors;
   const topHex = TOPBOTTOM[c.top];
   const botHex = TOPBOTTOM[c.bottom];
+  const skinHex = SKIN[c.skin];
+  const hairHex = HAIR[c.hair];
   const palette = [
-    { ...P[0], color: SKIN[c.skin] },   // 1 skin
-    { ...P[1], color: HAIR[c.hair] },   // 2 hair
-    { ...P[2] },                        // 3 eye (fixed)
-    { ...P[3], color: topHex },         // 4 hoodie main
+    { ...P[0], color: skinHex },          // 1 skin
+    { ...P[1], color: hairHex },          // 2 hair (scalp cap)
+    { ...P[2] },                          // 3 pupil (fixed)
+    { ...P[3], color: topHex },           // 4 hoodie main
     { ...P[4], color: shadeHex(topHex) }, // 5 hoodie shade
-    { ...P[5], color: botHex },         // 6 jeans main
+    { ...P[5], color: botHex },           // 6 jeans main
     { ...P[6], color: shadeHex(botHex) }, // 7 jeans shade
-    { ...P[7], color: SHOES[c.shoes] }, // 8 sneaker
-    { ...P[8] },                        // 9 sole (fixed)
+    { ...P[7], color: SHOES[c.shoes] },   // 8 sneaker
+    { ...P[8] },                          // 9 sole (fixed)
+    { ...P[9], color: hairHex },          // 10 hair, long-variant drape
+    { ...P[10], color: hairHex },         // 11 hair, buzz-shaved volume
+    { ...P[11] },                         // 12 eye white (fixed)
+    { ...P[12], color: shadeHex(skinHex) }, // 13 skin shade
+    { ...P[13] },                         // 14 trim: drawstrings, laces, midsole (fixed)
+    { ...P[14] },                         // 15 metal: eyelets, zip pull (fixed)
   ];
   const parts = base.parts.map((p) =>
     p.name === "head" ? { ...p, data: buildHeadData(p.data, a.hair) } : p
