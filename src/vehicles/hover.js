@@ -121,6 +121,10 @@ export class HoverVehicle {
       );
     }
 
+    // Self-levelling: the thruster springs only ever push +Y, so past vertical they cannot bring the
+    // craft back and a ram / blast / cliff could leave it flying on its back permanently.
+    this._applyUpright(dt, q);
+
     // Horizontal glide + yaw.
     if (driving) {
       const ax = input.axis();
@@ -140,6 +144,35 @@ export class HoverVehicle {
 
     this._glowPhase += dt;
     this.syncMeshes();
+  }
+
+  // Upright PD controller: torques the body's up-vector back toward world up (P) while damping the
+  // off-yaw angular velocity (D). Yaw is deliberately excluded so steering is untouched, and tilts inside
+  // uprightFree are left alone so the craft still leans naturally while manoeuvring.
+  _applyUpright(dt, q) {
+    const V = this.V;
+    const up = WORLD_UP.clone().applyQuaternion(q);
+    const tilt = Math.acos(THREE.MathUtils.clamp(up.dot(WORLD_UP), -1, 1));
+    // Corrective axis. up x worldUp vanishes both at 0 and at exactly 180 deg (an unstable equilibrium
+    // that would let the craft balance on its back forever), so at the pole fall back to the body's
+    // forward axis - any axis perpendicular to `up` rotates it off the pole.
+    const axis = new THREE.Vector3().crossVectors(up, WORLD_UP);
+    if (axis.lengthSq() < 1e-8) {
+      if (tilt < 1e-3) axis.set(0, 0, 0);
+      else axis.set(0, 0, 1).applyQuaternion(q).normalize();
+    } else axis.normalize();
+
+    const k = tilt > V.uprightHardTilt ? V.uprightK * V.uprightHardMult : V.uprightK;
+    const err = Math.max(0, tilt - V.uprightFree);
+    const av = this.body.angvel();
+    const w = new THREE.Vector3(av.x, av.y, av.z);
+    w.addScaledVector(WORLD_UP, -w.dot(WORLD_UP)); // drop the yaw component: steering stays free
+    const alpha = axis.multiplyScalar(k * err).addScaledVector(w, -V.uprightDamp);
+    if (alpha.lengthSq() < 1e-12) return;
+    // Angular acceleration -> torque through the diagonal body-frame inertia tensor, then to an impulse.
+    const t = alpha.applyQuaternion(q.clone().invert());
+    t.set(t.x * V.inertia.x, t.y * V.inertia.y, t.z * V.inertia.z).applyQuaternion(q);
+    this.body.applyTorqueImpulse({ x: t.x * dt, y: t.y * dt, z: t.z * dt }, true);
   }
 
   syncMeshes() {

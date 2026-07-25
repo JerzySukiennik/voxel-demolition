@@ -160,7 +160,12 @@ export const CONFIG = {
     speedboat: { controller: "boat", mass: 1800, engineForce: 7000, brakeForce: 8000, reverseForce: 3000, wheelRadius: 0.35, suspensionRest: 0.45, maxTravel: 0.25, springK: 14400, damperC: 9000, tireMu: 0.7, lateralGrip: 2.0, steerLow: 0.45, steerHigh: 0.20, colliderHalf: { x: 1.05, y: 0.6, z: 3.1 }, colliderCenterY: 0.75, spawnBodyY: 0.26, audioSpeedRef: 15, noWheelMesh: true, rayAnchors: [[0.9, 0.3, 2.4], [-0.9, 0.3, 2.4], [0.9, 0.3, -2.4], [-0.9, 0.3, -2.4]] },
 
     // Hover craft (Jurek's favourite). No wheels; 4 downward thruster rays.
-    hover: { mass: 1300, colliderHalf: { x: 1.0, y: 0.5, z: 2.2 }, colliderCenterY: 0.75, spawnBodyY: 0.10, linearDamping: 0.4, angularDamping: 2.5, hoverHeight: 1.1, hoverMin: 0.7, hoverMax: 6.0, hoverSpringK: 14, hoverDamperC: 5, altRate: 2.5, thrustAccel: 12, yawRate: 1.8, latDamp: 3, glowSize: { x: 2.2, z: 4.2 } },
+    // upright*: PD self-levelling gains (hover.js _applyUpright). The thruster springs only push +Y, so
+    // once the craft passes vertical they have no authority to bring it back and it could fly inverted.
+    // uprightK/uprightDamp are an angular acceleration spring (rad/s^2 per rad / per rad/s) on the tilt of
+    // the body up-vector; uprightFree is a dead band that leaves small leans alone so it still banks;
+    // past uprightHardTilt the gain is multiplied by uprightHardMult so a flipped craft snaps back fast.
+    hover: { mass: 1300, colliderHalf: { x: 1.0, y: 0.5, z: 2.2 }, colliderCenterY: 0.75, spawnBodyY: 0.10, linearDamping: 0.4, angularDamping: 2.5, hoverHeight: 1.1, hoverMin: 0.7, hoverMax: 6.0, hoverSpringK: 14, hoverDamperC: 5, altRate: 2.5, thrustAccel: 12, yawRate: 1.8, latDamp: 3, glowSize: { x: 2.2, z: 4.2 }, uprightK: 9, uprightDamp: 5.5, uprightFree: 0.20, uprightHardTilt: 1.05, uprightHardMult: 3.5 },
 
     // Helicopter. Collective + cyclic + pedals.
     heli: { mass: 4500, colliderHalf: { x: 1.2, y: 1.2, z: 4.5 }, colliderCenterY: 1.5, spawnBodyY: 0.20, linearDamping: 0.15, angularDamping: 2.2, collectiveNeutral: 0.55, collectiveRate: 0.8, thrustMaxG: 1.5, pitchTorqueK: 1.6, rollTorqueK: 1.4, yawTorqueK: 1.0, autoLevel: 2.0, rotorMainSpeed: 18, rotorTailSpeed: 40 },

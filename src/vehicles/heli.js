@@ -106,9 +106,14 @@ export class HeliVehicle {
       this.body.applyTorqueImpulse({ x: tt.x, y: tt.y, z: tt.z }, true);
     }
 
-    // Auto-level spring toward upright.
+    // Auto-level spring toward upright. cross(up, WORLD_UP) has magnitude sin(tilt), which vanishes BOTH
+    // at upright and at exactly inverted — so a craft flipped onto its back sat at a torque-free unstable
+    // equilibrium and never recovered. Use the tilt ANGLE for magnitude and fall back to the body forward
+    // axis at that pole, so it always rights itself. Small angles are unchanged (sin θ ≈ θ).
+    const tilt = Math.acos(THREE.MathUtils.clamp(up.dot(WORLD_UP), -1, 1));
     const levelAxis = new THREE.Vector3().crossVectors(up, WORLD_UP);
-    const lt = levelAxis.multiplyScalar(V.autoLevel * V.inertia.x * dt);
+    if (levelAxis.lengthSq() < 1e-8) levelAxis.copy(fwd); else levelAxis.normalize();
+    const lt = levelAxis.multiplyScalar(V.autoLevel * tilt * V.inertia.x * dt);
     this.body.applyTorqueImpulse({ x: lt.x, y: lt.y, z: lt.z }, true);
 
     // Rotor spin.

@@ -213,6 +213,10 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
       for (const pl of welcome.players || []) if (pl.pid !== netc.pid) remotes.add(pl.pid, pl.nick, pl.avatar);
       replication.applySnapshot(welcome.snap);
     }
+    // Handlers are live and the welcome snapshot is the base state, so replay everything the server
+    // sent while this client was building the map (RAPIER.init + voronoi + colliders + tiles = seconds).
+    // Anyone who joined, and every chunk that was knocked off, during that window lands here.
+    netc.flushPending();
     // Verification guard (brief section 2.4): per-volume chunk counts for the server to compare.
     netc.sendMapCheck(destruction.volumes.map((v) => v.chunks.length));
 

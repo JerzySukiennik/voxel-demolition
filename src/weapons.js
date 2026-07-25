@@ -23,6 +23,11 @@ const FX = W.fx;
 const UP = new THREE.Vector3(0, 1, 0);
 const FWD_Z = new THREE.Vector3(0, 0, 1);
 
+// Monotonic wall clock (seconds). Used as a hard deadline for the camera shake so it expires even
+// across frames where update() is never called at all (pause menu open, pointer unlocked, tab hidden).
+const nowSeconds = () =>
+  (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now()) / 1000;
+
 // Self-contained Gravity-Gun hold step (Phase 7 §5a). ***MP-CRITICAL: this function depends ONLY on its
 // arguments — no `this`, no scene, no globals — so Phase 6 can relocate it verbatim to the server, which
 // owns the spring simulation while the client only sends grab/aim/release/throw intents.***
@@ -246,7 +251,13 @@ export class Weapons {
     this.nukes = [];             // { body, mesh, fuse, armed }
     this._nukeArmed = false;     // one nuke armed at a time
     this._nukeCooldownT = -1e9;
-    this._shakeT = 0; this._shakeAmp = 0;
+    // Camera shake state. `_shakeOffset` is the displacement WE added last frame and `_shakePost` is the
+    // camera position we left behind, so the shake can be un-applied before the next kick and can never
+    // integrate into a permanent offset. `_shakeEnd` is the wall-clock deadline (see nowSeconds).
+    this._shakeT = 0; this._shakeAmp = 0; this._shakeDur = 0; this._shakeEnd = 0;
+    this._shakeOffset = new THREE.Vector3();
+    this._shakePost = new THREE.Vector3();
+    this._shakeApplied = false;
     this._flashDiv = document.createElement("div");
     this._flashDiv.style.cssText = "position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;z-index:50;transition:none;";
     document.body.appendChild(this._flashDiv);
@@ -472,6 +483,10 @@ export class Weapons {
     this._tickClusters(dt);
     this._tickTrail(dt);
     this._tickFlash(dt);
+    // ALWAYS-ON: the nuke camera shake must decay before any of the early-return paths below (driving /
+    // RC car / plane view / unarmed), otherwise a shake applied in one mode never ticks down and sticks
+    // to the camera for the rest of the session.
+    this._tickShake(dt);
     this._tickTracers(dt);
     this._tickDust(dt);
     this._decayAnim(dt);
@@ -514,6 +529,7 @@ export class Weapons {
       this.input.consumeLMB();
       this.input.consumeRMB();
       this.input.consumeWheel();
+      this._applyShake(); // on top of the chase camera main just placed
       return;
     }
     // Back on foot: drop any vehicle rope we were holding.
@@ -857,7 +873,8 @@ export class Weapons {
     for (const rec of this._painted.values()) this._releaseSplat(rec.splat);
     this._painted.clear();
     this._endOrbital();
-    this._flashT = 0; this._shakeT = 0; this._dustColT = 0;
+    this._flashT = 0; this._dustColT = 0;
+    this._clearShake();
     this._flashDiv.style.opacity = "0"; this._dustCol.visible = false;
     this.audio.blastSpray(false); this.audio.rcMotor(false); this.audio.airPlaneLoop(false);
     // Phase 7 batch D: Builders transient state (foam projectiles/blobs/volumes, rebuild ghosts, size lerps).
@@ -1813,15 +1830,51 @@ export class Weapons {
     else this.destruction.applyRadialDamage(center, force, radius, budget);
   }
 
-  _applyShake() {
-    if (this._shakeT <= 0) return;
-    const k = this._shakeT / W.nuke.shakeTime;
-    const a = this._shakeAmp * k * k;
-    this.camera.position.x += (Math.random() * 2 - 1) * a;
-    this.camera.position.y += (Math.random() * 2 - 1) * a;
-    this.camera.position.z += (Math.random() * 2 - 1) * a;
+  // Camera shake (nuke). Purely transient: it is layered on top of whatever camera transform the rest of
+  // the engine computed this frame (FPP rig / chase rig / RC or plane view cam) and always unwinds itself.
+  _startShake(time, amp) {
+    this._shakeT = time;
+    this._shakeDur = time;
+    this._shakeAmp = amp;
+    this._shakeEnd = nowSeconds() + time;
   }
-  _tickShake(dt) { if (this._shakeT > 0) this._shakeT -= dt; }
+  // Drops the shake AND any offset still sitting on the camera. Safe to call at any time.
+  _clearShake() {
+    this._shakeT = 0; this._shakeAmp = 0; this._shakeDur = 0; this._shakeEnd = 0;
+    this._unapplyShake();
+  }
+  // Removes last frame's kick, but only if nothing else has moved the camera since — when the engine
+  // re-places the camera every frame (the normal case) the offset is already gone with the old transform.
+  _unapplyShake() {
+    if (!this._shakeApplied) return;
+    this._shakeApplied = false;
+    if (this.camera.position.distanceToSquared(this._shakePost) < 1e-12) {
+      this.camera.position.sub(this._shakeOffset);
+    }
+    this._shakeOffset.set(0, 0, 0);
+  }
+  _applyShake() {
+    this._unapplyShake();
+    if (this._shakeT <= 0) return;
+    const dur = this._shakeDur || W.nuke.shakeTime;
+    const k = THREE.MathUtils.clamp(this._shakeT / dur, 0, 1);
+    const a = this._shakeAmp * k * k;
+    this._shakeOffset.set(
+      (Math.random() * 2 - 1) * a,
+      (Math.random() * 2 - 1) * a,
+      (Math.random() * 2 - 1) * a
+    );
+    this.camera.position.add(this._shakeOffset);
+    this._shakePost.copy(this.camera.position);
+    this._shakeApplied = true;
+  }
+  // Decays on dt AND on a wall-clock deadline, so a shake started before a pause (menu, unfocused tab,
+  // a mode that skips rendering) is already spent when the frame loop resumes instead of freezing.
+  _tickShake(dt) {
+    if (this._shakeT <= 0) return;
+    this._shakeT = Math.min(this._shakeT - dt, this._shakeEnd - nowSeconds());
+    if (this._shakeT <= 0) this._clearShake();
+  }
 
   // --- 2d. Blast Painter: hold LMB spray-paints chunks (pooled splats), RMB detonatePainted them all ---
   _tickBlastPainter(dt, equipped) {
@@ -2001,7 +2054,7 @@ export class Weapons {
     try { this.world.removeRigidBody(nk.body); } catch (e) {}
     // Effect (not HUD): fullscreen white flash + camera shake.
     this._flashT = nkc.flashTime; this._flashDur = nkc.flashTime; this._flashDiv.style.opacity = "1";
-    this._shakeT = nkc.shakeTime; this._shakeAmp = nkc.shakeAmp;
+    this._startShake(nkc.shakeTime, nkc.shakeAmp);
     // ONE huge radial job fed ENTIRELY through the staged queue (debrisCap 200 never raised).
     this._bigBlast(p, nkc.force, nkc.radius, nkc.budget, true);
     // Pooled dust column at ground zero.

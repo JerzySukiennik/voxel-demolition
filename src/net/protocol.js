@@ -56,6 +56,11 @@ export const MESSAGE_TYPES = [
   "debris_rm", "veh_spawn", "veh_rm", "seat", "c4_add", "c4_boom", "warn",
 ];
 
+// Server->client snapshot types: every message of these types fully supersedes the previous one, so a
+// queued backlog only needs its NEWEST entry replayed. Every other type is an event and is replayed in
+// full, in arrival order. Used by NetClient.flushPending().
+export const COALESCING_TYPES = [S2C.PSTATE, S2C.VSTATE, S2C.DEBRIS];
+
 // --- Frozen rates (Hz / ms) ------------------------------------------------------------------
 export const RATES = {
   serverHz: 60,        // server physics accumulator
@@ -76,6 +81,36 @@ export const INTERVALS = {
   pstate: 1000 / RATES.pstateHz,
   vstate: 1000 / RATES.vstateHz,
   debris: 1000 / RATES.debrisHz,
+};
+
+// --- Net-layer tuning (has no home in src/config.js; both the browser client and the Node server
+// import this file, and config.js is shared game tuning rather than wire behaviour) ---------------
+export const NET_TUNING = {
+  // Client: cap on the message backlog queued between `hello` and the game's handler registration.
+  // The map build that sits between `welcome` and Replication.register() takes seconds on a cold
+  // machine; at ~50 msg/s a 4000-entry cap covers >60 s of traffic and can never grow unbounded.
+  maxPendingMessages: 4000,
+  // Server: seconds after a map reset during which contact-driven detach is ignored. Restored chunk
+  // bodies spawn overlapping anyone standing in the crater they just made, and the solver's
+  // penetration-recovery force reads as a huge impact — without this, the map re-shatters around that
+  // player the instant it is rebuilt. Explicit weapon damage is unaffected.
+  resetSettleSec: 1.0,
+  // Server: an impactor embedded deeper than this (metres) inside a live chunk is "buried" and is
+  // temporarily removed from the detach-impactor set — its contact force is penetration recovery, not
+  // a hit. It is put back the moment it is free again. Measured on the plaza: a capsule resting on a
+  // destructible floor reads ~0.000, one wedged inside a rebuilt house reads -0.03 and deeper.
+  buriedDepthM: 0.02,
+  // Server: how often (seconds) the buried-impactor audit runs. Only ticks while a reset is settling
+  // or somebody is still buried, so normal play pays nothing.
+  buriedAuditSec: 0.1,
+  // Server: release threshold (metres) for a quarantined impactor — shallower than buriedDepthM so the
+  // two form a hysteresis band. A body merely resting on a destructible floor measures ~0.000 and clears
+  // immediately; one wedged inside a rebuilt wall keeps reading past this and stays quarantined.
+  buriedClearDepthM: 0.005,
+  // Server: consecutive clean audits needed before a buried impactor is trusted again. A wedged capsule
+  // jitters — its measured depth flickers through 0.000 between frames — so one clean sample must not
+  // release it back into the detach path.
+  buriedClearAudits: 5,
 };
 
 // --- Validation caps (server-side, loose; brief section 5 + 10) ------------------------------

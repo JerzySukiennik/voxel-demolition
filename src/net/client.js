@@ -2,12 +2,18 @@
 // Boots at lobby load: ?solo=1 goes offline immediately; otherwise it dials ws://<location.host> and
 // falls back to OFFLINE (exact Phase 5 single-player) after a 2 s timeout or any error. On success it
 // surfaces the server's `session` push (drives lobby card state), sends `hello` on PLAY, and — once in
-// game — uploads player state at 20 Hz and driving input at 30 Hz.
+// game — uploads player state at 20 Hz and driving input at 30 Hz. Everything the server sends between
+// `hello` and flushPending() is QUEUED, not dropped: startGame() spends seconds building the map
+// before Replication.register() exists, and joins/detaches lost in that window never come back.
 import {
-  PROTOCOL_VERSION, C2S, S2C, INTERVALS, packP, packV, packQ, packInput,
+  PROTOCOL_VERSION, C2S, S2C, INTERVALS, COALESCING_TYPES, NET_TUNING,
+  packP, packV, packQ, packInput,
 } from "./protocol.js";
 
 const CONNECT_TIMEOUT_MS = 2000;
+// Lifecycle messages the boot path already listens for before the game exists — never queued.
+const LIFECYCLE_TYPES = new Set([S2C.WELCOME, S2C.SESSION, S2C.FULL]);
+const COALESCE = new Set(COALESCING_TYPES);
 
 export class NetClient {
   constructor({ solo = false } = {}) {
@@ -32,6 +38,11 @@ export class NetClient {
     this._stateTimer = null;
     this._inputTimer = null;
     this._drivingVid = null;
+
+    // Backlog of game messages received while the game world is still being built (see flushPending).
+    this._pending = [];
+    this._buffering = false;
+    this._pendingOverflow = 0;
   }
 
   get online() { return this.state === "online"; }
@@ -101,8 +112,46 @@ export class NetClient {
     // Track identity from the two lifecycle messages before dispatching.
     if (msg.t === S2C.WELCOME) { this.pid = msg.pid; this.mapId = msg.mapId; }
     else if (msg.t === S2C.SESSION) { this.session = { active: !!msg.active, mapId: msg.mapId, count: msg.count | 0 }; if (this.onSession) this.onSession(this.session); }
+    // Queue anything the game itself owns until its handlers are wired (flushPending). Without this,
+    // every join / detach / seat / reset that lands during the multi-second map build is discarded.
+    if (this._buffering && !LIFECYCLE_TYPES.has(msg.t)) {
+      if (this._pending.length < NET_TUNING.maxPendingMessages) this._pending.push(msg);
+      else this._pendingOverflow++;
+      return;
+    }
+    this._dispatch(msg);
+  }
+
+  _dispatch(msg) {
     const h = this.handlers.get(msg.t);
     if (h) h(msg);
+  }
+
+  // Replay everything queued since `hello` and go live. Called once by main.js after Replication has
+  // registered its handlers AND the welcome snapshot has been applied, so the backlog lands on top of
+  // the correct base state. Pure snapshot types keep only their newest entry (a 5 s backlog of 20 Hz
+  // pstates would otherwise stuff the interpolation buffers with 100 samples sharing one timestamp);
+  // event types replay in full, in arrival order.
+  flushPending() {
+    this._buffering = false;
+    const q = this._pending;
+    this._pending = [];
+    if (!q.length) return 0;
+    const lastOf = new Map();
+    for (let i = 0; i < q.length; i++) if (COALESCE.has(q[i].t)) lastOf.set(q[i].t, i);
+    let replayed = 0;
+    for (let i = 0; i < q.length; i++) {
+      const m = q[i];
+      if (COALESCE.has(m.t) && lastOf.get(m.t) !== i) continue;
+      this._dispatch(m);
+      replayed++;
+    }
+    if (this._pendingOverflow) {
+      console.warn(`[net] dropped ${this._pendingOverflow} queued messages (backlog cap) — expect a desync`);
+      this._pendingOverflow = 0;
+    }
+    console.log(`[net] replayed ${replayed}/${q.length} messages queued during the map build`);
+    return replayed;
   }
 
   _send(obj) {
@@ -111,8 +160,12 @@ export class NetClient {
   }
 
   // --- Send helpers (client -> server) -------------------------------------------------------
+  // From here on the server may send game traffic at any moment, but the game (and its handlers) does
+  // not exist yet — start queueing until flushPending().
   sendHello(nick, avatar, wantMap) {
-    return this._send({ t: C2S.HELLO, ver: PROTOCOL_VERSION, nick, avatar, wantMap });
+    const ok = this._send({ t: C2S.HELLO, ver: PROTOCOL_VERSION, nick, avatar, wantMap });
+    if (ok) { this._pending.length = 0; this._pendingOverflow = 0; this._buffering = true; }
+    return ok;
   }
   sendMapCheck(counts) { return this._send({ t: C2S.MAP_CHECK, counts }); }
   sendState(s) {
@@ -180,9 +233,19 @@ export class NetClient {
     this._drivingVid = null;
   }
 
+  // An explicitly closed client must never still report `online`: beginPlay()'s welcome-timeout path
+  // calls close() and then starts the game synchronously, and a lingering "online" would boot the whole
+  // session in replica mode against a dead socket (nothing destructible, no remotes, reset does nothing).
+  // State is set directly rather than via _goOffline so the lobby's onOffline banner does not fire on
+  // a deliberate teardown.
   close() {
     this._stopTimers();
     if (this.ws) { try { this.ws.close(); } catch (e) {} }
     this.ws = null;
+    this.state = "offline";
+    this._buffering = false;
+    this._pending.length = 0;
+    this._pendingOverflow = 0;
+    this._resolveReady();
   }
 }

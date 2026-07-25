@@ -53,6 +53,10 @@ export class RemotePlayers {
     const decoded = group.userData.decoded;
     // Remote heads + arms stay visible (unlike the local first-person player).
     if (parts.head) parts.head.visible = true;
+    // Hidden until the first interpolation sample lands: a freshly added remote sits at the world
+    // origin, which on every map is inside the playfield — a body standing in the middle of the map is
+    // worse than no body at all. pstate runs at 20 Hz for every connected player, so this is ~1 frame.
+    group.visible = false;
     this.scene.add(group);
 
     // Held-tool holder parented at the right arm (coarse placement in the hand region).
@@ -72,6 +76,7 @@ export class RemotePlayers {
     }
 
     const nametag = this._makeNametag(nick);
+    nametag.visible = false;
     this.scene.add(nametag);
 
     this.remotes.set(pid, {
@@ -152,7 +157,8 @@ export class RemotePlayers {
       r.group.rotation.set(0, sample.yaw, 0);
       this._walkLimbs(r, feet, dt);
     }
-    if (!feet) return;
+    if (!feet) { r.group.visible = false; r.nametag.visible = false; return; }
+    r.group.visible = true;
 
     // Tool visibility: show the current held tool, hide the rest.
     for (const id of TOOL_IDS) {

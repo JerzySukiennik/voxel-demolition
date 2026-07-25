@@ -9,7 +9,7 @@ import { VehicleManager } from "../src/vehicles/manager.js";
 import { VEHICLE_SPECS, resolveTuning } from "../src/vehicles/registry.js";
 import { sanitizeAvatar } from "../src/avatar.js";
 import { NetInput } from "./net-input.js";
-import { C2S, S2C, CAPS, packP, packQ } from "../src/net/protocol.js";
+import { C2S, S2C, CAPS, NET_TUNING, packP, packQ } from "../src/net/protocol.js";
 
 const P = CONFIG.player;
 const WPN = CONFIG.weapons;
@@ -37,6 +37,9 @@ export class Session {
     this._neutral = new NetInput();
     this._detachOut = [];
     this._debrisRmOut = [];
+    this._settleT = 0;         // seconds of post-reset contact-detach suppression still owed
+    this._buried = new Map();  // colliderHandle -> heavy flag, for impactors currently inside a chunk
+    this._auditT = 0;          // countdown to the next buried-impactor audit
   }
 
   // ---- Lifecycle ----------------------------------------------------------------------------
@@ -103,6 +106,9 @@ export class Session {
     this._nextCid4 = 1;
     this._detachOut.length = 0;
     this._debrisRmOut.length = 0;
+    this._settleT = 0;
+    this._buried.clear();
+    this._auditT = 0;
     this.log.log("[session] empty — full teardown; next player rebuilds a fresh sim");
   }
 
@@ -338,6 +344,14 @@ export class Session {
     this.charges.clear();
     this._detachOut.length = 0;
     this._debrisRmOut.length = 0;
+    // The rebuilt chunk bodies materialise on top of whoever is standing in the crater they just made.
+    // Rapier resolves that overlap with a penetration-recovery force in the tens of thousands, which
+    // drainContacts cannot tell apart from a real hit — so the building explodes again the instant it
+    // comes back, and that player reports "the reset did nothing for me" while everyone standing clear
+    // sees a clean map. Suppress contact-driven detach until the solver has pushed everyone out; the
+    // clients' own replicas do the same eject locally, so it resolves in a handful of frames.
+    this._settleT = NET_TUNING.resetSettleSec;
+    this._auditT = 0; // audit on the very next step, once the narrow phase has seen the new bodies
     this._broadcast({ t: S2C.RESET, by: player.pid });
     this.log.log(`[session] reset by pid ${player.pid}`);
   }
@@ -388,7 +402,15 @@ export class Session {
       rec.v.update(dt, driving ? rec.netInput : this._neutral, driving);
     }
     this.world.step(this.eventQueue);
-    this.destruction.drainContacts(this.eventQueue); // fires onDetach -> _detachOut
+    // Post-reset settle window: swallow this step's contacts instead of detaching on them (see _onReset).
+    // The EventQueue was built with autoDrain, so skipping the drain leaks nothing.
+    if (this._settleT > 0) this._settleT -= dt;
+    // Keep the buried-impactor quarantine current while a reset settles or anyone is still embedded.
+    if (this._settleT > 0 || this._buried.size) {
+      this._auditT -= dt;
+      if (this._auditT <= 0) { this._auditT = NET_TUNING.buriedAuditSec; this._auditBuried(); }
+    }
+    if (this._settleT <= 0) this.destruction.drainContacts(this.eventQueue); // fires onDetach -> _detachOut
     this.destruction.update(dt);                     // sleep bookkeeping + cull -> onDebrisRemove
 
     if (this._detachOut.length) { this._broadcast({ t: S2C.DETACH, events: this._detachOut.slice() }); this._detachOut.length = 0; }
@@ -498,6 +520,71 @@ export class Session {
     // Clear the owning player's pointer.
     for (const pl of this.players.values()) if (pl.spawnedVid === vid) pl.spawnedVid = null;
     this._broadcast({ t: S2C.VEH_RM, vid });
+  }
+
+  // ---- Buried-impactor quarantine (post-reset) ----------------------------------------------
+  // A player capsule that a rebuilt chunk materialised around is NOT hitting that chunk — the
+  // solver is pushing it out, and the recovery force (tens of thousands of newtons) is indistinguishable
+  // from a real impact inside drainContacts. While an impactor is embedded it is dropped from the
+  // detach-impactor set, so the map it is standing in stays intact; it is restored, with its original
+  // heavy flag, as soon as it is free. Weapon damage intents never route through impactors and so are
+  // untouched. The candidate list is rebuilt every audit, which also makes it immune to Rapier
+  // recycling a collider handle after a despawn.
+  _auditBuried() {
+    const d = this.destruction;
+    if (!d) { this._buried.clear(); return; }
+    const seen = new Set();
+    const visit = (col) => {
+      if (!col) return;
+      const h = col.handle;
+      seen.add(h);
+      const rec = this._buried.get(h);
+      if (!rec && !d.allowedImpactors.has(h)) return; // not an impactor at all (decor, static)
+      const depth = this._chunkPenetration(col);
+      if (!rec) {
+        if (depth < -NET_TUNING.buriedDepthM) {
+          this._buried.set(h, { heavy: d.heavyImpactors.has(h), clean: 0 });
+          d.unregisterImpactor(h);
+        }
+        return;
+      }
+      // Quarantined: release only after a sustained run of contact-free audits (hysteresis — a wedged
+      // capsule jitters and reads 0.000 on individual frames while still very much stuck in the wall).
+      rec.clean = depth < -NET_TUNING.buriedClearDepthM ? 0 : rec.clean + 1;
+      if (rec.clean >= NET_TUNING.buriedClearAudits) {
+        this._buried.delete(h);
+        d.registerImpactor(h, rec.heavy);
+      }
+    };
+    // Player capsules only. Vehicles are deliberately left alone: ramming through a building is the
+    // whole point of a vehicle, and a heavy impactor legitimately reads as deeply penetrating mid-ram —
+    // quarantining one would break the core mechanic to fix a much rarer problem.
+    // Disabled capsules (seated drivers) are visited too, not skipped: their collider still exists, it
+    // touches nothing, so it clears the quarantine instead of being forgotten while unregistered.
+    for (const player of this.players.values()) {
+      const body = player.body;
+      if (!body) continue;
+      const n = body.numColliders();
+      for (let i = 0; i < n; i++) visit(body.collider(i));
+    }
+    // Anything quarantined that is no longer a live candidate (left / despawned) is simply forgotten —
+    // never re-registered, so a recycled handle can't be promoted into an impactor by accident.
+    for (const h of [...this._buried.keys()]) if (!seen.has(h)) this._buried.delete(h);
+  }
+
+  // Deepest penetration (metres, negative = inside) of `col` into any live (still-attached) chunk.
+  // 0 when it is touching nothing destructible.
+  _chunkPenetration(col) {
+    let deepest = 0;
+    try {
+      this.world.contactPairsWith(col, (other) => {
+        if (!other) return;
+        if (!this.destruction.registry.has(other.handle)) return; // only live chunk colliders count
+        const c = col.contactCollider(other, 0);
+        if (c && c.distance < deepest) deepest = c.distance;
+      });
+    } catch (e) { return 0; }
+    return deepest;
   }
 
   _posValid(pos, senderP) {

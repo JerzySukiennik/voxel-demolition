@@ -137,8 +137,13 @@ export class PlaneVehicle {
       this.body.applyTorqueImpulse({ x: tt.x, y: tt.y, z: tt.z }, true);
     }
 
-    // Auto-level spring toward upright.
-    const levelAxis = new THREE.Vector3().crossVectors(up, WORLD_UP).multiplyScalar(V.autoLevel * V.inertia.x * dt);
+    // Auto-level spring toward upright. cross(up, WORLD_UP) has magnitude sin(tilt), which vanishes BOTH
+    // at upright and at exactly inverted — so a plane flipped onto its back sat at a torque-free unstable
+    // equilibrium. Use the tilt ANGLE for magnitude and fall back to the body forward axis at that pole.
+    const tilt = Math.acos(THREE.MathUtils.clamp(up.dot(WORLD_UP), -1, 1));
+    const axis = new THREE.Vector3().crossVectors(up, WORLD_UP);
+    if (axis.lengthSq() < 1e-8) axis.copy(fwd); else axis.normalize();
+    const levelAxis = axis.multiplyScalar(V.autoLevel * tilt * V.inertia.x * dt);
     this.body.applyTorqueImpulse({ x: levelAxis.x, y: levelAxis.y, z: levelAxis.z }, true);
 
     // Fixed-gear suspension (keeps it on the runway; rolls, then lifts off with airspeed).
