@@ -45,6 +45,7 @@ export class Destruction {
     // { pos():Vector3, explode(), chainR, exploded, queued }. NOT in allowedImpactors (never cascades).
     this.damageableProps = new Map(); // colliderHandle -> rec
     this._propChain = [];      // scheduled chain-reaction explosions: [{ rec, at }] (staged 1 beat apart)
+    this._deferTiles = null;   // non-null during a batched vehicle punch: collects "volId:tileId" to re-mesh once
     this._detachSeq = 0;       // Phase 7 batch D: monotonic detach counter -> chunk.detachSeq = "damage age" (Rebuild Gun restores oldest-first)
     this._time = 0;
     // Only these collider handles (player, vehicle) may trigger contact-based detach.
@@ -125,9 +126,9 @@ export class Destruction {
     for (const req of this._detachQueue) {
       const other = this._otherPos(req.otherHandle);
       const dir = dirTo(other, req.chunk.centroid);
-      this._detach(req.volume, req.chunk, dir, req.force);
+      this._detach(req.volume, req.chunk, dir, req.force, req.heavy ? D.vehiclePunchKick : 1, req.heavy);
       impacts.push(req.force);
-      if (req.heavy) this._vehiclePunch(req.chunk.centroid, D.vehiclePunchRadius, req.force, seen);
+      if (req.heavy) this._vehiclePunch(req.chunk.centroid, D.vehiclePunchRadius, req.force, seen, this._impactorTravel(req.otherHandle));
       else if (req.ring) this._detachRing(req.volume, req.chunk, req.force, seen);
     }
     this._detachQueue.length = 0;
@@ -138,9 +139,15 @@ export class Destruction {
   // Vehicle ram: detach every active chunk within `radius` of the contact (across volumes), bypassing
   // per-material thresholds so a car punches a car-sized tunnel and keeps its momentum. Deduped via `seen`,
   // capped by vehiclePunchBudget. Only ever reached from a heavy (vehicle) contact -> never a debris cascade.
-  _vehiclePunch(center, radius, force, seen) {
+  _vehiclePunch(contact, radius, force, seen, travel) {
+    // Open the hole AHEAD of the impact along the vehicle's travel direction: the car meets already-empty
+    // space instead of a fresh wall face, which is what lets it keep speed through house after house.
+    const center = contact.clone();
+    if (travel) center.addScaledVector(travel, D.vehiclePunchLead);
     const r2 = radius * radius;
     let budget = D.vehiclePunchBudget;
+    const deferOwner = !this._deferTiles;
+    if (deferOwner) this._deferTiles = new Set();
     for (const vol of this.volumes) {
       if (budget <= 0) break;
       const [nx, ny, nz] = vol.dims;
@@ -156,8 +163,22 @@ export class Destruction {
         const gid = vol.id + ":" + chunk.id;
         if (seen.has(gid)) continue;
         seen.add(gid);
-        this._detach(vol, chunk, dirTo(center, chunk.centroid), force * 0.5);
+        // Hurl the rubble outward (and along travel) so it clears the car's path rather than blocking it.
+        const dir = dirTo(center, chunk.centroid);
+        if (travel) dir.addScaledVector(travel, 0.6).normalize();
+        this._detach(vol, chunk, dir, force * 0.5, D.vehiclePunchKick, true);
         budget--;
+      }
+    }
+    if (deferOwner) {
+      const tiles = this._deferTiles;
+      this._deferTiles = null;
+      if (this.scene) {
+        for (const key of tiles) {
+          const sep = key.indexOf(":");
+          const vol = this.volumes[+key.slice(0, sep)];
+          if (vol) rebuildTile(vol, +key.slice(sep + 1), this.scene, this.materials);
+        }
       }
     }
   }
@@ -460,15 +481,32 @@ export class Destruction {
     return null;
   }
 
+  // Normalised travel direction of an impactor body (null when parked/too slow to imply a direction).
+  _impactorTravel(handle) {
+    const col = this.world.getCollider(handle);
+    const body = col && col.parent();
+    if (!body || !body.linvel) return null;
+    const v = body.linvel();
+    const len = Math.hypot(v.x, v.y, v.z);
+    if (len < 1) return null;
+    return new THREE.Vector3(v.x / len, v.y / len, v.z / len);
+  }
+
   // Flip a chunk to a dynamic debris body + kick. gfx: mesh it + rebuild tiles. Headless: physics only.
   // Always records an onDetach event (server broadcasts it). Never called in replica mode.
-  _detach(vol, chunk, dir, force) {
+  _detach(vol, chunk, dir, force, kickScale = 1, lighten = false) {
     chunk.active = false;
     chunk.detachSeq = ++this._detachSeq; // damage age for the Rebuild Gun (oldest-damage-first restore)
     chunk.body.setBodyType(this.RAPIER.RigidBodyType.Dynamic, true);
+    // Rammed-out rubble is re-densitied so a ploughing vehicle bats it aside instead of being stopped by
+    // tonnes of full-density chunks. Purely a mass change — visuals/colliders are unchanged.
+    if (lighten) {
+      const col = this.world.getCollider(chunk.colliderHandle);
+      if (col && col.setDensity) col.setDensity(D.vehicleDebrisDensity);
+    }
     const c = chunk.centroid;
     let mag = D.detachKick * force * CONFIG.fixedDt;
-    mag = Math.min(mag, 400);
+    mag = Math.min(mag, 400) * kickScale;
     chunk.body.applyImpulseAtPoint(
       { x: dir.x * mag, y: dir.y * mag + mag * 0.15, z: dir.z * mag },
       { x: c.x, y: c.y, z: c.z },
@@ -491,7 +529,12 @@ export class Destruction {
     this.debris.push(entry);
     this._enforceCap();
 
-    if (this.scene) for (const tid of chunk.tileIds) rebuildTile(vol, tid, this.scene, this.materials);
+    // Tile re-meshing: during a big vehicle punch this is deferred and flushed once (one rebuild per
+    // touched tile instead of one per chunk), which keeps a 120-chunk punch off the frame budget.
+    if (this.scene) {
+      if (this._deferTiles) for (const tid of chunk.tileIds) this._deferTiles.add(vol.id + ":" + tid);
+      else for (const tid of chunk.tileIds) rebuildTile(vol, tid, this.scene, this.materials);
+    }
 
     if (this.onDetach) {
       const t = chunk.body.translation();
