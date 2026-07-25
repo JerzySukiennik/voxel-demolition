@@ -1,2 +1,6 @@
 .DS_Store
 node_modules/
+
+# Reference material only (not needed to run). Contains screenshots from the commercial game
+# Teardown, and a folder name with a colon that Windows cannot check out.
+Sketches/
