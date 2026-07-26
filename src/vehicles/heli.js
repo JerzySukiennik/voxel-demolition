@@ -88,10 +88,14 @@ export class HeliVehicle {
       if (input.down("ShiftLeft")) this.collective = Math.max(0, this.collective - V.collectiveRate * dt);
     }
 
-    // Collective lift along body-up, capped.
+    // Collective lift, capped. The thrust axis is blended toward world-up by liftAssist: with pure body-up
+    // thrust every bank costs altitude, which made the helicopter sink whenever the player turned. The
+    // blend keeps the machine flying while still leaning into the direction of travel.
     let thrust = (this.collective / V.collectiveNeutral) * V.mass * G;
     thrust = Math.min(thrust, V.thrustMaxG * V.mass * G);
-    this.body.applyImpulse({ x: up.x * thrust * dt, y: up.y * thrust * dt, z: up.z * thrust * dt }, true);
+    const assist = V.liftAssist || 0;
+    const lift = up.clone().multiplyScalar(1 - assist).addScaledVector(WORLD_UP, assist).normalize();
+    this.body.applyImpulse({ x: lift.x * thrust * dt, y: lift.y * thrust * dt, z: lift.z * thrust * dt }, true);
 
     // Cyclic + pedals (body-frame torques).
     if (driving) {
@@ -104,6 +108,19 @@ export class HeliVehicle {
       const ty = up.clone().multiplyScalar(V.yawTorqueK * V.inertia.y * yawIn * dt);
       const tt = tp.add(tr).add(ty);
       this.body.applyTorqueImpulse({ x: tt.x, y: tt.y, z: tt.z }, true);
+
+      // Direct translation assist. With a strong self-levelling spring the machine barely banks, and a
+      // helicopter that only moves by banking would then go nowhere. Push it along the flattened body
+      // axes instead, so the stick actually flies it; the small residual bank is just for looks.
+      const flatF = new THREE.Vector3(fwd.x, 0, fwd.z);
+      const flatR = new THREE.Vector3(right.x, 0, right.z);
+      if (flatF.lengthSq() > 1e-6) flatF.normalize();
+      if (flatR.lengthSq() > 1e-6) flatR.normalize();
+      const move = flatF.multiplyScalar(-pitchIn).addScaledVector(flatR, -rollIn);
+      if (move.lengthSq() > 1e-6) {
+        move.normalize().multiplyScalar(V.moveAccel * V.mass * dt);
+        this.body.applyImpulse({ x: move.x, y: 0, z: move.z }, true);
+      }
     }
 
     // Auto-level spring toward upright. cross(up, WORLD_UP) has magnitude sin(tilt), which vanishes BOTH

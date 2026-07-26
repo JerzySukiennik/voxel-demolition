@@ -237,10 +237,15 @@ export const CONFIG = {
     hover: { mass: 1300, colliderHalf: { x: 1.0, y: 0.5, z: 2.2 }, colliderCenterY: 0.75, spawnBodyY: 0.10, linearDamping: 0.4, angularDamping: 2.5, hoverHeight: 1.1, hoverMin: 0.7, hoverMax: 6.0, hoverSpringK: 14, hoverDamperC: 5, altRate: 2.5, thrustAccel: 12, yawRate: 1.8, latDamp: 3, glowSize: { x: 2.2, z: 4.2 }, uprightK: 9, uprightDamp: 5.5, uprightFree: 0.20, uprightHardTilt: 1.05, uprightHardMult: 3.5 },
 
     // Helicopter. Collective + cyclic + pedals.
-    heli: { mass: 4500, colliderHalf: { x: 1.2, y: 1.2, z: 4.5 }, colliderCenterY: 1.5, spawnBodyY: 0.20, linearDamping: 0.15, angularDamping: 2.2, collectiveNeutral: 0.55, collectiveRate: 0.8, thrustMaxG: 1.5, pitchTorqueK: 1.6, rollTorqueK: 1.4, yawTorqueK: 1.0, autoLevel: 2.0, rotorMainSpeed: 18, rotorTailSpeed: 40 },
+    // Flown with an assist, not simulated: strong self-levelling, gentle cyclic, and liftAssist blends the
+    // rotor thrust toward world-up so banking no longer drops you out of the sky (the main reason the
+    // stock helicopter was unflyable). liftAssist 0 = pure body-up (realistic), 1 = always straight up.
+    heli: { mass: 4500, colliderHalf: { x: 1.2, y: 1.2, z: 4.5 }, colliderCenterY: 1.5, spawnBodyY: 0.20, linearDamping: 0.6, angularDamping: 4.0, collectiveNeutral: 0.55, collectiveRate: 0.8, thrustMaxG: 1.5, pitchTorqueK: 0.9, rollTorqueK: 0.8, yawTorqueK: 0.9, autoLevel: 2.6, liftAssist: 0.7, moveAccel: 7.0, rotorMainSpeed: 18, rotorTailSpeed: 40 },
 
     // Fixed-wing airplane. Throttle + pitch/roll/rudder; needs airspeed for lift.
-    plane: { mass: 1400, colliderHalf: { x: 1.0, y: 0.8, z: 3.6 }, colliderCenterY: 1.1, spawnBodyY: 0.10, linearDamping: 0.0, angularDamping: 1.2, thrustMaxK: 9, vRef: 22, vStall: 12, dragK: 0.04, autoLevel: 0.8, throttleRate: 0.5, pitchTorqueK: 1.2, rollTorqueK: 2.2, yawTorqueK: 0.8, propSpeedBase: 10, propSpeedMax: 50, gearSpringK: 30000, gearDamperC: 4000, gearWheelRadius: 0.25, gearRest: 0.25, gearMaxTravel: 0.12 },
+    // Forgiving arcade flight: more thrust, lift from a lower airspeed (short runways), calmer roll and a
+    // much stronger self-levelling spring so letting go of the stick recovers instead of spiralling.
+    plane: { mass: 1400, colliderHalf: { x: 1.0, y: 0.8, z: 3.6 }, colliderCenterY: 1.1, spawnBodyY: 0.10, linearDamping: 0.0, angularDamping: 2.2, thrustMaxK: 13, vRef: 17, vStall: 8, dragK: 0.03, autoLevel: 2.6, throttleRate: 0.7, pitchTorqueK: 0.9, rollTorqueK: 1.2, yawTorqueK: 0.7, propSpeedBase: 10, propSpeedMax: 50, gearSpringK: 30000, gearDamperC: 4000, gearWheelRadius: 0.25, gearRest: 0.25, gearMaxTravel: 0.12 },
   },
 
   camera: {
@@ -482,7 +487,14 @@ export const CONFIG = {
       // which at a 70-degree FOV puts a rocket launcher across a third of the screen and hides what you
       // are aiming at. Scaling the group (not the offsets) pulls the weapon back toward the hand.
       // _muzzleWorld scales muzzleLen by the same factor so projectiles still leave the visible barrel.
-      scale: 0.55,
+      scale: 0.40,
+      // Absolute per-tool override for the bulkiest models, which still filled a corner at the global
+      // scale. Car Cannon is a deliberately absurd wide-bore cannon and needs the most taming.
+      scaleById: {
+        carcannon: 0.26, rocketLauncher: 0.32, clusterlauncher: 0.32, stickylauncher: 0.34,
+        foamcannon: 0.32, windcannon: 0.32, vacuum: 0.34, nuke: 0.30, gravitygun: 0.34,
+        magnetgun: 0.34, chainsaw: 0.34, sledgehammer: 0.36,
+      },
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
       // Batch C held devices: painter/nuke/orbital/airstrike/carcannon/rccar/propane share the base grip.
       blastpainterOffset: { x: 0.24, y: -0.28, z: -0.44 },

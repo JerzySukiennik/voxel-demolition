@@ -26,6 +26,7 @@ export class PlaneVehicle {
       .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
       .setLinearDamping(V.linearDamping)
       .setAngularDamping(V.angularDamping)
+      .setCcdEnabled(true) // a diving plane covers > its own length per step and would tunnel the ground
       .setCanSleep(false);
     this.body = world.createRigidBody(bodyDesc);
     const colDesc = RAPIER.ColliderDesc.cuboid(V.colliderHalf.x, V.colliderHalf.y, V.colliderHalf.z)

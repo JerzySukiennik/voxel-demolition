@@ -405,7 +405,11 @@ export class Weapons {
       this.viewmodel.add(mesh);
       const muzzleLen = d.model.parts[0].size[2] * d.model.voxelSize - piv[2];
       const armsOffset = meleeKinds.has(d.kind) ? VM.armsOffsetSledge : VM.armsOffset;
-      const item = { id: d.id, name: d.name, kind: d.kind, num: d.num, mesh, baseOffset: d.base, muzzleLen, armsOffset, state: { lastUse: -1e9 } };
+      // The group already carries VM.scale (so the arms shrink with it); a bulky tool gets an extra
+      // relative factor on its own mesh so it stops filling the corner of the screen.
+      const vmScale = (VM.scaleById && VM.scaleById[d.id]) || VM.scale;
+      if (vmScale !== VM.scale) mesh.scale.setScalar(vmScale / VM.scale);
+      const item = { id: d.id, name: d.name, kind: d.kind, num: d.num, mesh, baseOffset: d.base, muzzleLen, armsOffset, vmScale, state: { lastUse: -1e9 } };
       let cat = this.categories.find((c) => c.num === d.num);
       if (!cat) { cat = { num: d.num, label: d.catLabel, items: [] }; this.categories.push(cat); }
       cat.items.push(item);
@@ -435,7 +439,7 @@ export class Weapons {
   _camPos() { return this.camera.getWorldPosition(new THREE.Vector3()); }
   _muzzleWorld(item) {
     const b = this._currentBaseOffset;
-    return this.camera.localToWorld(new THREE.Vector3(b.x, b.y, b.z - item.muzzleLen * VM.scale));
+    return this.camera.localToWorld(new THREE.Vector3(b.x, b.y, b.z - item.muzzleLen * (item.vmScale || VM.scale)));
   }
 
   // Muzzle flash (shared world-space quad).
