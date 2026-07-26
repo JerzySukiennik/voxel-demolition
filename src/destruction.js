@@ -53,6 +53,7 @@ export class Destruction {
     // Subset of allowedImpactors that ram "cardboard": vehicles + Car Cannon. They get a big force
     // multiplier + a radial punch so a car plows through buildings. The player stays OUT of this set.
     this.heavyImpactors = new Set();
+    this._motionPrev = new Map(); // heavy handle -> {s, dx, dy, dz} at the previous step (approach motion)
     this.stats = {
       chunks: 0, chunksGrid: 0, chunksStructure: 0,
       collidersCuboid: 0, collidersHull: 0,
@@ -113,6 +114,14 @@ export class Destruction {
       const chunk = hit.chunk;
       // Vehicles (heavy) ram like cardboard: boosted force clears any material; the player stays at full
       // material threshold so walking into a wall never breaks it.
+      // A heavy impactor only counts as a RAM above a minimum speed; parked or crawling vehicles must not
+      // chew up the road they sit on (doing so dropped them into their own craters and flung them skyward).
+      if (this.heavyImpactors.has(otherHandle)) {
+        // Vehicles smash STRUCTURES, never the road: ploughing the ground skin dug trenches the car then
+        // fell into (which is what threw it into the air). Grid-kind volumes are the ground.
+        if (hit.volume.spec.kind === "grid") return;
+        if (this._ramSpeed(otherHandle) < D.vehicleMinRamSpeed) return; // parked / crawling: no damage
+      }
       const heavy = this.heavyImpactors.has(otherHandle);
       const eff = heavy ? f * D.vehicleImpactForceMult : f;
       if (eff < chunk.threshold) return;
@@ -131,9 +140,55 @@ export class Destruction {
       if (req.heavy) this._vehiclePunch(req.chunk.centroid, D.vehiclePunchRadius, req.force, seen, this._impactorTravel(req.otherHandle));
       else if (req.ring) this._detachRing(req.volume, req.chunk, req.force, seen);
     }
+    this._vehicleSweep(seen);     // clear structure just ahead of anything travelling fast enough to ram
     this._detachQueue.length = 0;
     this._flushDetach();
+    this._sampleImpactorMotion(); // record this step's motion for the next step's ram gate
     return impacts;
+  }
+
+  // Every heavy impactor above the ram speed carves a small volume ahead of its nose, so a fast vehicle
+  // drives into an opening rather than into a solid wall that would eat all of its momentum in one step.
+  _vehicleSweep(seen) {
+    if (this.heavyImpactors.size === 0) return;
+    for (const h of this.heavyImpactors) {
+      const col = this.world.getCollider(h);
+      const body = col && col.parent();
+      if (!body || !body.linvel) continue;
+      const v = body.linvel();
+      const s = Math.hypot(v.x, v.y, v.z);
+      if (s < D.vehicleMinRamSpeed) continue;
+      const t = body.translation();
+      const dir = new THREE.Vector3(v.x / s, v.y / s, v.z / s);
+      const nose = new THREE.Vector3(t.x, t.y, t.z).addScaledVector(dir, D.vehicleSweepLead);
+      this._sweepAt(nose, dir, seen);
+    }
+  }
+
+  _sweepAt(center, dir, seen) {
+    const radius = D.vehicleSweepRadius, r2 = radius * radius;
+    let budget = D.vehicleSweepBudget;
+    for (const vol of this.volumes) {
+      if (budget <= 0) break;
+      if (vol.spec.kind === "grid") continue; // structures only, never the road
+      const [nx, ny, nz] = vol.dims;
+      const [ox, oy, oz] = vol.origin;
+      const vs = vol.vs;
+      if (center.x < ox - radius || center.x > ox + nx * vs + radius) continue;
+      if (center.y < oy - radius || center.y > oy + ny * vs + radius) continue;
+      if (center.z < oz - radius || center.z > oz + nz * vs + radius) continue;
+      for (const chunk of vol.chunks) {
+        if (budget <= 0) break;
+        if (!chunk.active) continue;
+        if (chunk.centroid.distanceToSquared(center) > r2) continue;
+        const gid = vol.id + ":" + chunk.id;
+        if (seen.has(gid)) continue;
+        seen.add(gid);
+        const kick = dirTo(center, chunk.centroid).addScaledVector(dir, 0.6).normalize();
+        this._detach(vol, chunk, kick, D.vehicleSweepForce * 0.5, D.vehiclePunchKick, true);
+        budget--;
+      }
+    }
   }
 
   // Vehicle ram: detach every active chunk within `radius` of the contact (across volumes), bypassing
@@ -150,6 +205,7 @@ export class Destruction {
     if (deferOwner) this._deferTiles = new Set();
     for (const vol of this.volumes) {
       if (budget <= 0) break;
+      if (vol.spec.kind === "grid") continue; // never carve the road out from under the car
       const [nx, ny, nz] = vol.dims;
       const [ox, oy, oz] = vol.origin;
       const vs = vol.vs;
@@ -481,15 +537,48 @@ export class Destruction {
     return null;
   }
 
+  // Ram speed for the gate. drainContacts runs AFTER world.step, by which point the wall has already
+  // stopped the car — so the current velocity reads ~0 on the very frame of impact. Use the greater of
+  // the current speed and the speed sampled on the previous step (the approach speed).
+  _ramSpeed(handle) {
+    const prev = this._motionPrev.get(handle);
+    return Math.max(this._impactorSpeed(handle), prev ? prev.s : 0);
+  }
+
+  // Snapshot the motion of every heavy impactor, so the next step can read the pre-collision approach.
+  _sampleImpactorMotion() {
+    for (const h of this.heavyImpactors) {
+      const col = this.world.getCollider(h);
+      const body = col && col.parent();
+      if (!body || !body.linvel) { this._motionPrev.delete(h); continue; }
+      const v = body.linvel();
+      const s = Math.hypot(v.x, v.y, v.z);
+      this._motionPrev.set(h, s > 1e-3 ? { s, dx: v.x / s, dy: v.y / s, dz: v.z / s } : { s: 0, dx: 0, dy: 0, dz: 0 });
+    }
+    for (const h of this._motionPrev.keys()) if (!this.heavyImpactors.has(h)) this._motionPrev.delete(h);
+  }
+
+  // Speed (m/s) of an impactor body; 0 when it has no parent body.
+  _impactorSpeed(handle) {
+    const col = this.world.getCollider(handle);
+    const body = col && col.parent();
+    if (!body || !body.linvel) return 0;
+    const v = body.linvel();
+    return Math.hypot(v.x, v.y, v.z);
+  }
+
   // Normalised travel direction of an impactor body (null when parked/too slow to imply a direction).
   _impactorTravel(handle) {
     const col = this.world.getCollider(handle);
     const body = col && col.parent();
-    if (!body || !body.linvel) return null;
-    const v = body.linvel();
-    const len = Math.hypot(v.x, v.y, v.z);
-    if (len < 1) return null;
-    return new THREE.Vector3(v.x / len, v.y / len, v.z / len);
+    if (body && body.linvel) {
+      const v = body.linvel();
+      const len = Math.hypot(v.x, v.y, v.z);
+      if (len >= 1) return new THREE.Vector3(v.x / len, v.y / len, v.z / len);
+    }
+    // Post-collision the velocity is already killed, so fall back to the approach direction.
+    const p = this._motionPrev.get(handle);
+    return p && p.s >= 1 ? new THREE.Vector3(p.dx, p.dy, p.dz) : null;
   }
 
   // Flip a chunk to a dynamic debris body + kick. gfx: mesh it + rebuild tiles. Headless: physics only.

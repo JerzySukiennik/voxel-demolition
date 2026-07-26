@@ -77,6 +77,7 @@ export class Weapons {
     this.remoteRockets = [];      // visual-only rockets fired by other players
 
     this.viewmodel = new THREE.Group();
+    this.viewmodel.scale.setScalar(VM.scale); // held tools are modelled full-size; shrink so they don't hide the aim
     camera.add(this.viewmodel);
 
     this._time = 0;
@@ -434,7 +435,7 @@ export class Weapons {
   _camPos() { return this.camera.getWorldPosition(new THREE.Vector3()); }
   _muzzleWorld(item) {
     const b = this._currentBaseOffset;
-    return this.camera.localToWorld(new THREE.Vector3(b.x, b.y, b.z - item.muzzleLen));
+    return this.camera.localToWorld(new THREE.Vector3(b.x, b.y, b.z - item.muzzleLen * VM.scale));
   }
 
   // Muzzle flash (shared world-space quad).

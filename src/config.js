@@ -129,8 +129,23 @@ export const CONFIG = {
     // Vehicle ramming feel: buildings should be very fragile to vehicles (drive through a house or two on
     // the loose) WITHOUT changing weapon or on-foot-player balance. Only handles tagged `heavy` (vehicles +
     // Car Cannon) get these; the player capsule stays a normal impactor so walking never breaks walls.
-    vehicleEventFloor: 600,         // chunk colliders fire contact events down to this force (so even a gentle nudge registers); still gated per-impactor in code
-    vehicleImpactForceMult: 22,     // heavy-impactor contact force is multiplied before the threshold gate — vehicles clear any material trivially
+    // Low floor on purpose: a wall has to give way on the FIRST light touch, otherwise the car spends its
+    // whole momentum on one immovable step of contact and stops dead instead of ploughing through.
+    vehicleEventFloor: 600,
+    vehicleImpactForceMult: 18,     // heavy-impactor contact force is multiplied before the threshold gate
+    // A resting or slowly-rolling car pushes on the ground hard enough to clear even the skin threshold
+    // once multiplied, so without a speed gate it shredded the road it was driving on and then fell into
+    // its own holes (which is what launched it into the air). Ramming has to be a RAM: below this speed a
+    // heavy impactor detaches nothing at all.
+    vehicleMinRamSpeed: 5.0,        // m/s (~18 km/h)
+    // Contact-driven detach alone can never plough: Rapier resolves the collision against the still-solid
+    // wall in the SAME step, so the car's momentum is gone before the chunks come loose. A vehicle above
+    // the ram speed therefore sweeps a small volume just ahead of its nose every step, so it meets an
+    // opening instead of a wall. Structures only - the ground is excluded.
+    vehicleSweepRadius: 2.0,        // m, roughly the width of a car
+    vehicleSweepLead: 2.6,          // m ahead of the body centre
+    vehicleSweepForce: 30000,       // clears every structure threshold; feeds the normal detach kick
+    vehicleSweepBudget: 24,         // chunks per vehicle per step
     vehiclePunchRadius: 4.0,        // each vehicle contact carves this radius -> an ~8 m tunnel, wide enough to swallow whole rooms
     vehiclePunchBudget: 120,        // max chunks detached per punch (perf cap; tile rebuilds are batched so this stays cheap)
     vehiclePunchLead: 3.0,          // punch centre is pushed this far along the vehicle's travel direction, so the hole opens AHEAD and momentum survives
@@ -463,6 +478,11 @@ export const CONFIG = {
     },
 
     viewmodel: {
+      // Uniform shrink of the held-tool group. The HD tool models are modelled at true real-world size,
+      // which at a 70-degree FOV puts a rocket launcher across a third of the screen and hides what you
+      // are aiming at. Scaling the group (not the offsets) pulls the weapon back toward the hand.
+      // _muzzleWorld scales muzzleLen by the same factor so projectiles still leave the visible barrel.
+      scale: 0.55,
       baseOffset: { x: 0.28, y: -0.26, z: -0.45 },
       // Batch C held devices: painter/nuke/orbital/airstrike/carcannon/rccar/propane share the base grip.
       blastpainterOffset: { x: 0.24, y: -0.28, z: -0.44 },
