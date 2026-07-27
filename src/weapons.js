@@ -6,7 +6,8 @@ import { mulberry32 } from "./sim/rng.js";
 import toolModels from "../assets/models/tools.js";
 import { GroundVehicle } from "./vehicles/ground.js";
 import { VEHICLE_SPECS } from "./vehicles/registry.js";
-import { CAPS } from "./net/protocol.js";
+import { CAPS, packBits, unpackBits, bitAt } from "./net/protocol.js";
+import { foamVolumeSpec } from "./destruction.js";
 
 // Build a centered voxel geometry for an in-world projectile from a tool model's "main" part.
 function centeredGeo(model) {
@@ -22,6 +23,31 @@ const VM = W.viewmodel;
 const FX = W.fx;
 const UP = new THREE.Vector3(0, 1, 0);
 const FWD_Z = new THREE.Vector3(0, 0, 1);
+
+// ---- Local tuning block (CONFIG.weapons is owned elsewhere this session; same documented-local-constants
+// pattern as the mix block in audio.js). Both values belong to one spawn calculation and nothing else. ----
+// Car Cannon spawn: the projectile is a 3.6 m long body, so pushing it only 1.5 m past the muzzle left it
+// starting the frame inside anything the player stood close to.
+const CAR_SPAWN_LEAD = 2.6;       // m ahead of the muzzle (half the car length + clearance)
+const CAR_SPAWN_CLEARANCE = 0.6;  // m kept between the spawn point and geometry the muzzle is looking at
+// Car Cannon in MULTIPLAYER. Solo damage comes from the contact/sweep path inside drainContacts, which is
+// a no-op on a replica (the client never detaches), so a flung car used to smash nothing online. The
+// projectile stays a client-side body for looks; while it is travelling at ram speed the client emits a
+// short carve intent along its path and the server does the real damage. Numbers below are the MP-only
+// pacing; the force/radius/budget of each pulse are read from CONFIG.destruction's vehicle-sweep values so
+// the online hit matches the offline sweep.
+// 1.25x the server's own carve interval: emitting exactly at the limit loses most pulses to jitter.
+const CAR_MP_PULSE_SEC = CAPS.dmgMinIntervalCarveSec * 1.25;
+const CAR_MP_LEN_MIN = 2.0;   // m, shortest carve segment (a slow car still bites what it touches)
+const CAR_MP_LEN_MAX = 8.0;   // m, longest — one pulse must not outrun the space it actually crossed
+// Foam Cannon in MULTIPLAYER: pacing for the hardened-blob upload queue (see Weapons._foamOut).
+const FOAM_OUT_INTERVAL = CAPS.foamMinIntervalSec * 1.25; // 1.25x the server's floor, same jitter margin
+const FOAM_OUT_MAX = 8;       // queued blobs; past this the oldest is dropped rather than grow unbounded
+// Size Ray aim assist: how far off the aim LINE a valid target may sit and still be picked when the
+// hairline ray itself missed. Matters most for already-shrunk rubble — a chunk at the 0.25x floor is a few
+// centimetres across, and without this you can shrink something and then never hit it again to grow it back
+// (measured: 65% -> 100% acquisition on 0.25x debris at ~1.2 degrees of crosshair slop).
+const SIZE_AIM_RADIUS = 0.28;     // m
 
 // Monotonic wall clock (seconds). Used as a hard deadline for the camera shake so it expires even
 // across frames where update() is never called at all (pause menu open, pointer unlocked, tab hidden).
@@ -334,6 +360,11 @@ export class Weapons {
     this._foamProj = [];         // in-flight spray projectiles { pool, pos, vel, life }
     this._foamBlobs = [];        // soft (pre-harden) blobs { cells:Map(key->marker), min[], max[], lastSpray, id }
     this._foamVols = [];         // hardened foam volume refs (oldest despawns first at the cap)
+    // MP only: hardened blobs waiting for a send slot. Two blobs can harden in the same frame (the
+    // soft-blob cap force-hardens the oldest the moment a seventh starts), and the server drops anything
+    // inside CAPS.foamMinIntervalSec — so queue instead of firing them all and losing the loser.
+    this._foamOut = [];          // [{ o, d, bits }]
+    this._foamOutT = 0;
     this._foamSprayTimer = 0;
     this._foamBlobSeq = 0;
     this._foamSplatT = 0;        // splat-audio rate limiter
@@ -407,7 +438,11 @@ export class Weapons {
       const armsOffset = meleeKinds.has(d.kind) ? VM.armsOffsetSledge : VM.armsOffset;
       // The group already carries VM.scale (so the arms shrink with it); a bulky tool gets an extra
       // relative factor on its own mesh so it stops filling the corner of the screen.
-      const vmScale = (VM.scaleById && VM.scaleById[d.id]) || VM.scale;
+      // Match the override case-insensitively: the table is hand-written and several ids are camelCase
+      // (carCannon, clusterLauncher, stickyLauncher), so a literal lookup silently missed exactly the
+      // bulkiest tools and left them at the global scale.
+      const byId = VM.scaleById || {};
+      const vmScale = byId[d.id] ?? byId[d.id.toLowerCase()] ?? VM.scale;
       if (vmScale !== VM.scale) mesh.scale.setScalar(vmScale / VM.scale);
       const item = { id: d.id, name: d.name, kind: d.kind, num: d.num, mesh, baseOffset: d.base, muzzleLen, armsOffset, vmScale, state: { lastUse: -1e9 } };
       let cat = this.categories.find((c) => c.num === d.num);
@@ -1822,9 +1857,11 @@ export class Weapons {
   }
 
   // ============================ Phase 7 batch C: Strikes + heavy/vehicular ordnance ============
-  // MP note (flag): the heavy Strike destruction (nuke radius 18, orbital carve, painted set) is
-  // authoritative/solo. On a replica client this forwards a cap-fitting radial intent (server owns the
-  // detach + staging) so nothing exceeds the server caps — a deliberate simplification, NOT a redesign.
+  // MP note (flag): the ORBITAL carve and the airstrike Penetrator are fully networked now — they go out as
+  // `dmg kind:"carve"` and the server runs the real carveCylinder (see destruction.carveCylinder). What is
+  // still simplified is this shared big-blast helper: the nuke's radius-18 staged collapse and the painted
+  // set forward a cap-fitting radial intent instead, so a replica nuke is smaller than a solo one. Server
+  // owns the detach either way; nothing exceeds the caps. Deliberate, NOT a redesign.
   _bigBlast(center, force, radius, budget, staged) {
     if (this.net) {
       const f = Math.min(force, CAPS.radialForceMax), r = Math.min(radius, CAPS.radialRadiusMax);
@@ -2147,9 +2184,23 @@ export class Weapons {
     while (this.carShots.length) this._removeCarShot(this.carShots[0]); // one live -> despawn old
     const cc = W.carCannon;
     const dir = this._aimDir();
-    const origin = this._muzzleWorld(item).addScaledVector(dir, 1.5); // clear the player
+    // Spawn far enough out that the 3.6 m long car body cannot start the frame already buried in whatever
+    // the player is standing next to: a body spawned interpenetrating a wall is ejected by Rapier's
+    // penetration recovery on step 1, which throws away the 30 m/s launch and leaves the car dribbling.
+    // CAR_SPAWN_LEAD is half the body length plus clearance; if the muzzle already looks into geometry the
+    // lead is shortened to the free distance so the car never spawns on the far side of a wall.
+    const muzzle = this._muzzleWorld(item);
+    const nose = CAR_SPAWN_LEAD + cc.half.z; // how far the front of the car reaches past the muzzle
+    let lead = CAR_SPAWN_LEAD;
+    const blocked = this.world.castRay(new this.RAPIER.Ray(muzzle, dir), nose + CAR_SPAWN_CLEARANCE, true, undefined, undefined, undefined, this.player.body);
+    if (blocked) lead = Math.max(0.2, blocked.toi - CAR_SPAWN_CLEARANCE - cc.half.z);
+    const origin = muzzle.addScaledVector(dir, lead);
+    // The collider follows the flight direction like the mesh does. It used to be a world-axis box while
+    // only the mesh was rotated, so a car fired along X collided as a 3.6 m wide slab.
+    const q = new THREE.Quaternion().setFromUnitVectors(FWD_Z, dir);
     const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(origin.x, origin.y, origin.z)
+      .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
       .setLinvel(dir.x * cc.speed, dir.y * cc.speed + cc.upBias, dir.z * cc.speed)
       .setAngvel({ x: Math.random() * cc.spin - cc.spin / 2, y: Math.random() * cc.spin - cc.spin / 2, z: Math.random() * cc.spin - cc.spin / 2 })
       .setCcdEnabled(true).setCanSleep(false);
@@ -2162,9 +2213,9 @@ export class Weapons {
     this.destruction.registerImpactor(collider.handle, true); // heavy: the flung car smashes like a rammed vehicle
     const mesh = new THREE.Mesh(this._carCannonGeo, this.materials);
     mesh.castShadow = true; mesh.receiveShadow = true;
-    mesh.position.copy(origin); mesh.quaternion.setFromUnitVectors(FWD_Z, dir);
+    mesh.position.copy(origin); mesh.quaternion.copy(q);
     this.scene.add(mesh);
-    this.carShots.push({ body, collider, mesh, age: 0, fading: null, prevSpeed: cc.speed });
+    this.carShots.push({ body, collider, mesh, age: 0, fading: null, prevSpeed: cc.speed, netPulseT: 0 });
     this.audio.carCannonWhoosh();
     this._recoilZ += 0.2; this._recoilPitch += 0.14;
   }
@@ -2183,6 +2234,7 @@ export class Weapons {
       const speed = Math.hypot(lv.x, lv.y, lv.z);
       if (s.fading == null && s.prevSpeed - speed > 8) this.audio.carCannonCrash(this._camPos().distanceTo(s.mesh.position));
       s.prevSpeed = speed;
+      if (this.net && s.fading == null) this._carShotNetDamage(s, t, lv, speed, dt);
       const atRest = s.age > 0.6 && speed < cc.restSpeed;
       if (s.fading == null && (s.age > cc.lifetime || atRest)) {
         s.fading = cc.fadeTime;
@@ -2197,6 +2249,32 @@ export class Weapons {
     }
     this.carShots = keep;
   }
+  // MP ONLY (guarded by `this.net` at the single call site — solo never reaches this function, so the
+  // offline Car Cannon is exactly what it was and can never be damaged twice). Once per CAR_MP_PULSE_SEC,
+  // while the projectile is above the ram speed and there is real structure in front of it, carve a short
+  // segment along its travel direction. The client's Destruction is a replica, so carveCylinder turns this
+  // into the sanctioned `dmg kind:"carve"` intent and the SERVER does the detaching.
+  //
+  // Why carve and not a radial sphere: CAPS.dmgWithinSenderM caps a radial at 20 m from the sender and this
+  // projectile crosses the whole map, so most pulses would be rejected outright; and a sphere at 60 Hz-ish
+  // sampling leaves gaps between pulses that a 30 m/s car flies straight through. A segment covers the
+  // ground actually travelled and rides the carve cap (120 m) instead.
+  _carShotNetDamage(s, t, lv, speed, dt) {
+    const D_ = CONFIG.destruction;
+    s.netPulseT -= dt;
+    if (s.netPulseT > 0) return;
+    if (speed < D_.vehicleMinRamSpeed) return;
+    const dir = new THREE.Vector3(lv.x / speed, lv.y / speed, lv.z / speed);
+    const nose = new THREE.Vector3(t.x, t.y, t.z).addScaledVector(dir, D_.vehicleSweepLead);
+    // Solo's sweep skips grid volumes so a car never ploughs the road; the server's carve does not know
+    // the difference, so gate the pulse on structure being there at all. Also stops a car sailing over an
+    // empty plaza from burning its rate-limit slots on nothing.
+    if (!this.destruction.hasStructureNear(nose, D_.vehicleSweepRadius)) return;
+    s.netPulseT = CAR_MP_PULSE_SEC;
+    const len = THREE.MathUtils.clamp(speed * CAR_MP_PULSE_SEC, CAR_MP_LEN_MIN, CAR_MP_LEN_MAX);
+    this.destruction.carveCylinder(nose, dir, len, D_.vehicleSweepRadius, D_.vehicleSweepForce * 0.5, D_.vehicleSweepBudget);
+  }
+
   _removeCarShot(s) {
     this.destruction.unregisterImpactor(s.collider.handle); // idempotent
     if (s.mesh && s.mesh.parent) s.mesh.parent.remove(s.mesh);
@@ -2461,10 +2539,11 @@ export class Weapons {
   }
 
   // ============================ Phase 7 batch D: Builders (constructive-voxel subsystem B) =====
-  // MP note (flag): all three builders are solo/authoritative. On a replica client (this.net set) foam
-  // stays cosmetic (spray projectiles fade, no accretion/harden — server would author blob grids and sync
-  // one compact voxel-grid message per hardened blob), and Rebuild/Size are no-ops (reattachChunk mirrors
-  // the detach channel; size scale is one synced float). Deliberate stubs, NOT a netcode redesign.
+  // MP: all three are server-authoritative now. Foam sprays and accretes locally (cosmetic markers), but a
+  // hardened blob crosses the wire as one packed voxel grid and the SERVER creates the volume, echoing back
+  // the index every peer must use. Rebuild streams its aim point and the server picks the chunk, answering
+  // on the `reattach` channel — the mirror of `detach`. Size Ray sends grow/shrink for a `vol:cid` debris
+  // chunk and the server steps and broadcasts the scale. Nothing here restructures an existing message.
 
   // Walk-mode dispatcher: Foam Cannon hold-spray spawn + Rebuild Gun hold-heal. (Size Ray fires on the
   // LMB/RMB edges routed through _handleFire.) Manages the foam spray loop audio every frame.
@@ -2480,7 +2559,7 @@ export class Weapons {
         this._spawnFoamProjectile(item);
       }
     } else this._foamSprayTimer = 0;
-    if (kind === "rebuildgun" && this.input.lmbDown && !this.net) this._tickRebuild(dt);
+    if (kind === "rebuildgun" && this.input.lmbDown) { if (this.net) this._tickRebuildNet(dt); else this._tickRebuild(dt); }
     else this._rebuildAcc = 0;
   }
 
@@ -2526,12 +2605,22 @@ export class Weapons {
       }
       this._foamProj = keep;
     }
-    // Harden blobs idle for hardenDelay (solo only — MP foam is cosmetic, so no soft blobs ever exist there).
+    // Harden blobs idle for hardenDelay. Runs in MP too: the soft blob is local, but hardening it now sends
+    // the grid to the server instead of creating a volume here (see _hardenFoamBlob).
     if (this._foamBlobs.length) {
       const due = [];
       for (const b of this._foamBlobs) if (this._time - b.lastSpray > fm.hardenDelay) due.push(b);
       for (const b of due) this._hardenFoamBlob(b);
     }
+    // MP: drain the harden queue no faster than the server accepts it.
+    if (this._foamOut.length) {
+      this._foamOutT -= dt;
+      if (this._foamOutT <= 0) {
+        const job = this._foamOut.shift();
+        this._foamOutT = FOAM_OUT_INTERVAL;
+        this.net.sendFoam(job.o, job.d, job.bits);
+      }
+    } else this._foamOutT = 0;
   }
 
   // Is `pos` adjacent (within one lattice cell) to any existing soft-foam cell? Enables mid-air bridge growth.
@@ -2548,9 +2637,11 @@ export class Weapons {
     return false;
   }
 
+  // Accretion is client-local in BOTH modes: the soft blob is a pile of pooled marker cubes with no bodies
+  // and no damage, so it costs the wire nothing and gives the sprayer immediate feedback. Only the hardened
+  // result is authored by the server (see _hardenFoamBlob). Other players do not see the soft spray.
   _landFoam(point) {
     this._foamSplat(point);
-    if (this.net) return; // MP stub (flagged): foam is cosmetic on a replica — no accretion / no harden
     const cell = W.foam.cell;
     const gx = Math.floor(point.x / cell), gy = Math.floor(point.y / cell), gz = Math.floor(point.z / cell);
     const blob = this._foamTargetBlob(gx, gy, gz);
@@ -2595,25 +2686,75 @@ export class Weapons {
     if (i >= 0) this._foamBlobs.splice(i, 1);
     for (const mk of blob.cells.values()) this._releaseFoamMarker(mk);
     if (blob.cells.size === 0) return;
-    const D = CONFIG.destruction;
     const cell = W.foam.cell;
     const [minx, miny, minz] = blob.min;
     const nx = blob.max[0] - minx + 1, ny = blob.max[1] - miny + 1, nz = blob.max[2] - minz + 1;
     const cells = blob.cells;
-    const spec = {
-      name: "foam", voxelSize: cell, dims: [nx, ny, nz], origin: [minx * cell, miny * cell, minz * cell],
-      palette: [
-        { color: "#e6eaec", roughness: 0.95, metalness: 0.0 },
-        { color: "#c6cace", roughness: 0.95, metalness: 0.0 },
-      ],
-      fill: (x, y, z) => cells.has((minx + x) + "," + (miny + y) + "," + (minz + z)) ? 1 : 0,
-      density: D.density.foam, threshold: D.forceThreshold.foam, chunkSize: D.matChunkSize.foam,
-      kind: "single", materialClass: "foam",
-    };
-    const vol = this.destruction.addVolume(spec);
+    const occupied = (x, y, z) => (cells.has((minx + x) + "," + (miny + y) + "," + (minz + z)) ? 1 : 0);
+    if (this.net) {
+      // MP: brand-new world geometry must be server-authored or the clients diverge on the spot. Send the
+      // grid as one packed bitmap and wait for foam_add — even the sprayer builds nothing locally, so the
+      // volume can only ever appear at the index the server assigned. Harden audio plays on receipt.
+      const bits = packBits(nx * ny * nz, (li) => occupied(li % nx, ((li / nx) | 0) % ny, (li / (nx * ny)) | 0));
+      this._foamOut.push({ o: [minx, miny, minz], d: [nx, ny, nz], bits });
+      while (this._foamOut.length > FOAM_OUT_MAX) this._foamOut.shift(); // bounded: drop the oldest, never grow
+      return;
+    }
+    const vol = this.destruction.addVolume(foamVolumeSpec([minx, miny, minz], [nx, ny, nz], occupied));
     this._foamVols.push(vol);
     while (this._foamVols.length > W.foam.maxVolumes) this.destruction.despawnVolume(this._foamVols.shift());
-    this.audio.foamHarden(this._camPos().distanceTo(new THREE.Vector3((minx + nx / 2) * cell, (miny + ny / 2) * cell, (minz + nz / 2) * cell)));
+    this._foamHardenAudio([minx, miny, minz], [nx, ny, nz]);
+  }
+
+  _foamHardenAudio(o, d) {
+    const cell = W.foam.cell;
+    this.audio.foamHarden(this._camPos().distanceTo(
+      new THREE.Vector3((o[0] + d[0] / 2) * cell, (o[1] + d[1] / 2) * cell, (o[2] + d[2] / 2) * cell)
+    ));
+  }
+
+  // --- MP builder hooks (called by replication.js; never reached in solo) ----------------------
+  // Server authored a hardened blob. Build it at the server's index — addVolumeAt pads any gap with husks
+  // so the slot arithmetic cannot drift even if this client somehow missed an earlier blob.
+  applyNetFoam(volIdx, o, d, bits) {
+    if (!Array.isArray(o) || !Array.isArray(d)) return;
+    const nx = d[0], ny = d[1], nz = d[2];
+    const bytes = unpackBits(bits, nx * ny * nz);
+    if (!bytes) { console.warn("[net] foam_add with an undecodable bitmap — skipped, expect a foam desync"); return; }
+    const spec = foamVolumeSpec(o, d, (x, y, z) => bitAt(bytes, x + nx * (y + ny * z)));
+    const vol = this.destruction.addVolumeAt(volIdx, spec);
+    if (!vol) { console.warn(`[net] foam_add for volume ${volIdx} but slot ${volIdx} is taken — foam desync`); return; }
+    this._foamVols.push(vol);
+    this._foamHardenAudio(o, d);
+  }
+  // Server evicted a blob at the live-foam cap. Slot stays reserved (despawnVolume leaves a husk).
+  removeNetFoam(volIdx) {
+    const vol = this.destruction.volumes[volIdx];
+    if (!vol) return;
+    this.destruction.despawnVolume(vol);
+    this._foamVols = this._foamVols.filter((v) => v !== vol);
+  }
+  // Server rescaled a debris chunk (Size Ray). One float; the mass/collider rules already ran server-side,
+  // this just makes the local body and mesh agree with it.
+  applyNetScale(volIdx, cid, s) {
+    const entry = this.destruction.findDebrisByRef(volIdx, cid);
+    if (!entry) return;
+    const prev = entry.sizeScale || 1;
+    const hc = this.destruction.chunkHalfCenter(entry.chunk, s);
+    if (!this.destruction.rescaleDebris(entry, hc.half, hc.center, s)) return;
+    entry.sizeScale = s;
+    if (entry.mesh) this._startSizeLerp(entry.mesh, s);
+    this._trackSized(entry);
+    const at = entry.mesh ? entry.mesh.position : entry.chunk.centroid;
+    this.audio[s > prev ? "sizeGrow" : "sizeShrink"](this._camPos().distanceTo(at));
+  }
+  // Server restored chunks (Rebuild Gun). The inverse of the detach stream, on its own channel.
+  applyNetReattach(events) {
+    for (const e of events || []) {
+      const vol = this.destruction.volumes[e[0]];
+      const chunk = vol && vol.chunks[e[1]];
+      if (this.destruction.applyReattach(e[0], e[1]) && chunk) this._rebuildSettle(chunk.centroid);
+    }
   }
 
   _foamSplat(point) {
@@ -2638,6 +2779,20 @@ export class Weapons {
       this._rebuildAcc -= per;
       this._startGhost(cand.vol, cand.chunk);
     }
+  }
+  // MP Rebuild: the server owns "which chunk restores", so the client only streams where it is pointing, at
+  // the same rate the solo tool restores chunks. The 0.2 s ghost preview is solo-only — previewing a chunk
+  // this client did not pick would show the wrong one, and the reattach round-trip is already the delay.
+  _tickRebuildNet(dt) {
+    const rb = W.rebuild;
+    this._rebuildAcc += dt;
+    const per = 1 / rb.rate;
+    if (this._rebuildAcc < per) return;
+    this._rebuildAcc = 0;
+    const origin = this._camPos();
+    const dir = this._aimDir();
+    const hit = this.world.castRay(new this.RAPIER.Ray(origin, dir), rb.aimRange, true, undefined, undefined, undefined, this.player.body);
+    this.net.sendRebuild(origin.clone().addScaledVector(dir, hit ? hit.toi : rb.aimRange));
   }
   _ghostBusy(chunk) { for (const g of this._rebuildGhosts) if (g.chunk === chunk) return true; return false; }
   _startGhost(vol, chunk) {
@@ -2671,20 +2826,71 @@ export class Weapons {
 
   // --- 7c. Size Ray: LMB shrink x0.6 / RMB enlarge x1.6 on debris chunks + dynamic props only -------------
   _sizeZap(grow) {
-    if (this.net) return; // MP stub (flagged): scale would be one synced float on a server-owned body
     const sr = W.sizeRay;
     const origin = this._camPos();
     const dir = this._aimDir();
     const ray = new this.RAPIER.Ray(origin, dir);
     const hit = this.world.castRay(ray, sr.range, true, undefined, undefined, undefined, this.player.body);
-    if (!hit) return;
+    if (!hit) { this._sizeRefused("no target"); return; }
     const handle = hit.collider.handle;
-    const entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
-    if (entry) { this._sizeApplyDebris(entry, grow); return; }
-    const tank = this.findPropByCollider(handle); // dynamic prop (propane tank)
+    let entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
+    let tank = entry ? null : this.findPropByCollider(handle); // dynamic prop (propane tank)
+    if (!entry && !tank) {
+      // The hairline ray landed on the ground/wall behind the rubble. Before refusing, take the valid
+      // target closest to the aim LINE (never further along it than the surface the ray actually hit).
+      const near = this._nearestSizeTarget(origin, dir, hit.toi + SIZE_AIM_RADIUS);
+      entry = near.entry; tank = near.tank;
+    }
+    if (entry) {
+      // MP: a debris chunk is `vol:cid`, the one identity that is stable across peers. Send the intent and
+      // let the server step and broadcast the scale — applying it here first would fight the broadcast.
+      // The propane tank below is NOT networked at all yet (it is a client-local body in MP), so scaling it
+      // locally is the consistent behaviour until props get replicated.
+      if (this.net) { this.net.sendZap(entry.vol.id, entry.chunk.id, grow); return; }
+      this._sizeApplyDebris(entry, grow); return;
+    }
     if (tank) { this._sizeApplyProp(tank, grow); return; }
-    // Refused: ground / attached structure / vehicle / player — brief strain feedback, no scaling.
-    this._strainT = W.gravityGun.strainTime; this._recoilPitch += 0.03;
+    // Refused: ground / attached structure / vehicle / player.
+    this._sizeRefused("debris and loose props only");
+  }
+
+  // Valid Size Ray target whose centre lies closest to the aim LINE (not to the ray's impact point:
+  // a hairline ray that slips past a chunk lands on the floor behind it, which is metres away from the
+  // chunk the player was clearly pointing at). Only targets in front of the camera and no further than
+  // the surface the ray actually hit are considered, so this never reaches through a wall.
+  _nearestSizeTarget(origin, dir, maxAlong) {
+    let entry = null, tank = null, best = SIZE_AIM_RADIUS * SIZE_AIM_RADIUS;
+    const rel = new THREE.Vector3();
+    const test = (pos) => {
+      rel.copy(pos).sub(origin);
+      const along = rel.dot(dir);
+      if (along <= 0 || along > maxAlong) return -1;
+      return rel.addScaledVector(dir, -along).lengthSq(); // squared perpendicular distance to the aim line
+    };
+    this.destruction.forEachDebris((d) => {
+      if (!d.mesh) return;
+      const q = test(d.mesh.position);
+      if (q >= 0 && q < best) { best = q; entry = d; tank = null; }
+    });
+    for (const t of this.propaneTanks) {
+      if (t.disposed || !t.mesh) continue;
+      const q = test(t.mesh.position);
+      if (q >= 0 && q < best) { best = q; tank = t; entry = null; }
+    }
+    return { entry, tank };
+  }
+
+  // A refused zap must be legible: strain wobble + a dud clang + the reason on the tool label.
+  _sizeRefused(why) {
+    this._strainT = W.gravityGun.strainTime;
+    this._recoilPitch += 0.03;
+    this.audio.clang(false);
+    if (!this._label || this.activeCat < 0) return;
+    this._labelNum.textContent = String(this.categories[this.activeCat].num);
+    this._labelName.textContent = "Size Ray — " + why;
+    this._label.style.opacity = "1";
+    clearTimeout(this._labelTimer);
+    this._labelTimer = setTimeout(() => { this._label.style.opacity = "0"; }, VM.labelSeconds * 1000);
   }
   // Local half-extents (unscaled mesh bbox * scale) + its center offset, for the replacement cuboid collider.
   _meshHalfCenter(mesh, scale) {
@@ -2704,7 +2910,7 @@ export class Weapons {
     if (Math.abs(ns - cur) < 1e-3) return; // already at a clamp limit
     entry.sizeCd = this._time;
     const hc = this._meshHalfCenter(entry.mesh, ns);
-    this.destruction.rescaleDebris(entry, hc.half, hc.center);
+    this.destruction.rescaleDebris(entry, hc.half, hc.center, ns); // ns => mass tracks scale^3 exactly
     entry.sizeScale = ns;
     this._startSizeLerp(entry.mesh, ns);
     this._trackSized(entry);
@@ -2764,6 +2970,8 @@ export class Weapons {
     this._foamBlobs.length = 0;
     for (const vol of this._foamVols) this.destruction.despawnVolume(vol);
     this._foamVols.length = 0;
+    this._foamOut.length = 0; // MP: a reset cancels blobs that had not been uploaded yet
+    this._foamOutT = 0;
     this._foamSprayTimer = 0;
     for (const g of this._rebuildGhosts) { this.scene.remove(g.mesh); g.mesh.geometry.dispose(); }
     this._rebuildGhosts.length = 0;

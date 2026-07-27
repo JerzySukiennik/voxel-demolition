@@ -14,18 +14,29 @@ export const C2S = {
   ENTER_VEH: "enter_veh", // vid                              (E near vehicle)
   EXIT_VEH: "exit_veh",  // vid, p                            (E while driving)
   SPAWN_VEH: "spawn_veh", // id, yaw                          (Tab pick)
-  DMG: "dmg",           // {kind:"point",vol,cid,src,force} | {kind:"radial",p,force,radius}
+  // dmg kinds: {kind:"point",vol,cid,src,force} | {kind:"radial",p,force,radius}
+  //          | {kind:"carve",p,dir,len,radius,force,budget}   (Orbital Laser / airstrike Penetrator / Car Cannon)
+  DMG: "dmg",
   C4_PLACE: "c4_place", // p, q, vid                          (LMB place)
   C4_DET: "c4_det",     // -                                  (RMB detonate own charges)
   ROCKET: "rocket",     // rid, p, dir                        (launch, visual relay)
   ROCKET_END: "rocket_end", // rid, p                         (hit / lifetime end)
   FX: "fx",             // kind:"swing"|"clang"|"gunshot", p  (fx with no other message)
   RESET: "reset",       // -                                  (ESC Reset)
+  FOAM: "foam",         // o:[gx,gy,gz], d:[nx,ny,nz], bits   (hardened foam blob -> server authors the volume)
+  ZAP: "zap",           // vol, cid, g                        (Size Ray on a debris chunk; g=1 grow, 0 shrink)
+  REBUILD: "rebuild",   // p                                  (Rebuild Gun aim point, sent at the tool's rate)
 };
 
 // Server -> Client.
 export const S2C = {
   WELCOME: "welcome",   // pid, mapId, snap, players:[{pid,nick,avatar}]
+  // Sent the instant a hello is accepted, BEFORE the server builds the map. Building a cold session is
+  // seconds of blocking work (town is ~2500 chunks of Voronoi + colliders), and the client used to give
+  // up on welcome after 3 s and drop silently into solo — so the FIRST player onto a fresh server always
+  // ended up offline, the session emptied, tore down, and the next attempt was cold again. This ack lets
+  // the client tell "no server" apart from "server is busy building" and wait as long as the build needs.
+  HOLD: "hold",         // mapId, building:true
   FULL: "full",         // reason
   SESSION: "session",   // active, mapId, count               (pushed on WS open, pre-hello)
   JOIN: "join",         // pid, nick, avatar
@@ -45,6 +56,10 @@ export const S2C = {
   FX: "fx",             // kind, pid, p                       (relay)
   RESET: "reset",       // by (pid)
   WARN: "warn",         // msg
+  FOAM_ADD: "foam_add", // vol, o:[gx,gy,gz], d:[nx,ny,nz], bits   (server-assigned volume index — see below)
+  FOAM_RM: "foam_rm",   // vol                                     (live-foam cap eviction / reset)
+  SCALE: "scale",       // vol, cid, s                             (Size Ray result, one float per body)
+  REATTACH: "reattach", // events:[[vol,cid],...]                  (Rebuild Gun — the mirror of `detach`)
 };
 
 // Flat list of every distinct wire type (rocket/rocket_end/fx/reset are shared C2S<->S2C). Used by the
@@ -54,6 +69,8 @@ export const MESSAGE_TYPES = [
   "c4_place", "c4_det", "rocket", "rocket_end", "fx", "reset",
   "welcome", "full", "session", "join", "leave", "pstate", "vstate", "detach", "debris",
   "debris_rm", "veh_spawn", "veh_rm", "seat", "c4_add", "c4_boom", "warn",
+  // Phase 7 batch D builders, added without restructuring any existing message.
+  "foam", "zap", "rebuild", "foam_add", "foam_rm", "scale", "reattach",
 ];
 
 // Server->client snapshot types: every message of these types fully supersedes the previous one, so a
@@ -129,6 +146,43 @@ export const CAPS = {
   dmgWithinSenderM: 20,      // dmg pos must be within this of the sender (+ map AABB)
   c4MaxPerPlayer: 20,
   stateTeleportMax: 30,      // > this per tick => clamp server capsule + log
+
+  // --- kind:"carve" (Orbital Laser, airstrike Penetrator, Car Cannon) --------------------------
+  // A carve is ONE authoritative carveCylinder, not a clamped sphere: a 40 m column has to punch through
+  // several floors, which a single radial never could. Every ceiling here is >= the largest legitimate
+  // gameplay value so real play always passes: force 60000 = orbital/penetrator force, radius 2.0 =
+  // destruction.vehicleSweepRadius (the widest carve any tool asks for), len 60 > orbital throughGround 40.
+  carveForceMax: 60000,
+  carveRadiusMax: 2.0,
+  carveLenMax: 60,
+  carveBudgetMax: 240,       // = weapons.orbital.carveBudget, the largest carve budget in the game
+  // The Orbital's designation raycast reaches 200 m, but every shipped map fits inside a ~125 m diagonal
+  // and _posValid already clamps the point to the map AABB + margin, so this is the second fence, not the
+  // first. Sized to admit any legitimate designation on the biggest map.
+  carveWithinSenderM: 120,
+  // Own timer (player.lastCarve), NOT the shared point/radial one: the Orbital's 3 s countdown overlaps
+  // with whatever else the player is shooting, and a chainsaw stream must not eat the strike.
+  dmgMinIntervalCarveSec: 0.15,
+
+  // --- Foam Cannon (kind-free message `foam`) --------------------------------------------------
+  // The client sends a hardened blob as a packed occupancy bitmap; the SERVER creates the volume and
+  // echoes it with the index it landed on, so volume ids stay identical on every peer.
+  foamMinIntervalSec: 0.4,   // hardenDelay is 1.5 s, so this only bites on a flood
+  foamDimMax: 128,           // per-axis cell count
+  foamVoxelMax: 65536,       // nx*ny*nz ceiling (8 KB of bitmap) before any decode work happens
+  foamWithinSenderM: 40,     // blob origin must be near the sprayer (foam projRange is 16 m)
+
+  // --- Size Ray (`zap`) ------------------------------------------------------------------------
+  // The client never sends a scale: it sends grow/shrink and the server steps its own authoritative value,
+  // then clamps to weapons.sizeRay.min/max. Per-TARGET cooldown is the gameplay value; this is the
+  // per-PLAYER floodgate.
+  zapMinIntervalSec: 0.12,
+  zapWithinSenderM: 45,      // weapons.sizeRay.range is 40
+
+  // --- Rebuild Gun (`rebuild`) -----------------------------------------------------------------
+  // Client streams its aim point while LMB is held; the server picks the chunk (oldest damage first).
+  rebuildMinIntervalSec: 0.2, // weapons.rebuild.rate is 4/s
+  rebuildWithinSenderM: 45,   // weapons.rebuild.aimRange is 40
 };
 
 // Reconciliation thresholds for the driver's own vehicle (brief section 1).
@@ -154,6 +208,59 @@ export const packV = packP;
 export function packQ(q) {
   if (Array.isArray(q)) return [q3(q[0]), q3(q[1]), q3(q[2]), q3(q[3])];
   return [q3(q.x), q3(q.y), q3(q.z), q3(q.w)];
+}
+
+// --- Occupancy-bitmap codec (Foam Cannon) ----------------------------------------------------
+// A hardened foam blob is a dense voxel grid; sending it as JSON booleans would be ~10x the bytes and
+// would blow the message size on a big bridge. One bit per voxel, x fastest then y then z (the same
+// linear order buildVolume's fill() is sampled in), base64 over the packed bytes. Hand-rolled base64 so
+// this file keeps its no-dependency promise: the browser has btoa, Node has Buffer, and neither is
+// guaranteed to be the one running this module.
+const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const B64_INV = (() => { const m = new Int8Array(128).fill(-1); for (let i = 0; i < 64; i++) m[B64_CHARS.charCodeAt(i)] = i; return m; })();
+
+export function bitsByteLength(voxelCount) { return (voxelCount + 7) >> 3; }
+
+// occupied(i) -> truthy for a filled voxel at linear index i. Returns a base64 string.
+export function packBits(voxelCount, occupied) {
+  const bytes = new Uint8Array(bitsByteLength(voxelCount));
+  for (let i = 0; i < voxelCount; i++) if (occupied(i)) bytes[i >> 3] |= 1 << (i & 7);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    const has1 = i + 1 < bytes.length, has2 = i + 2 < bytes.length;
+    out += B64_CHARS[b0 >> 2];
+    out += B64_CHARS[((b0 & 3) << 4) | (has1 ? b1 >> 4 : 0)];
+    out += has1 ? B64_CHARS[((b1 & 15) << 2) | (has2 ? b2 >> 6 : 0)] : "=";
+    out += has2 ? B64_CHARS[b2 & 63] : "=";
+  }
+  return out;
+}
+
+// Inverse of packBits. Returns a Uint8Array of exactly bitsByteLength(voxelCount) bytes, or null if the
+// string is malformed or the wrong length for the declared voxel count (server-side validation).
+export function unpackBits(str, voxelCount) {
+  if (typeof str !== "string") return null;
+  const want = bitsByteLength(voxelCount);
+  const clean = str.endsWith("==") ? str.slice(0, -2) : str.endsWith("=") ? str.slice(0, -1) : str;
+  if (((clean.length * 6) >> 3) !== want) return null;
+  const out = new Uint8Array(want);
+  let acc = 0, bits = 0, o = 0;
+  for (let i = 0; i < clean.length; i++) {
+    const c = clean.charCodeAt(i);
+    const v = c < 128 ? B64_INV[c] : -1;
+    if (v < 0) return null;
+    acc = (acc << 6) | v; bits += 6;
+    if (bits >= 8) { bits -= 8; out[o++] = (acc >> bits) & 0xff; }
+  }
+  return o === want ? out : null;
+}
+
+export function bitAt(bytes, i) { return (bytes[i >> 3] >> (i & 7)) & 1; }
+export function countBits(bytes) {
+  let n = 0;
+  for (let i = 0; i < bytes.length; i++) { let b = bytes[i]; while (b) { n += b & 1; b >>= 1; } }
+  return n;
 }
 
 // Driving input bitfield helpers (NetInput on the server reads the same 7 fields). Kept as an

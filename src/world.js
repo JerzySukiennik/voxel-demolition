@@ -1,4 +1,4 @@
-// world.js - scene/sun/gradient sky + IBL with per-map env, generalized indestructible core, water plane, static cliffs, shadow follow
+// world.js - scene/sun/gradient sky + IBL with per-map env, indestructible bedrock core + edge borders, water plane, static cliffs, shadow follow
 import * as THREE from "three";
 import { CONFIG } from "./config.js";
 import { buildGeometry, jitterBucket, jitteredColor } from "./voxel.js";
@@ -207,16 +207,21 @@ function normRect(r) {
   };
 }
 
-// Indestructible core: fixed collider(s) with their top surface at y=0 + a static jittered visual layer.
-// Dry maps (no waterRect) build ONE flat cuboid, byte-identical to before. With a waterRect the core is a
-// "picture frame" of up to 4 cuboids around the rect (a single Rapier cuboid can't have a hole), and the
-// rect opening becomes an excavated basin: a deep floor cuboid (top at basinFloorY) + 4 retaining walls
-// (basinFloorY -> skinThickness) so the pond reads as a real recessed bowl and boats float at true depth.
+// Indestructible core = BEDROCK: fixed collider(s) whose top surface sits at bedrockY
+// (skinThickness - groundDepth, i.e. -2.7 m) plus a static jittered visual layer. It used to top out at
+// y=0, one voxel under the ground skin; it now sits a full groundDepth below the surface so the two
+// destructible ground strata above it can be mined out and this is what a finished mine shaft bottoms on.
+// Dry maps (no waterRect) build ONE flat cuboid. With a waterRect the core is a "picture frame" of up to
+// 4 cuboids around the rect (a single Rapier cuboid can't have a hole), and the rect opening becomes an
+// excavated basin: a deep floor cuboid (top at basinFloorY) + 4 retaining walls (basinFloorY ->
+// skinThickness) so the pond reads as a real recessed bowl and boats float at true depth. basinFloorY
+// (-2.6) still lands just above bedrock, so the pond bottom and the mine floor read as the same stratum.
 export function createCore(scene, world, RAPIER, materials, size, color, waterRect) {
   const halfX = size.x / 2, halfZ = size.z / 2;
   const rect = normRect(waterRect);
+  const bedrock = W.skinThickness - W.groundDepth;
 
-  // All core geometry hangs off one fixed body; colliders carry their own offsets (top surface at y=0).
+  // All core geometry hangs off one fixed body; colliders carry their own offsets (top surface at bedrock).
   const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0));
   const halfT = W.coreThickness / 2;
   const slab = (cx, cz, hx, hz, cy, hy) => {
@@ -228,15 +233,16 @@ export function createCore(scene, world, RAPIER, materials, size, color, waterRe
     world.createCollider(cd, body);
   };
 
+  const coreCy = bedrock - halfT; // cuboid centre so its top face lands exactly on bedrock
   if (!rect) {
-    // Flat map-sized core cuboid, top at y=0 (unchanged behavior).
-    slab(0, 0, halfX, halfZ, -halfT, halfT);
+    // Flat map-sized core cuboid, top at bedrock.
+    slab(0, 0, halfX, halfZ, coreCy, halfT);
   } else {
     // Picture frame: west/east strips span full depth; north/south strips fill the rect's x-span only.
-    slab((-halfX + rect.x0) / 2, 0, (rect.x0 + halfX) / 2, halfZ, -halfT, halfT);                                  // west
-    slab((rect.x1 + halfX) / 2, 0, (halfX - rect.x1) / 2, halfZ, -halfT, halfT);                                   // east
-    slab((rect.x0 + rect.x1) / 2, (-halfZ + rect.z0) / 2, (rect.x1 - rect.x0) / 2, (rect.z0 + halfZ) / 2, -halfT, halfT); // north
-    slab((rect.x0 + rect.x1) / 2, (rect.z1 + halfZ) / 2, (rect.x1 - rect.x0) / 2, (halfZ - rect.z1) / 2, -halfT, halfT);  // south
+    slab((-halfX + rect.x0) / 2, 0, (rect.x0 + halfX) / 2, halfZ, coreCy, halfT);                                  // west
+    slab((rect.x1 + halfX) / 2, 0, (halfX - rect.x1) / 2, halfZ, coreCy, halfT);                                   // east
+    slab((rect.x0 + rect.x1) / 2, (-halfZ + rect.z0) / 2, (rect.x1 - rect.x0) / 2, (rect.z0 + halfZ) / 2, coreCy, halfT); // north
+    slab((rect.x0 + rect.x1) / 2, (rect.z1 + halfZ) / 2, (rect.x1 - rect.x0) / 2, (halfZ - rect.z1) / 2, coreCy, halfT);  // south
 
     // Excavated basin under the rect: indestructible floor + 4 retaining walls (all fixed core geometry).
     const floorY = W.basinFloorY, ft = W.basinFloorThickness, wt = W.basinWallThickness, wallTop = W.skinThickness;
@@ -250,16 +256,17 @@ export function createCore(scene, world, RAPIER, materials, size, color, waterRe
     slab(rect.x1, cz, wh, hz, wallCy, wallHy);                                         // east wall (x1)
   }
 
-  // Visual: one static voxel layer, top surface at y=0, same look as the destructible skin. Carved out of
-  // the pond rect (the basin supplies its own submerged floor/wall mesh below).
+  // Visual: one static voxel layer, top surface at bedrock — the floor of the world and of every mine
+  // the players dig. Coloured bedrockColor (not the surface colour) so breaking through the last stratum
+  // visibly bottoms out on stone. Carved out of the pond rect (the basin supplies its own mesh below).
   const vs = W.skinVoxel;
   const nX = Math.round(size.x / vs), nZ = Math.round(size.z / vs);
-  const base = new THREE.Color().setStyle(color || W.groundColor);
+  const base = new THREE.Color().setStyle(W.bedrockColor || color || W.groundColor);
   const inRect = (wx, wz) => rect && wx > rect.x0 && wx < rect.x1 && wz > rect.z0 && wz < rect.z1;
   const geo = buildGeometry({
     dims: [nX, 1, nZ],
     voxelSize: vs,
-    origin: [-halfX, -vs, -halfZ],
+    origin: [-halfX, bedrock - vs, -halfZ],
     get: (x, y, z) => (inRect(-halfX + (x + 0.5) * vs, -halfZ + (z + 0.5) * vs) ? 0 : 1),
     mergeKey: (x, y, z) => jitterBucket(x, y, z),
     colorAt: (x, y, z, pidx, out) => jitteredColor(base, x, y, z, out),
@@ -387,14 +394,118 @@ export function createWater(scene, water) {
   };
 }
 
-// Indestructible static cliff terraces (canyon boundary). Returns { colliderCount, meshes }.
+// Indestructible static geometry: cliff terraces (canyon) + the map-edge border ring.
+// Returns { colliderCount, meshes }.
 export function buildStaticGeo(scene, world, RAPIER, materials, entries) {
   let colliderCount = 0;
   const meshes = [];
   for (const e of entries || []) {
     if (e.type === "cliff") colliderCount += buildCliff(scene, world, RAPIER, materials, e, meshes);
+    else if (e.type === "border") colliderCount += buildBorder(scene, world, RAPIER, materials, e, meshes);
   }
   return { colliderCount, meshes };
+}
+
+// Map-edge border: a stepped embankment on all four sides so nothing can fall or be launched off the
+// world. FIXED core geometry only — it owns no chunks, is never destructible and never enters
+// allowedImpactors, so a car that slams into it just bounces (exactly like the basin retaining walls).
+//
+// Per edge: `steps` terrace cuboids (tallest at the outer face, stepping down toward the map) whose tops
+// track a matching coarse voxel mesh, plus ONE thin cuboid at the very outer face that continues up to
+// border.wallHeight. That last one is the only invisible part: it stands above the visible crest, at the
+// extreme edge of the map, so you meet it only after you have already climbed the berm — while a car at
+// full speed, a Car Cannon round or a low pass in a hover/heli is stopped cold.
+//
+// Each cuboid runs from bedrock up, not from the surface: the ground under the berm is diggable now, and
+// a trench at its foot must not open a gap underneath.
+function buildBorder(scene, world, RAPIER, materials, e, meshes) {
+  const B = W.border;
+  const size = e.size;
+  const halfX = size.x / 2, halfZ = size.z / 2;
+  const width = e.width, height = e.height, steps = Math.max(1, e.steps | 0);
+  const cv = B.voxel;
+  const bedrock = W.skinThickness - W.groundDepth;
+  const base = new THREE.Color().setStyle(e.color);
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0, 0, 0));
+  let count = 0;
+
+  // Terrace top (world Y) as a function of inward distance t from the outer face.
+  const topAt = (t) => {
+    const k = Math.min(steps - 1, Math.max(0, Math.floor((t / width) * steps)));
+    return W.skinThickness + (height * (steps - k)) / steps;
+  };
+
+  const slab = (cx, cz, hx, hz, top) => {
+    if (hx <= 1e-4 || hz <= 1e-4) return;
+    const hy = (top - bedrock) / 2;
+    if (hy <= 1e-4) return;
+    const cd = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
+      .setTranslation(cx, bedrock + hy, cz)
+      .setFriction(0.9)
+      .setRestitution(0.0);
+    world.createCollider(cd, body);
+    count++;
+  };
+
+  // axis: "x" = the N/S edges (run along X, span the full width of the map so they own the corners),
+  //       "z" = the E/W edges (run along Z, inset by `width` at both ends).
+  // sign: -1 = the low-coordinate edge, +1 = the high one. `out` points away from the map centre.
+  const edges = [
+    { axis: "x", sign: -1 }, { axis: "x", sign: 1 },
+    { axis: "z", sign: -1 }, { axis: "z", sign: 1 },
+  ];
+  for (const ed of edges) {
+    const alongX = ed.axis === "x";
+    const runHalf = alongX ? halfX : Math.max(0, halfZ - width);
+    if (runHalf <= 1e-4) continue;
+    const outer = (alongX ? halfZ : halfX) * ed.sign; // world coord of the outer face on the cross axis
+
+    // Colliders: one per terrace band + the tall clearance wall at the outer face.
+    for (let k = 0; k < steps; k++) {
+      const t0 = (k / steps) * width, t1 = ((k + 1) / steps) * width;
+      const c = outer - ed.sign * (t0 + t1) / 2;
+      const h = (t1 - t0) / 2;
+      const top = topAt((t0 + t1) / 2);
+      if (alongX) slab(0, c, runHalf, h, top); else slab(c, 0, h, runHalf, top);
+    }
+    const wt = B.wallThickness / 2, wc = outer - ed.sign * wt;
+    const wallTop = W.skinThickness + B.wallHeight;
+    if (alongX) slab(0, wc, runHalf, wt, wallTop); else slab(wc, 0, wt, runHalf, wallTop);
+
+    // Matching voxel mesh. Local axes: u = along the run, y = up, t = inward from the outer face.
+    const nU = Math.max(1, Math.round((2 * runHalf) / cv));
+    const nT = Math.max(1, Math.round(width / cv));
+    const nY = Math.max(1, Math.round((W.skinThickness + height - bedrock) / cv));
+    const seed = alongX ? (ed.sign > 0 ? 17 : 41) : (ed.sign > 0 ? 63 : 89);
+    const solid = (u, y, t) => {
+      const wy = bedrock + (y + 0.5) * cv;
+      if (wy < W.skinThickness) return 1;            // buried foundation: full width, seen only if dug out
+      return wy < topAt((t + 0.5) * cv) ? 1 : 0;     // stepped berm above the surface
+    };
+    const geo = buildGeometry({
+      dims: alongX ? [nU, nY, nT] : [nT, nY, nU],
+      voxelSize: cv,
+      origin: alongX
+        ? [-runHalf, bedrock, ed.sign > 0 ? outer - width : outer]
+        : [ed.sign > 0 ? outer - width : outer, bedrock, -runHalf],
+      get: (x, y, z) => {
+        const u = alongX ? x : z;
+        const ti = alongX ? z : x;
+        // t is measured from the OUTER face, so the local index runs backwards on the high-coord edges.
+        const t = ed.sign > 0 ? nT - 1 - ti : ti;
+        return solid(u, y, t);
+      },
+      mergeKey: (x, y, z) => jitterBucket(x + seed, y, z),
+      colorAt: (x, y, z, pidx, out) => jitteredColor(base, x + seed, y, z, out),
+      groupAt: () => 0,
+    });
+    const mesh = new THREE.Mesh(geo, materials);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+  return count;
 }
 
 // One terraced cliff run from->to: stepped strata rising outward, meshed as coarse voxels,

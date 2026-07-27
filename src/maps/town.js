@@ -1,5 +1,5 @@
 // Fallbrook — small crossroads town map (72x72). All names/signage invented; zero copied wordmarks.
-import { MAT, groundSpec, wall, box, roof, building, tree, fence, cratePile, lampPost } from "./lib.js";
+import { MAT, groundVolumes, borderRing, pad, wall, box, roof, building, tree, fence, cratePile, lampPost } from "./lib.js";
 
 // Best-effort facade paint: preserves the MAT entry (threshold/density/chunkSize/palette) and adds a
 // tint hint. The frozen lib API (§3.1) exposes no paint parameter, so if lib ignores unknown keys the
@@ -99,7 +99,7 @@ const buildings = [
 
 // Trees (12): leafy + pine mix in yards and along the edges.
 const treeList = [
-  { x: -32, z: -6, kind: "pine" },
+  { x: -31, z: -6, kind: "pine" }, // pulled 1 m in so the crown clears the map-edge border berm
   { x: -17, z: -6, kind: "leafy" },
   { x: -9, z: -8, kind: "leafy" },
   { x: 14, z: -9, kind: "pine" },
@@ -152,28 +152,47 @@ const busShelter = [
   box({ origin: [-10.7, 2.4, 3.8], size: [3.4, 0.2, 2.4], mat: MAT.metal }),
 ];
 
+const SIZE = { x: 72, z: 72 };
+const SPAWN = { x: -20, z: 26, yaw: 0 };
+const HATCH = { x: -16, z: 22, yaw: 1.6 };
+const DECOR = [
+  { id: "pickup", x: -26, z: 6, yaw: 0 },
+  { id: "classic", x: 21, z: 16, yaw: 0 },
+  { id: "wagon", x: 25, z: 16, yaw: 0 },
+];
+
+// Everything that stands on the ground. groundVolumes flattens the terrain under each footprint, so the
+// hills only roll through the open yards, verges and field edges — nothing is left floating or buried.
+const structures = [
+  ...buildings,
+  ...treeList.flatMap((t) => tree({ x: t.x, z: t.z, height: t.kind === "pine" ? 5 : 4, kind: t.kind })),
+  ...fenceRuns.flatMap((f) => fence({ from: f.from, to: f.to, height: 1.1, mat: MAT.plank })),
+  ...lampSpots.map((l) => lampPost({ x: l.x, z: l.z })),
+  ...cratePile({ x: -25, z: -19, rows: 3 }),
+  ...welcomeSign,
+  ...busShelter,
+];
+
 export default {
   id: "town",
   name: "Fallbrook",
-  size: { x: 72, z: 72 },
-  spawn: { x: -20, z: 26, yaw: 0 },
-  hatchback: { x: -16, z: 22, yaw: 1.6 },
+  size: SIZE,
+  spawn: SPAWN,
+  hatchback: HATCH,
   env: { groundColor: "#7d8471" },
   water: null,
   volumes: [
-    groundSpec({ x: 72, z: 72 }, "#7d8471", patches),
-    ...buildings,
-    ...treeList.flatMap((t) => tree({ x: t.x, z: t.z, height: t.kind === "pine" ? 5 : 4, kind: t.kind })),
-    ...fenceRuns.flatMap((f) => fence({ from: f.from, to: f.to, height: 1.1, mat: MAT.plank })),
-    ...lampSpots.map((l) => lampPost({ x: l.x, z: l.z })),
-    ...cratePile({ x: -25, z: -19, rows: 3 }),
-    ...welcomeSign,
-    ...busShelter,
+    ...groundVolumes({
+      mapId: "town", size: SIZE, color: "#7d8471", patches, structures,
+      // Streets and forecourts are graded flat; so are the spawn point and every parked vehicle's pad.
+      flatRects: [
+        ...patches.map((p) => p.rect),
+        pad(SPAWN.x, SPAWN.z, 4), pad(HATCH.x, HATCH.z, 4),
+        ...DECOR.map((d) => pad(d.x, d.z, 4)),
+      ],
+    }),
+    ...structures,
   ],
-  staticGeo: [],
-  decorVehicles: [
-    { id: "pickup", x: -26, z: 6, yaw: 0 },
-    { id: "classic", x: 21, z: 16, yaw: 0 },
-    { id: "wagon", x: 25, z: 16, yaw: 0 },
-  ],
+  staticGeo: [borderRing({ size: SIZE, color: "#7f7a63" })],
+  decorVehicles: DECOR,
 };

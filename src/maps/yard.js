@@ -1,5 +1,5 @@
 // Graywater Freight Yard — industrial freight/warehouse map (Author B). All names/signage invented; axis-aligned; box/building/roof origins = min corner (matches engine addVolume), point props (container/cratePile/rockPile/lampPost/tree) = center.
-import { MAT, groundSpec, wall, box, roof, building, tree, fence, container, cratePile, rockPile, lampPost } from "./lib.js";
+import { MAT, groundVolumes, borderRing, pad, wall, box, roof, building, tree, fence, container, cratePile, rockPile, lampPost } from "./lib.js";
 
 // ---- container livery (rhythm: rust / blue / green / orange) ----
 const RUST = "#8a4a32", BLUE = "#2f5a80", GREEN = "#3f6a4a", ORANGE = "#c07a30";
@@ -7,7 +7,9 @@ const STRIPE = "#b6b9bc"; // warehouse floor markings (visual)
 const DIRT = "#7a6f5c";   // worn ground patches (visual)
 
 // ---- ground: 80x64, gray hardstand + dirt/worn patches + warehouse floor stripes ----
-const ground = groundSpec({ x: 80, z: 64 }, "#8a8d90", [
+// A working freight yard is graded, so the hills here are deliberately shallow (0.7 m) and only show on
+// the rough verges outside the perimeter fence and in the unpaved corners.
+const groundPatches = [
   // worn drive lanes / dirt
   { rect: { x0: -4, z0: 8, x1: 22, z1: 26 }, color: DIRT },   // gate -> yard approach
   { rect: { x0: 22, z0: -4, x1: 33, z1: 8 }, color: DIRT },   // office frontage
@@ -17,7 +19,7 @@ const ground = groundSpec({ x: 80, z: 64 }, "#8a8d90", [
   { rect: { x0: -32, z0: -8, x1: -10, z1: -6 }, color: STRIPE }, // drive-through lane
   { rect: { x0: -30, z0: -4, x1: -11, z1: -3 }, color: STRIPE }, // south bay line
   { rect: { x0: -30, z0: -13, x1: -11, z1: -12 }, color: STRIPE }, // north bay line
-]);
+];
 
 // =====================================================================
 // WAREHOUSE centerpiece — 22x14 m, h7, corrugated metal, flat roof.
@@ -180,12 +182,34 @@ const trees = [
 ];
 
 // =====================================================================
+const SIZE = { x: 80, z: 64 };
+const SPAWN = { x: 0, z: 26, yaw: 0 };            // at the south gate, facing into the yard
+const HATCH = { x: 0, z: 19, yaw: 0 };            // just inside the gate
+const DECOR = [
+  { id: "suv", x: 28, z: 6, yaw: 1.6 },           // by the office
+  { id: "pickup", x: -6, z: 24, yaw: 0 },         // by the gate
+];
+
+const structures = [
+  ...warehouse,
+  ...bridge,
+  ...office,
+  ...canopy,
+  ...guardHut,
+  ...perimeter,
+  ...containers,
+  ...crates,
+  gravel,
+  ...lamps,
+  ...trees,
+];
+
 export default {
   id: "yard",
   name: "Graywater Freight Yard",
-  size: { x: 80, z: 64 },
-  spawn: { x: 0, z: 26, yaw: 0 },                 // at the south gate, facing into the yard
-  hatchback: { x: 0, z: 19, yaw: 0 },             // just inside the gate
+  size: SIZE,
+  spawn: SPAWN,
+  hatchback: HATCH,
   env: {
     skyColor: 0x9ab4d0,
     fogColor: 0xa8bccd,
@@ -196,22 +220,19 @@ export default {
   },
   water: null,
   volumes: [
-    ground,
-    ...warehouse,
-    ...bridge,
-    ...office,
-    ...canopy,
-    ...guardHut,
-    ...perimeter,
-    ...containers,
-    ...crates,
-    gravel,
-    ...lamps,
-    ...trees,
+    ...groundVolumes({
+      mapId: "yard", size: SIZE, color: "#8a8d90", patches: groundPatches, structures,
+      hills: { height: 0.9, cell: 26 },
+      flatRects: [
+        ...groundPatches.map((p) => p.rect),
+        { x0: -32, z0: -14, x1: -10, z1: 0 },      // warehouse slab
+        { x0: -2, z0: 3, x1: 22, z1: 9 },          // loading-bridge apron
+        pad(SPAWN.x, SPAWN.z, 4), pad(HATCH.x, HATCH.z, 4),
+        ...DECOR.map((d) => pad(d.x, d.z, 4)),
+      ],
+    }),
+    ...structures,
   ],
-  staticGeo: [],
-  decorVehicles: [
-    { id: "suv", x: 28, z: 6, yaw: 1.6 },          // by the office
-    { id: "pickup", x: -6, z: 24, yaw: 0 },        // by the gate
-  ],
+  staticGeo: [borderRing({ size: SIZE, color: "#7d7f77" })],
+  decorVehicles: DECOR,
 };

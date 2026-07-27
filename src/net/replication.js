@@ -48,6 +48,12 @@ export class Replication {
     net.on(S2C.FX, (m) => this._onFx(m));
     net.on(S2C.RESET, (m) => this._onReset(m));
     net.on(S2C.WARN, (m) => console.warn("[net] server warning:", m.msg));
+    // Phase 7 batch D builders. Every one of these is a server DECISION being applied locally: the volume
+    // index, the scale and the restored chunk ids are all chosen by the host.
+    net.on(S2C.FOAM_ADD, (m) => this.weapons.applyNetFoam(m.vol, m.o, m.d, m.bits));
+    net.on(S2C.FOAM_RM, (m) => this.weapons.removeNetFoam(m.vol));
+    net.on(S2C.SCALE, (m) => this.weapons.applyNetScale(m.vol, m.cid, m.s));
+    net.on(S2C.REATTACH, (m) => this.weapons.applyNetReattach(m.events));
     return this;
   }
 
@@ -56,6 +62,13 @@ export class Replication {
   // --- Late-join snapshot (welcome.snap, brief section 7) ------------------------------------
   applySnapshot(snap) {
     if (!snap) return;
+    // Foam volumes FIRST and strictly in index order: volume identity is the array index, so every foam
+    // slot the host allocated has to exist here before a single detach from snap.detached is applied.
+    // `rm` entries are evicted blobs — they still own their slot, so reserve it with an empty husk.
+    for (const f of snap.foam || []) {
+      if (f.rm) this.destruction.addHuskVolume(f.v);
+      else this.weapons.applyNetFoam(f.v, f.o, f.d, f.bits);
+    }
     // Vehicles first so seats/charges can reference them.
     for (const v of snap.vehicles || []) {
       this.manager.spawnNetworked(v.vid, v.id, { x: v.p[0], y: v.p[1], z: v.p[2], yaw: quatToYaw(v.q) });

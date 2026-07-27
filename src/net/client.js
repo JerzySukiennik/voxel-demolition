@@ -7,12 +7,14 @@
 // before Replication.register() exists, and joins/detaches lost in that window never come back.
 import {
   PROTOCOL_VERSION, C2S, S2C, INTERVALS, COALESCING_TYPES, NET_TUNING,
-  packP, packV, packQ, packInput,
+  packP, packV, packQ, packInput, q2, q3,
 } from "./protocol.js";
 
 const CONNECT_TIMEOUT_MS = 2000;
 // Lifecycle messages the boot path already listens for before the game exists — never queued.
-const LIFECYCLE_TYPES = new Set([S2C.WELCOME, S2C.SESSION, S2C.FULL]);
+// HOLD belongs here for the same reason FULL does: it is answered by beginPlay() before startGame() has
+// run, so queueing it would hide it behind the very map build it exists to announce.
+const LIFECYCLE_TYPES = new Set([S2C.WELCOME, S2C.SESSION, S2C.FULL, S2C.HOLD]);
 const COALESCE = new Set(COALESCING_TYPES);
 
 export class NetClient {
@@ -188,6 +190,15 @@ export class NetClient {
       if (intent.mult) m.mult = intent.mult; // Phase 7: per-material multiplier table (server clamps each ≤ dmgMultMax)
       return this._send(m);
     }
+    if (intent.kind === "carve") {
+      // Orbital Laser / airstrike Penetrator / Car Cannon: one authoritative carveCylinder on the server.
+      // dir is a unit vector, so 3 dp (packQ's precision) is plenty and keeps the beam straight.
+      return this._send({
+        t: C2S.DMG, kind: "carve", p: packP(intent.p),
+        dir: [q3(intent.dir.x), q3(intent.dir.y), q3(intent.dir.z)],
+        len: q2(intent.len), radius: q2(intent.radius), force: intent.force, budget: intent.budget | 0,
+      });
+    }
     const m = { t: C2S.DMG, kind: "radial", p: packP(intent.p), force: intent.force, radius: intent.radius };
     if (intent.mult) m.mult = intent.mult;
     return this._send(m);
@@ -200,6 +211,12 @@ export class NetClient {
   sendRocketEnd(rid, p) { return this._send({ t: C2S.ROCKET_END, rid, p: packP(p) }); }
   sendFx(kind, p) { return this._send({ t: C2S.FX, kind, p: packP(p) }); }
   sendReset() { return this._send({ t: C2S.RESET }); }
+  // --- Phase 7 batch D builders (server-authoritative; see protocol.js CAPS) -------------------
+  // Foam: `o` is the blob's min lattice cell, `d` its cell dims, `bits` the packed occupancy bitmap.
+  // The server creates the volume and echoes it back as foam_add with the index it landed on.
+  sendFoam(o, d, bits) { return this._send({ t: C2S.FOAM, o, d, bits }); }
+  sendZap(vol, cid, grow) { return this._send({ t: C2S.ZAP, vol, cid, g: grow ? 1 : 0 }); }
+  sendRebuild(p) { return this._send({ t: C2S.REBUILD, p: packP(p) }); }
 
   // --- Upload timers -------------------------------------------------------------------------
   // Start the 20 Hz state upload once the game world exists. stateProvider must be set first.

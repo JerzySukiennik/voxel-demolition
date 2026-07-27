@@ -12,9 +12,69 @@ export const CONFIG = {
   world: {
     plazaSize: 48,
     coreThickness: 1.0,
+    // skinThickness is the NOMINAL ground surface Y. Every building base, prop, spawn point and parked
+    // vehicle is placed against it, so it stays 0.3 no matter how deep the diggable ground gets.
     skinThickness: 0.3,
     skinVoxel: 0.3,
     structureVoxel: 0.15,
+
+    // ---- Deep diggable ground (terrain rework) ---------------------------------------------------
+    // The ground used to be ONE 0.3 m destructible skin on an indestructible core whose top was y=0:
+    // one layer and you hit bedrock. It is now two stacked "grid" strata, depth-graded so the chunk
+    // count stays affordable (see maps/lib.js groundVolumes):
+    //   topsoil  — skinVoxel 0.3, fine chunks, carries the hills + the road/patch colours
+    //   subsoil  — subsoilVoxel 0.8, coarse chunks, ~19x fewer cells per m^3 and a sixth of the chunks
+    // The indestructible core drops to bedrockY = skinThickness - groundDepth and becomes the floor of
+    // any mine shaft. groundDepth is the destructible thickness under flat ground; under a hill you dig
+    // through the hill on top of that.
+    groundDepth: 3.0,
+    topsoilDepth: 0.6,        // metres of 0.3 m voxels under the surface before the coarse stratum
+    subsoilVoxel: 0.8,
+    subsoilColor: "#6b5b45",  // upper subsoil band (packed earth)
+    subsoilDeepColor: "#5b5348", // lowest subsoil band, reads as the approach to bedrock
+    bedrockColor: "#585c60",  // the indestructible core layer: the floor of the world / of a mine
+
+    // ---- Rolling hills ----------------------------------------------------------------------------
+    // Deterministic seeded value noise (mulberry32 keyed by mapId), evaluated per ground column. The
+    // field is UP-ONLY: h >= 0 above skinThickness, never below, so nothing that was placed on the flat
+    // surface can end up floating. Built-up ground stays dead flat: every structure/prop footprint (and
+    // every road patch / spawn pad a map declares) forces h = 0 and the terrain blends back to full
+    // hills over flatBlend metres.
+    // Slope discipline matters: grid chunks get an AABB collider, so a chunk whose columns differ by
+    // more than one 0.3 m voxel would let the player stand a visible step above the mesh. height/cell
+    // are tuned so the field climbs at most ~0.12 m per metre => under one voxel per chunk footprint.
+    hills: {
+      height: 1.5,        // max metres above skinThickness
+      cell: 34,           // metres per lattice cell, octave 1 (the broad swells)
+      octave2: 0.35,      // relative amplitude of octave 2 (the surface texture)
+      octave2Cell: 14,
+      gain: 0.9,          // noise -> [0,1] is clamp01(0.5 + gain*n): >0.5 of open ground sits raised
+      flatMargin: 1.2,    // dead-flat apron kept around every graded footprint
+      flatBlend: 3.0,     // metres to ramp (linearly) from flat back to the full field. Short on purpose:
+                          // slopeLimit() below turns whatever is left into a 0.3 m-per-cell staircase, so
+                          // the mask does not have to buy the grading with a long, hill-eating blend
+      flatMaxY: 2.5,      // specs based above this do NOT grade the ground (roofs, decks, foliage)
+      edgeFlat: 0,        // the border berm is bedrock-founded and does not care how high the ground under
+                          // it sits, so the hills are allowed to roll all the way to the map edge
+      liftMax: 4.2,       // footprints up to this (2 chunk cells) are LIFTED onto the terrain, not graded
+      contactY: 0.5,      // a lifted spec based at/below this is ground-contacting; above it it follows
+      maskRes: 1.0,       // metres per cell of the precomputed flatness mask (bilinear sampled)
+    },
+
+    // ---- Indestructible map borders ---------------------------------------------------------------
+    // A stepped embankment at all four map edges, built as fixed core geometry in world.js
+    // (buildStaticGeo, `{ type: "border" }`): never destructible, never an allowedImpactor, zero chunks.
+    // `height` is the VISIBLE berm; `wallHeight` is an extra invisible clearance above it so a car at
+    // full speed, a Car Cannon round or a low pass in the hover/heli cannot leave the map.
+    border: {
+      width: 2.5,
+      height: 3.2,
+      steps: 4,
+      voxel: 0.5,
+      wallHeight: 12,
+      wallThickness: 0.6,
+      color: "#8d7d66",
+    },
     // Excavated water basin (createCore). On a map with a `water.rect`, the indestructible core is
     // rebuilt as a "picture frame" of cuboids around the rect (a single cuboid can't have a hole) and
     // the rect opening is lined with a recessed bowl: an indestructible floor at basinFloorY plus four
@@ -117,9 +177,32 @@ export const CONFIG = {
   },
 
   destruction: {
-    chunkSizeSkin: 3.0,
+    // Ground chunking is DEPTH-GRADED (see world.groundDepth). chunkSizeSkin now only applies to the
+    // topsoil, where digging actually happens, and came down 3.0 -> 2.4 m: a 2.4 m footprint is 1.56x
+    // more pieces per square metre than the old 3 m slab. The subsoil is deliberately coarse — a 6.0 m
+    // block at a 0.8 m voxel — which is what keeps the extra 3 m of depth affordable (a sixth of the
+    // chunks per layer of the topsoil). Arithmetic on town (72x72 m): topsoil ceil(72/2.4)^2 = 900,
+    // subsoil ceil(72/6.0)^2 = 144, total 1044 grid chunks against 576 for the old single flat skin —
+    // 3 m of depth and a finer surface for +468. All four maps stay under the 2500 gate.
+    chunkSizeSkin: 2.4,
+    chunkSizeSubsoil: 6.0,
     chunkSizeProp: 0.6,
+    // Foliage blobs and window glass were by far the most chunk-hungry things per cubic metre on the map
+    // (a leaf crown at 1.4 m was ~18 chunks, a shop window at 0.5 m ~20). Coarsening them pays most of the
+    // bill for the deep diggable ground; at these sizes a crown still bursts into 8 clumps and a pane into
+    // 9 shards, which is indistinguishable in play. See the terrain report.
+    chunkSizeFoliage: 2.0,
+    // A fence is a 0.12 m lattice of posts and rails; at 1.1-1.3 m it shattered into more pieces than the
+    // house behind it. 2.0 m is one bay between posts, which is how a fence should come apart anyway.
+    chunkSizeFence: 2.0,
     tileMeters: 8,
+    // Ground tile sizes are tuned so the two strata together mesh into far FEWER tiles (= fewer draw
+    // calls) than the single 8 m-tiled skin they replace: town 36 + 9 = 45 against 81 before, which is
+    // what pays for the border meshes and keeps the frame inside the <300 draw-call gate. A bigger tile
+    // costs more only in the empty-cell scan of a re-mesh (face emission tracks surface area, not tile
+    // size), and a detached chunk now touches fewer tiles, so per-dig cost comes out about even.
+    tileMetersTopsoil: 12,
+    tileMetersSubsoil: 24,
     debrisCap: 200,
     debrisSleepCullSeconds: 20,
     debrisSleepCullMin: 100,
@@ -157,12 +240,14 @@ export const CONFIG = {
     // Phase 1 props (skin/wall/crate/shed) unchanged. Phase 4 map materials appended (brief section 4).
     // Phase 7 batch D: `foam` = the constructive-voxel material sprayed by the Foam Cannon — light density,
     // low-ish threshold so every weapon breaks it through the normal pipeline, yet high enough to stand/drive on.
-    density: { skin: 1600, wall: 1400, crate: 350, shed: 700, brick: 1400, concrete: 2000, wood: 600, plank: 600, roofWood: 600, roofTile: 900, metal: 1200, glass: 250, sand: 1600, rock: 2200, foam: 120 },
-    forceThreshold: { skin: 9000, wall: 5000, shed: 5000, crate: 1500, brick: 5000, concrete: 8000, wood: 3000, plank: 3000, roofWood: 3000, roofTile: 4000, metal: 6000, glass: 800, sand: 9000, rock: 14000, foam: 2200 },
+    // `subsoil` = the coarse deep ground stratum: heavier and tougher than topsoil, so a mine shaft is
+    // real work (a shotgun cannot dig; explosives and the heavy strikes can).
+    density: { skin: 1600, wall: 1400, crate: 350, shed: 700, brick: 1400, concrete: 2000, wood: 600, plank: 600, roofWood: 600, roofTile: 900, metal: 1200, glass: 250, sand: 1600, rock: 2200, foam: 120, subsoil: 1900 },
+    forceThreshold: { skin: 9000, wall: 5000, shed: 5000, crate: 1500, brick: 5000, concrete: 8000, wood: 3000, plank: 3000, roofWood: 3000, roofTile: 4000, metal: 6000, glass: 800, sand: 9000, rock: 14000, foam: 2200, subsoil: 12000 },
     // Chunk sizes tuned UP from the section-4 starting values so map-scale chunk totals clear the
     // <=2500 gate on the Radeon 5500M (voxel size is fixed at 0.15). Chunkier pieces also match the
     // brief's "fewer pieces over fine dust" directive. Deviation documented in the phase report.
-    matChunkSize: { brick: 1.1, concrete: 1.4, wood: 1.1, plank: 1.1, roofWood: 1.4, roofTile: 1.4, metal: 1.3, glass: 0.5, sand: 3.0, rock: 1.4, foam: 0.6 },
+    matChunkSize: { brick: 1.1, concrete: 1.4, wood: 1.1, plank: 1.1, roofWood: 1.7, roofTile: 1.7, metal: 1.6, glass: 0.85, sand: 3.0, rock: 1.4, foam: 0.6 },
     boatWaterDamping: 1.2,
     carWaterDamping: 1.0,
     restitution: 0.12,

@@ -1,6 +1,6 @@
 // plaza.js - Phase 1-3 test plaza wrapped as a map module (byte-equivalent regression, ?map=plaza)
 import { CONFIG } from "../config.js";
-import { groundSpec } from "./lib.js";
+import { groundVolumes, borderRing, pad } from "./lib.js";
 
 const W = CONFIG.world;
 const Dn = CONFIG.destruction;
@@ -72,15 +72,27 @@ function propSpecs() {
   return specs;
 }
 
+const SIZE = { x: W.plazaSize, z: W.plazaSize };
+const SPAWN = { x: -3, z: -3, yaw: 0 };
+const HATCH = { x: 3, z: 3, yaw: 0 };
+const props = propSpecs();
+
 export default {
   id: "plaza",
   name: "Test Plaza",
-  size: { x: W.plazaSize, z: W.plazaSize },
-  spawn: { x: -3, z: -3, yaw: 0 },
-  hatchback: { x: 3, z: 3, yaw: 0 },
+  size: SIZE,
+  spawn: SPAWN,
+  hatchback: HATCH,
   env: {},
   water: null,
-  volumes: [groundSpec({ x: W.plazaSize, z: W.plazaSize }, W.groundColor, []), ...propSpecs()],
-  staticGeo: [],
+  volumes: [
+    ...groundVolumes({
+      mapId: "plaza", size: SIZE, color: W.groundColor,
+      structures: props,
+      flatRects: [pad(SPAWN.x, SPAWN.z, 4), pad(HATCH.x, HATCH.z, 4)],
+    }),
+    ...props,
+  ],
+  staticGeo: [borderRing({ size: SIZE })],
   decorVehicles: [],
 };

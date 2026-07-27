@@ -43,6 +43,9 @@ async function main() {
     const conn = {
       pid: null,
       send(obj) { if (ws.readyState === ws.OPEN) { try { ws.send(JSON.stringify(obj)); } catch (e) {} } },
+      // Needed by Session._completeJoin: a cold map build finishes a tick or more after the hello, and
+      // the client may have given up and closed in the meantime.
+      get open() { return ws.readyState === ws.OPEN; },
       close() { try { ws.close(); } catch (e) {} },
     };
     ws._conn = conn;

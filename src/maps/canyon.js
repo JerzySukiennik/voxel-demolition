@@ -1,5 +1,5 @@
 // Redgate Basin — desert canyon outpost + pond map (Phase 4, Author C). All names/props invented; origins are MIN-CORNER (engine addVolume convention), wall/fence/cliff from→to are centerlines.
-import { MAT, groundSpec, wall, box, roof, building, tree, fence, cratePile, rockPile, cliffRun } from "./lib.js";
+import { MAT, groundVolumes, borderRing, pad, wall, box, roof, building, tree, fence, cratePile, rockPile, cliffRun } from "./lib.js";
 import { CONFIG } from "../config.js";
 
 // ---- pond jetty ------------------------------------------------------------
@@ -67,12 +67,91 @@ function hoodoo(cx, cz) {
   ];
 }
 
+const SIZE = { x: 96, z: 80 };
+const SPAWN = { x: 0, z: 30, yaw: 0 };         // just inside the south vista gap, facing the bowl
+const HATCH = { x: 20, z: -2.5, yaw: 0 };      // at the barn's big west door
+const WATER = { rect: { x0: -24, z0: -14, x1: -2, z1: 2 }, level: 0.28 };
+
+// ---- outpost structures (all destructible) ----
+const outpost = [
+  // Barn 10x7 h5.5 wood, big west door.
+  ...building({
+    origin: [22, -6], size: [10, 7], height: 5.5,
+    wallMat: MAT.wood, roofKind: "gable", roofMat: MAT.roofWood,
+    faces: { w: [{ at: 3.5, width: 3, height: 4, sill: 0 }] },
+  }),
+  // Shack 7x5 gable, plank walls, door + window.
+  ...building({
+    origin: [24, -24], size: [7, 5], height: 3.2,
+    wallMat: MAT.plank, roofKind: "gable", roofMat: MAT.roofWood,
+    faces: {
+      s: [{ at: 3.5, width: 1.2, height: 2.2, sill: 0 }],
+      e: [{ at: 2.5, width: 1.2, height: 1, sill: 1.2 }],
+    },
+  }),
+  ...watchtower(-36, -6),   // west side, footprint x[-36..-33] z[-6..-3]
+  ...windpump(13.3, -25.4), // north-center-east, legs reach ground
+
+  // Plank jetty: raised deck out over the pond's north edge, standing on plank pilings down to the basin floor.
+  wall({ from: [JETTY.x, JETTY.z0], to: [JETTY.x, JETTY.z1], base: JETTY.deckBase, height: JETTY.deckH, thickness: JETTY.width, mat: MAT.plank }),
+  ...jettyPilings(),
+
+  // ---- interior rock formations (destructible MAT.rock) ----
+  ...hoodoo(36, 18),
+  ...hoodoo(-34, 18),
+  // boulder piles (scattered inside the bowl)
+  rockPile({ x: 34, z: -15, r: 1.6, h: 1.3 }),
+  rockPile({ x: 14, z: 20, r: 1.4, h: 1.1 }),
+  rockPile({ x: -6, z: 22, r: 1.7, h: 1.4 }),
+  rockPile({ x: -30, z: -24, r: 1.5, h: 1.2 }),
+  rockPile({ x: 30, z: 10, r: 1.5, h: 1.3 }),
+  rockPile({ x: -34, z: -14, r: 1.6, h: 1.2 }),
+  rockPile({ x: 8, z: 12, r: 1.3, h: 1.0 }),
+  rockPile({ x: -16, z: 22, r: 1.5, h: 1.2 }),
+
+  // ---- talus at cliff bases (destructible) ----
+  rockPile({ x: -30, z: -31, r: 1.8, h: 1.5 }), // N base
+  rockPile({ x: -10, z: -31, r: 1.6, h: 1.3 }),
+  rockPile({ x: 10, z: -31, r: 1.7, h: 1.4 }),
+  rockPile({ x: 30, z: -31, r: 1.8, h: 1.5 }),
+  rockPile({ x: -39, z: -20, r: 1.7, h: 1.4 }), // W base
+  rockPile({ x: -39, z: 0, r: 1.6, h: 1.3 }),
+  rockPile({ x: -39, z: 20, r: 1.7, h: 1.4 }),
+  rockPile({ x: 39, z: -20, r: 1.7, h: 1.4 }),  // E base
+  rockPile({ x: 39, z: 10, r: 1.6, h: 1.3 }),
+  rockPile({ x: 39, z: 26, r: 1.8, h: 1.5 }),
+
+  // ---- pond berm ring (just outside N + W edges; S/E left open for the boat apron) ----
+  rockPile({ x: -26, z: -6, r: 1.5, h: 1.2 }),
+  rockPile({ x: -26, z: 0, r: 1.4, h: 1.1 }),
+  rockPile({ x: -26, z: -12, r: 1.5, h: 1.2 }),
+  rockPile({ x: -22, z: -16, r: 1.4, h: 1.1 }),
+  rockPile({ x: -8, z: -16, r: 1.5, h: 1.2 }),
+  rockPile({ x: -26, z: 4, r: 1.4, h: 1.1 }),
+
+  // ---- dry vegetation (dry trees + cacti share kind:"dry") ----
+  ...tree({ x: -26, z: -2, height: 4, kind: "dry" }),
+  ...tree({ x: -18, z: -16, height: 3.5, kind: "dry" }),
+  ...tree({ x: -29, z: 3, height: 4, kind: "dry" }),
+  ...tree({ x: 20, z: -16, height: 3, kind: "dry" }),
+  ...tree({ x: 6, z: 18, height: 3.5, kind: "dry" }),
+  ...tree({ x: -20, z: 12, height: 4, kind: "dry" }),
+  ...tree({ x: 37, z: -14, height: 3, kind: "dry" }),
+  ...tree({ x: 16, z: -22, height: 3.5, kind: "dry" }),
+
+  // ---- misc props ----
+  ...fence({ from: [20, -8], to: [33, -8], height: 1.1, mat: MAT.plank }), // corral rail N of barn
+  ...cratePile({ x: 30, z: -10, rows: 3 }),
+  box({ origin: [18.85, 0, -9.15], size: [0.3, 2.6, 0.3], mat: MAT.wood }), // plain post
+  box({ origin: [18.85, 0, 2.85], size: [0.3, 2.6, 0.3], mat: MAT.wood }),  // plain post
+];
+
 export default {
   id: "canyon",
   name: "Redgate Basin",
-  size: { x: 96, z: 80 },
-  spawn: { x: 0, z: 30, yaw: 0 },            // just inside the south vista gap, facing the bowl
-  hatchback: { x: 20, z: -2.5, yaw: 0 },     // at the barn's big west door
+  size: SIZE,
+  spawn: SPAWN,
+  hatchback: HATCH,
   env: {
     skyColor: 0xa8c0d8,
     fogColor: 0xcbb491,
@@ -85,10 +164,13 @@ export default {
   },
   // Water sits a hair below the sand surface (skinThickness 0.3) so the shoreline reads as a waterline;
   // createCore excavates a real basin under this rect (floor ~basinFloorY) so boats float at true depth.
-  water: { rect: { x0: -24, z0: -14, x1: -2, z1: 2 }, level: 0.28 },
+  water: WATER,
   decorVehicles: [],
 
-  // Indestructible terraced boundary cliffs (h 8-12) ringing the bowl, one south gap (x -15..15).
+  // Indestructible terraced boundary cliffs (h 8-12) ringing the bowl, one south gap (x -15..15), plus the
+  // map-edge border. The border ring is DELIBERATELY low here (1.8 m) and sand-coloured: everywhere except
+  // the south gap it stands inside the cliff footprint and is never seen, so the cliffs are not doubled up.
+  // At the gap it reads as a low dune that closes the exit without eating the vista.
   staticGeo: [
     cliffRun({ from: [-43, -35], to: [3, -35], height: 11, depth: 4, seed: 311 }),   // N-west
     cliffRun({ from: [3, -35], to: [43, -35], height: 12, depth: 4, seed: 312 }),    // N-east
@@ -97,84 +179,30 @@ export default {
     cliffRun({ from: [-43, 5], to: [-43, 35], height: 9, depth: 4, seed: 315 }),     // W-south
     cliffRun({ from: [-43, 35], to: [-15, 35], height: 9, depth: 4, seed: 316 }),    // S-west (to gap)
     cliffRun({ from: [15, 35], to: [43, 35], height: 10, depth: 4, seed: 317 }),     // S-east (from gap)
+    borderRing({ size: SIZE, color: "#b89a63", height: 1.8, steps: 3 }),
   ],
 
   volumes: [
-    // ---- ground: warm sand + darker pond-area patch (visual only); sand skin carved out of the pond rect ----
-    groundSpec({ x: 96, z: 80 }, "#c8a86b", [
-      { rect: { x0: -28, z0: -18, x1: 2, z1: 6 }, color: "#b09a62" },
-    ], { x0: -24, z0: -14, x1: -2, z1: 2 }),
-
-    // ---- outpost structures (all destructible) ----
-    // Barn 10x7 h5.5 wood, big west door.
-    ...building({
-      origin: [22, -6], size: [10, 7], height: 5.5,
-      wallMat: MAT.wood, roofKind: "gable", roofMat: MAT.roofWood,
-      faces: { w: [{ at: 3.5, width: 3, height: 4, sill: 0 }] },
+    // ---- ground: warm sand hills over deep diggable strata; both strata carved out of the pond rect ----
+    ...groundVolumes({
+      mapId: "canyon", size: SIZE, color: "#c8a86b",
+      patches: [{ rect: { x0: -28, z0: -18, x1: 2, z1: 6 }, color: "#b09a62" }],
+      waterRect: WATER.rect,
+      structures: outpost,
+      subsoilColor: "#a2814d", subsoilDeepColor: "#8a6f45",
+      hills: { height: 1.5, cell: 38 },
+      flatRects: [
+        // The shoreline apron, the boat ramp corner and the jetty landing all have to stay level with the
+        // waterline, and the spawn/parking spots have to stay level with the vehicles standing on them.
+        { x0: -30, z0: -20, x1: 6, z1: 8 },
+        // Multi-leg structures need one level pad each: their legs are narrow enough to be lifted
+        // individually, and a leg landing on a neighbouring terrace would rack the whole frame.
+        { x0: -37, z0: -7, x1: -32, z1: -2 },      // watchtower
+        { x0: 11, z0: -27, x1: 17, z1: -23 },      // windpump
+        pad(SPAWN.x, SPAWN.z, 5), pad(HATCH.x, HATCH.z, 5),
+      ],
     }),
-    // Shack 7x5 gable, plank walls, door + window.
-    ...building({
-      origin: [24, -24], size: [7, 5], height: 3.2,
-      wallMat: MAT.plank, roofKind: "gable", roofMat: MAT.roofWood,
-      faces: {
-        s: [{ at: 3.5, width: 1.2, height: 2.2, sill: 0 }],
-        e: [{ at: 2.5, width: 1.2, height: 1, sill: 1.2 }],
-      },
-    }),
-    ...watchtower(-36, -6),   // west side, footprint x[-36..-33] z[-6..-3]
-    ...windpump(13.3, -25.4), // north-center-east, legs reach ground
-
-    // Plank jetty: raised deck out over the pond's north edge, standing on plank pilings down to the basin floor.
-    wall({ from: [JETTY.x, JETTY.z0], to: [JETTY.x, JETTY.z1], base: JETTY.deckBase, height: JETTY.deckH, thickness: JETTY.width, mat: MAT.plank }),
-    ...jettyPilings(),
-
-    // ---- interior rock formations (destructible MAT.rock) ----
-    ...hoodoo(36, 18),
-    ...hoodoo(-34, 18),
-    // boulder piles (scattered inside the bowl)
-    rockPile({ x: 34, z: -15, r: 1.6, h: 1.3 }),
-    rockPile({ x: 14, z: 20, r: 1.4, h: 1.1 }),
-    rockPile({ x: -6, z: 22, r: 1.7, h: 1.4 }),
-    rockPile({ x: -30, z: -24, r: 1.5, h: 1.2 }),
-    rockPile({ x: 30, z: 10, r: 1.5, h: 1.3 }),
-    rockPile({ x: -34, z: -14, r: 1.6, h: 1.2 }),
-    rockPile({ x: 8, z: 12, r: 1.3, h: 1.0 }),
-    rockPile({ x: -16, z: 22, r: 1.5, h: 1.2 }),
-
-    // ---- talus at cliff bases (destructible) ----
-    rockPile({ x: -30, z: -31, r: 1.8, h: 1.5 }), // N base
-    rockPile({ x: -10, z: -31, r: 1.6, h: 1.3 }),
-    rockPile({ x: 10, z: -31, r: 1.7, h: 1.4 }),
-    rockPile({ x: 30, z: -31, r: 1.8, h: 1.5 }),
-    rockPile({ x: -39, z: -20, r: 1.7, h: 1.4 }), // W base
-    rockPile({ x: -39, z: 0, r: 1.6, h: 1.3 }),
-    rockPile({ x: -39, z: 20, r: 1.7, h: 1.4 }),
-    rockPile({ x: 39, z: -20, r: 1.7, h: 1.4 }),  // E base
-    rockPile({ x: 39, z: 10, r: 1.6, h: 1.3 }),
-    rockPile({ x: 39, z: 26, r: 1.8, h: 1.5 }),
-
-    // ---- pond berm ring (just outside N + W edges; S/E left open for the boat apron) ----
-    rockPile({ x: -26, z: -6, r: 1.5, h: 1.2 }),
-    rockPile({ x: -26, z: 0, r: 1.4, h: 1.1 }),
-    rockPile({ x: -26, z: -12, r: 1.5, h: 1.2 }),
-    rockPile({ x: -22, z: -16, r: 1.4, h: 1.1 }),
-    rockPile({ x: -8, z: -16, r: 1.5, h: 1.2 }),
-    rockPile({ x: -26, z: 4, r: 1.4, h: 1.1 }),
-
-    // ---- dry vegetation (dry trees + cacti share kind:"dry") ----
-    ...tree({ x: -26, z: -2, height: 4, kind: "dry" }),
-    ...tree({ x: -18, z: -16, height: 3.5, kind: "dry" }),
-    ...tree({ x: -29, z: 3, height: 4, kind: "dry" }),
-    ...tree({ x: 20, z: -16, height: 3, kind: "dry" }),
-    ...tree({ x: 6, z: 18, height: 3.5, kind: "dry" }),
-    ...tree({ x: -20, z: 12, height: 4, kind: "dry" }),
-    ...tree({ x: 37, z: -14, height: 3, kind: "dry" }),
-    ...tree({ x: 16, z: -22, height: 3.5, kind: "dry" }),
-
-    // ---- misc props ----
-    ...fence({ from: [20, -8], to: [33, -8], height: 1.1, mat: MAT.plank }), // corral rail N of barn
-    ...cratePile({ x: 30, z: -10, rows: 3 }),
-    box({ origin: [18.85, 0, -9.15], size: [0.3, 2.6, 0.3], mat: MAT.wood }), // plain post
-    box({ origin: [18.85, 0, 2.85], size: [0.3, 2.6, 0.3], mat: MAT.wood }),  // plain post
+    ...outpost,
   ],
 };
+

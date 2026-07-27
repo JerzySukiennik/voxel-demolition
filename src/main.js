@@ -57,11 +57,25 @@ function initLobby() {
 function beginPlay(opts, lobby) {
   if (net && net.online) {
     let done = false;
-    const fallback = setTimeout(() => {
-      if (done) return; done = true;
-      try { net.close(); } catch (e) {}
-      startGame(opts, lobby, { net }).catch(reportBootError); // net is offline now -> solo + OFFLINE tag
-    }, 3000);
+    // Two-stage timeout. The short one only has to catch "nothing is listening"; once the server acks
+    // with HOLD we know it is alive and merely building, and a cold town build legitimately takes far
+    // longer than the old flat 3 s. Timing out during a build was silently dumping the first player into
+    // solo, which then emptied and tore down the session so every later attempt was cold too.
+    let fallback = null;
+    const giveUp = (ms) => {
+      if (fallback) clearTimeout(fallback);
+      fallback = setTimeout(() => {
+        if (done) return; done = true;
+        try { net.close(); } catch (e) {}
+        startGame(opts, lobby, { net }).catch(reportBootError); // net is offline now -> solo + OFFLINE tag
+      }, ms);
+    };
+    giveUp(3000);
+    net.on(S2C.HOLD, () => {
+      if (done) return;
+      giveUp(60000);
+      if (lobby && lobby.setStatus) lobby.setStatus("Serwer buduje mapę…");
+    });
     net.on(S2C.WELCOME, (msg) => {
       if (done) return; done = true; clearTimeout(fallback);
       startGame({ mapId: msg.mapId, avatar: opts.avatar, nick: opts.nick }, lobby,
