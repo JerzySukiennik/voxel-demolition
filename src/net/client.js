@@ -29,6 +29,11 @@ export class NetClient {
     this.handlers = new Map(); // type -> fn(msg)
     this.stateProvider = null; // () -> { p, yaw, pitch, v, tool, seat } | null
     this.inputProvider = null; // () -> { vid, x, z, sp, sh, kq, ke } | null
+    // Phase 8: the Grab & Force intent rides on the 20 Hz `state` upload rather than getting a channel of
+    // its own (state already carries the aim ray as yaw/pitch). Weapons installs this provider on itself
+    // when it is constructed with a net handle, so main.js's stateProvider needs no knowledge of it.
+    this.actProvider = null;   // () -> { k, m, a?, r? } | null
+    this.rcInputProvider = null; // () -> { vid, x, z, sp, sh, kq, ke } | null  (RC Car Bomb, see below)
 
     // Lifecycle callbacks the lobby / main.js hook into.
     this.onSession = null;     // (session) - server pushed session state (pre-hello)
@@ -171,10 +176,15 @@ export class NetClient {
   }
   sendMapCheck(counts) { return this._send({ t: C2S.MAP_CHECK, counts }); }
   sendState(s) {
-    return this._send({
+    const m = {
       t: C2S.STATE, p: packP(s.p), yaw: s.yaw, pitch: s.pitch, v: packV(s.v),
       tool: s.tool ?? null, seat: s.seat ?? null,
-    });
+    };
+    if (this.actProvider) {
+      const a = this.actProvider();
+      if (a) m.act = a;
+    }
+    return this._send(m);
   }
   sendInput(vid, ax, az, sp, sh, kq, ke) {
     return this._send({ t: C2S.INPUT, ...packInput(vid, ax, az, sp, sh, kq, ke) });
@@ -216,7 +226,26 @@ export class NetClient {
   // The server creates the volume and echoes it back as foam_add with the index it landed on.
   sendFoam(o, d, bits) { return this._send({ t: C2S.FOAM, o, d, bits }); }
   sendZap(vol, cid, grow) { return this._send({ t: C2S.ZAP, vol, cid, g: grow ? 1 : 0 }); }
+  sendZapProp(id, grow) { return this._send({ t: C2S.ZAP, prop: id | 0, g: grow ? 1 : 0 }); }
   sendRebuild(p) { return this._send({ t: C2S.REBUILD, p: packP(p) }); }
+
+  // --- Phase 8 send helpers -------------------------------------------------------------------
+  // One-shot Grab & Force impulses. `k` names the effect; the server owns every number behind it.
+  sendForce(k, dir) { return this._send({ t: C2S.FORCE, k, d: [q3(dir.x), q3(dir.y), q3(dir.z)] }); }
+  // Airstrike designation. `d` is the horizontal run heading this client's plane will fly, echoed to
+  // every peer so the scripted pass looks the same everywhere.
+  sendAir(p, ammo, dir) {
+    return this._send({ t: C2S.AIR, p: packP(p), a: ammo | 0, d: [q3(dir.x), q3(dir.y), q3(dir.z)] });
+  }
+  sendPaint(vol, cid) { return this._send({ t: C2S.PAINT, vol: vol | 0, cid: cid | 0 }); }
+  sendPaintDet() { return this._send({ t: C2S.PAINT_DET }); }
+  sendProp(p, dir) { return this._send({ t: C2S.PROP, p: packP(p), d: packP(dir) }); }
+  sendRc(a) { return this._send({ t: C2S.RC, a }); }
+  // Projectile visual relay: pipe / sticky / cluster. Damage still travels as an ordinary dmg intent.
+  sendProj(id, k, p, v, seed) {
+    return this._send({ t: C2S.PROJ, id: id | 0, k, p: packP(p), v: packP(v), seed: seed >>> 0 });
+  }
+  sendProjEnd(id, p) { return this._send({ t: C2S.PROJ_END, id: id | 0, p: packP(p) }); }
 
   // --- Upload timers -------------------------------------------------------------------------
   // Start the 20 Hz state upload once the game world exists. stateProvider must be set first.
@@ -234,8 +263,11 @@ export class NetClient {
     this._drivingVid = vid;
     if (vid != null && !this._inputTimer) {
       this._inputTimer = setInterval(() => {
-        if (this.state !== "online" || this._drivingVid == null || !this.inputProvider) return;
-        const i = this.inputProvider();
+        if (this.state !== "online" || this._drivingVid == null) return;
+        // The RC Car Bomb reuses this channel: it is a server-owned vehicle steered by a player who is
+        // still on foot, so main.js's driving provider (which only speaks while mode === "drive") returns
+        // null for it. Weapons installs its own provider instead of overwriting that one.
+        const i = (this.rcInputProvider && this.rcInputProvider()) || (this.inputProvider && this.inputProvider());
         if (i) this.sendInput(i.vid, i.x, i.z, i.sp, i.sh, i.kq, i.ke);
       }, INTERVALS.clientInput);
     } else if (vid == null && this._inputTimer) {

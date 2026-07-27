@@ -34,7 +34,7 @@ export class Replication {
     net.on(S2C.JOIN, (m) => this.remotes.add(m.pid, m.nick, m.avatar));
     net.on(S2C.LEAVE, (m) => this._onLeave(m.pid));
     net.on(S2C.PSTATE, (m) => this.remotes.onState(m.players));
-    net.on(S2C.VSTATE, (m) => this._onVState(m.vehicles));
+    net.on(S2C.VSTATE, (m) => this._onVState(m.vehicles, m.props));
     net.on(S2C.DETACH, (m) => this._onDetach(m.events));
     net.on(S2C.DEBRIS, (m) => this.destruction.applyDebris(m.items));
     net.on(S2C.DEBRIS_RM, (m) => this._onDebrisRemove(m.items));
@@ -52,9 +52,33 @@ export class Replication {
     // index, the scale and the restored chunk ids are all chosen by the host.
     net.on(S2C.FOAM_ADD, (m) => this.weapons.applyNetFoam(m.vol, m.o, m.d, m.bits));
     net.on(S2C.FOAM_RM, (m) => this.weapons.removeNetFoam(m.vol));
-    net.on(S2C.SCALE, (m) => this.weapons.applyNetScale(m.vol, m.cid, m.s));
+    net.on(S2C.SCALE, (m) => {
+      // Phase 8: the same message now also carries a networked prop's scale (`prop` instead of vol/cid).
+      if (m.prop != null) this.weapons.applyNetPropScale(m.prop, m.s);
+      else this.weapons.applyNetScale(m.vol, m.cid, m.s);
+    });
     net.on(S2C.REATTACH, (m) => this.weapons.applyNetReattach(m.events));
+    // Phase 8: the last five tools. Every one of these is the server telling this client what happened;
+    // none of them apply damage locally.
+    net.on(S2C.AIR_RUN, (m) => this.weapons.applyNetAirRun(m));
+    net.on(S2C.PAINT_ADD, (m) => this.weapons.applyNetPaint(m));
+    net.on(S2C.PAINT_CLR, (m) => this.weapons.clearNetPaint(m.pid));
+    net.on(S2C.PROP_ADD, (m) => this.weapons.applyNetProp(m.id, m.owner, m.p, m.q, m.s || 1));
+    net.on(S2C.PROP_RM, (m) => this._onPropRm(m));
+    net.on(S2C.PROJ, (m) => this.weapons.applyNetProj(m));
+    net.on(S2C.PROJ_END, (m) => this.weapons.endNetProj(m));
+    net.on(S2C.RC_GRANT, (m) => this.weapons.applyRcGrant(m.vid));
     return this;
+  }
+
+  // prop_rm doubles as the RC car's detonation cue (id 0 is never a real prop), so the audio is played
+  // from here even when there is no local twin to dispose.
+  _onPropRm(m) {
+    if (m.id) this.weapons.removeNetProp(m.id, m.boom, m.p);
+    else if (m.boom && m.p) {
+      const cam = this.camera.getWorldPosition(this._tmpA);
+      this.audio.explosion(cam.distanceTo(this._tmpB.set(m.p[0], m.p[1], m.p[2])));
+    }
   }
 
   setDriving(vid) { this.drivenVid = vid; }
@@ -91,6 +115,10 @@ export class Replication {
     // Seats + charges.
     for (const s of snap.seats || []) this.remotes.setSeat(s[1], s[0]);
     for (const c of snap.charges || []) this.weapons.addNetCharge(c.cid4, c.owner, c.p, c.q, c.vid);
+    // Phase 8: tanks already lying around and paint already sprayed. Without these a late joiner walks
+    // into a clean-looking wall that is one trigger pull from coming down.
+    for (const pr of snap.props || []) this.weapons.applyNetProp(pr.id, pr.owner, pr.p, pr.q, pr.s || 1);
+    for (const pt of snap.painted || []) this.weapons.applyNetPaint({ pid: pt[0], vol: pt[1], cid: pt[2] });
   }
 
   // --- Per-frame: interpolate non-driver networked vehicles --------------------------------------
@@ -136,7 +164,9 @@ export class Replication {
   }
 
   // --- Handlers ------------------------------------------------------------------------------
-  _onVState(vehicles) {
+  _onVState(vehicles, props) {
+    // Phase 8: networked props (propane tanks) ride this message rather than getting a channel of their own.
+    if (props && props.length) this.weapons.applyNetPropStream(props);
     const now = performance.now() / 1000;
     for (const v of vehicles || []) {
       const speed = v.v ? Math.hypot(v.v[0], v.v[2]) : 0;
@@ -247,5 +277,8 @@ export class Replication {
     this.remotes.remove(pid);
     if (this.weapons.removeNetChargesByOwner) this.weapons.removeNetChargesByOwner(pid);
     if (this.weapons.removeRemoteRocketsByOwner) this.weapons.removeRemoteRocketsByOwner(pid);
+    // Phase 8: their relayed projectiles will never get a proj_end, and their paint is gone server-side.
+    if (this.weapons.removeNetProjByOwner) this.weapons.removeNetProjByOwner(pid);
+    if (this.weapons.clearNetPaint) this.weapons.clearNetPaint(pid);
   }
 }

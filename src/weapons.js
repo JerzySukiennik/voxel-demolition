@@ -1,13 +1,31 @@
 // weapons.js - tool selection state machine, camera-space viewmodel, C4/rocket entities, firing logic
 import * as THREE from "three";
 import { CONFIG } from "./config.js";
-import { decodeModel, meshModelPart } from "./voxel.js";
+import { decodeModel, meshModelPart, scaleModel } from "./voxel.js";
 import { mulberry32 } from "./sim/rng.js";
 import toolModels from "../assets/models/tools.js";
 import { GroundVehicle } from "./vehicles/ground.js";
 import { VEHICLE_SPECS } from "./vehicles/registry.js";
-import { CAPS, packBits, unpackBits, bitAt } from "./net/protocol.js";
+import { CAPS, RATES, packBits, unpackBits, bitAt, q2 } from "./net/protocol.js";
 import { foamVolumeSpec } from "./destruction.js";
+
+// Interpolation window for server-streamed entities that this file owns the visuals of (propane tanks).
+// Same 100 ms buffer replica debris and networked vehicles use, so everything lags the host by one number.
+const NET_INTERP = RATES.interpMs / 1000;
+// The RC Car Bomb is a real GroundVehicle with its own tuning but is deliberately absent from the pickable
+// roster, so VEHICLE_SPECS has no entry for it. Register the derived spec here (and identically in
+// server/session.js) rather than editing the registry — spawnNetworked has to be able to resolve "rccar".
+// The model MUST be scaled to the rccar chassis, not inherited at full size: a ground vehicle casts its
+// suspension rays from the model's wheel anchors, and the hatchback's sit 0.30 m up while the rccar's ray
+// is only suspensionRest + wheelRadius = 0.26 m long. At full size all four rays miss on flat ground, no
+// wheel is ever grounded, no engine force is applied — the car simply could not drive, in MP or solo.
+export const RCCAR_MODEL_SCALE = 0.30;   // 3.9 m hatchback -> a 1.17 m toy; keep in sync with session.js
+if (!VEHICLE_SPECS.rccar) {
+  VEHICLE_SPECS.rccar = {
+    ...VEHICLE_SPECS.hatchback, id: "rccar", name: "RC Car", tuning: "rccar",
+    model: scaleModel(VEHICLE_SPECS.hatchback.model, RCCAR_MODEL_SCALE),
+  };
+}
 
 // Build a centered voxel geometry for an in-world projectile from a tool model's "main" part.
 function centeredGeo(model) {
@@ -101,6 +119,9 @@ export class Weapons {
     this.net = net;               // null => single-player; truthy => LAN client
     this._ridCounter = 0;         // client-local rocket ids (for rocket / rocket_end relays)
     this.remoteRockets = [];      // visual-only rockets fired by other players
+    // Phase 8 MP: the continuous Grab & Force intent rides on the 20 Hz `state` upload rather than a
+    // channel of its own. Installing the provider from here keeps main.js's stateProvider untouched.
+    if (net) net.actProvider = () => this._netAct();
 
     this.viewmodel = new THREE.Group();
     this.viewmodel.scale.setScalar(VM.scale); // held tools are modelled full-size; shrink so they don't hide the aim
@@ -332,6 +353,7 @@ export class Weapons {
     this._planeAim = new THREE.Vector2(0, 0); // slow aim offset while in plane view
     this._airDropGeo = centeredGeo(toolModels.clusterBomb);
     this._airDrops = [];         // falling ordnance meshes (ray-stepped along the descent ray)
+    this._netAirRuns = [];       // MP: server-driven passes flown by a throwaway plane mesh (see applyNetAirRun)
     this._airMarkMat = new THREE.MeshBasicMaterial({ color: 0xffcf5a, transparent: true, opacity: 0.8, depthWrite: false, side: THREE.DoubleSide });
     this._airMarker = new THREE.Mesh(this._splatGeo, this._airMarkMat);
     this._airMarker.rotation.x = -Math.PI / 2; this._airMarker.visible = false; scene.add(this._airMarker);
@@ -379,11 +401,53 @@ export class Weapons {
     this._sizeAnims = [];        // { mesh, from, to, t }
     this._sizeTracked = [];      // objects zapped this session (oldest silently dropped past the cap)
 
+    // --- Phase 8 MP: entities and sets that are now authored by the server --------------------
+    // Propane tanks are server-owned bodies. A replica still needs something local to LOOK at and to
+    // raycast against (Size Ray, Gravity Gun), so each one gets a kinematic body driven by the props
+    // stream — the same shape as replica debris.
+    this.netProps = new Map();   // propId -> { id, mesh, body, collider, scale, prev/target transforms }
+    // Blast Painter splats, keyed by the pid that sprayed them. The SET that matters lives on the server;
+    // this is only the paint everyone can see.
+    this._netPainted = new Map(); // pid -> Map("vol:cid" -> { splat })
+    // Relayed pipe bombs / stickies / cluster rounds thrown by other players: visual only, no damage.
+    this.remoteProjectiles = [];
+    this._projSeq = 0;
+    this._rcVid = null;          // MP: the RC car this client is currently steering (server-granted)
+
     // Label DOM.
     this._label = document.getElementById("tool-label");
     this._labelNum = document.getElementById("tool-label-num");
     this._labelName = document.getElementById("tool-label-name");
     this._labelTimer = 0;
+
+    // QA hook, opt-in via `?qa=1`. Publishes the live systems so a headless harness can drive the REAL
+    // game (pick tools, hold buttons, read chunk/debris/prop state on two clients at once) instead of
+    // testing a re-implementation of it. Costs nothing when the flag is absent and is never read by
+    // gameplay code. Weapons is the natural host: it already holds a reference to every system.
+    this._exposeQaHook();
+  }
+
+  _exposeQaHook() {
+    if (typeof window === "undefined" || typeof location === "undefined") return;
+    let on = false;
+    try { on = new URLSearchParams(location.search).has("qa"); } catch (e) { return; }
+    if (!on) return;
+    const self = this;
+    window.__vd = {
+      THREE, CONFIG,
+      get weapons() { return self; },
+      get scene() { return self.scene; },
+      get camera() { return self.camera; },
+      get world() { return self.world; },
+      get destruction() { return self.destruction; },
+      get player() { return self.player; },
+      get manager() { return self.manager; },
+      get input() { return self.input; },
+      get audio() { return self.audio; },
+      get net() { return self.net; },
+      get rig() { return self._rig; },
+      get mp() { return !!self.net; },
+    };
   }
 
   _buildItems() {
@@ -539,6 +603,7 @@ export class Weapons {
     this._tickNukes(dt);
     this._tickOrbital(dt);
     this._tickCarShots(dt);
+    this._tickNetAirRuns(dt);  // a peer's strike lands whatever tool this player happens to be holding
     this._tickAirDrops(dt);
     this._tickScreenFlash(dt);
     this._tickDustColumn(dt);
@@ -547,6 +612,9 @@ export class Weapons {
     this._tickFoam(dt);
     this._tickRebuildGhosts(dt);
     this._tickSizeAnims(dt);
+    // Phase 8 MP: server-owned tanks and relayed projectiles advance on their own timers, like rockets.
+    this._tickNetProps(dt);
+    this._tickRemoteProjectiles(dt);
     this.audio.rcMotor(!!this._rc); // RC-car electric motor loop (on only while a car is deployed)
 
     const driving = mode !== "walk";
@@ -910,8 +978,17 @@ export class Weapons {
     for (const d of this._airDrops) if (d.mesh.parent) d.mesh.parent.remove(d.mesh);
     this._airDrops.length = 0;
     this._airRun = null;
+    // Phase 8 MP transients: server-driven strike passes, relayed projectiles, remote paint, RC visuals.
+    for (const e of this._netAirRuns) this.scene.remove(e.mesh);
+    this._netAirRuns.length = 0;
+    for (const p of this.remoteProjectiles) if (p.mesh.parent) p.mesh.parent.remove(p.mesh);
+    this.remoteProjectiles.length = 0;
     for (const rec of this._painted.values()) this._releaseSplat(rec.splat);
     this._painted.clear();
+    for (const set of this._netPainted.values()) for (const rec of set.values()) this._releaseSplat(rec.splat);
+    this._netPainted.clear();
+    for (const t of this.netProps.values()) this._disposeNetProp(t);
+    this.netProps.clear();
     this._endOrbital();
     this._flashT = 0; this._dustColT = 0;
     this._clearShake();
@@ -1014,9 +1091,10 @@ export class Weapons {
 
     const dir = this._aimDir();
     const origin = this._muzzleWorld(item);
+    const launch = new THREE.Vector3(dir.x * pb.throwSpeed, dir.y * pb.throwSpeed + pb.upBias, dir.z * pb.throwSpeed);
     const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(origin.x, origin.y, origin.z)
-      .setLinvel(dir.x * pb.throwSpeed, dir.y * pb.throwSpeed + pb.upBias, dir.z * pb.throwSpeed)
+      .setLinvel(launch.x, launch.y, launch.z)
       .setAngvel({ x: Math.random() * 6 - 3, y: Math.random() * 6 - 3, z: Math.random() * 6 - 3 })
       .setLinearDamping(0.1).setCcdEnabled(true).setCanSleep(true);
     const body = this.world.createRigidBody(bodyDesc);
@@ -1030,7 +1108,11 @@ export class Weapons {
     const indicator = new THREE.Mesh(this._indGeo, this._indMat);
     indicator.position.set(0, pb.colliderHalf + 0.03, 0);
     mesh.add(indicator);
-    this.pipeBombs.push({ body, mesh, indicator, fuse: pb.fuse, prevVy: 0 });
+    const id = this._projSeq++;
+    this.pipeBombs.push({ body, mesh, indicator, fuse: pb.fuse, prevVy: 0, projId: id });
+    // MP: relay the throw so peers can SEE the bomb fly. Its damage already reaches them as the radial
+    // dmg intent this client sends when the fuse runs out — this is presentation only.
+    if (this.net) this.net.sendProj(id, "pipe", origin, launch, 0);
     this._recoilZ -= 0.05;
   }
 
@@ -1058,6 +1140,7 @@ export class Weapons {
         const p = new THREE.Vector3(t.x, t.y, t.z);
         this._explode(p, W.pipeBomb.force, W.pipeBomb.radius, W.pipeBomb.budget, false);
         this.audio.explosion(cam.distanceTo(p));
+        if (this.net && pb.projId != null) this.net.sendProjEnd(pb.projId, p);
         this._removePipeBomb(pb);
         continue;
       }
@@ -1152,7 +1235,10 @@ export class Weapons {
     const indicator = new THREE.Mesh(this._indGeo, this._indMat);
     indicator.position.set(0, this._c4HalfY + 0.02, 0);
     mesh.add(indicator);
-    this.stickies.push({ mesh, indicator, pos: origin.clone(), vel: dir.clone().multiplyScalar(st.speed), stuck: false, fuse: st.fuse, age: 0, vehicle: null });
+    const projId = this._projSeq++;
+    this.stickies.push({ mesh, indicator, pos: origin.clone(), vel: dir.clone().multiplyScalar(st.speed), stuck: false, fuse: st.fuse, age: 0, vehicle: null, projId });
+    // MP visual relay (damage still travels as this client's radial dmg intent when the fuse ends).
+    if (this.net) this.net.sendProj(projId, "sticky", origin, dir.clone().multiplyScalar(st.speed), 0);
     this.audio.stickyThoomp();
     this._flash(origin);
     this._recoilZ += 0.08;
@@ -1192,7 +1278,11 @@ export class Weapons {
         }
         s.pos.add(step);
         s.mesh.position.copy(s.pos);
-        if (s.age > W.sticky.lifetime) { if (s.mesh.parent) s.mesh.parent.remove(s.mesh); continue; }
+        if (s.age > W.sticky.lifetime) {
+          if (this.net && s.projId != null) this.net.sendProjEnd(s.projId, s.pos);
+          if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
+          continue;
+        }
         keep.push(s);
         continue;
       }
@@ -1201,6 +1291,7 @@ export class Weapons {
         const p = s.mesh.getWorldPosition(new THREE.Vector3());
         this._explode(p, W.sticky.force, W.sticky.radius, W.sticky.budget, false);
         this.audio.explosion(cam.distanceTo(p));
+        if (this.net && s.projId != null) this.net.sendProjEnd(s.projId, p);
         if (s.mesh.parent) s.mesh.parent.remove(s.mesh);
         continue;
       }
@@ -1223,7 +1314,11 @@ export class Weapons {
     this.scene.add(mesh);
     // Deterministic per-shot seed so the split pattern is reproducible (server-sync friendly + self-test).
     const seed = ((this._ridCounter++ * 2654435761) ^ 0x9e3779b9) >>> 0;
-    this.clusters.push({ phase: "shell", pos: origin.clone(), vel, mesh, timer: 0, seed, bomblets: [] });
+    const projId = this._projSeq++;
+    this.clusters.push({ phase: "shell", pos: origin.clone(), vel, mesh, timer: 0, seed, bomblets: [], projId });
+    // MP visual relay: peers fly the shell along the same arc. Its split is where the copy ends — the
+    // bomblets themselves are the thrower's, and their blasts arrive as ordinary radial dmg intents.
+    if (this.net) this.net.sendProj(projId, "cluster", origin, vel, seed);
     this.audio.stickyThoomp();
     this._flash(origin);
     this._recoilZ += 0.1;
@@ -1246,6 +1341,7 @@ export class Weapons {
     c.phase = "bomblets";
     if (c.mesh.parent) c.mesh.parent.remove(c.mesh);
     c.mesh = null;
+    if (this.net && c.projId != null) this.net.sendProjEnd(c.projId, c.pos);
     this.audio.clusterPop();
     const cl = W.cluster;
     const rng = mulberry32(c.seed);
@@ -1296,7 +1392,8 @@ export class Weapons {
         if (hit || b.age > cl.bombletLifetime) {
           const point = hit ? b.pos.clone().addScaledVector(dir, hit.toi) : b.pos.clone();
           // Each bomblet blast is staggered through the stage queue (solo) so 6 never land in one frame.
-          this._explode(point, cl.bombletForce, cl.bombletRadius, cl.bombletBudget, true);
+          // c.visual = bomblets from a server-driven airstrike: the host already damaged along these arcs.
+          if (!c.visual) this._explode(point, cl.bombletForce, cl.bombletRadius, cl.bombletBudget, true);
           this.audio.clusterCrump(cam.distanceTo(point));
           this._releaseBomblet(b.pool);
           b.dead = true;
@@ -1429,6 +1526,45 @@ export class Weapons {
     }
   }
 
+  // ============================ Phase 8 MP: Grab & Force intent =================================
+  // Every continuous force in category 5 is applied by the SERVER (it owns the debris and vehicle bodies;
+  // on a replica they are kinematic, so a local applyImpulse moves nothing anybody else can see). What
+  // this client sends is therefore an INTENT and nothing else: which tool, which button. The aim ray is
+  // already on the wire as the `state` message's yaw/pitch, so no numbers are duplicated and no new
+  // channel exists. Being a repeated LEVEL rather than an edge, it is self-healing — a lost packet cannot
+  // leave a magnet stuck on, and letting go of the button simply stops the field being reported.
+  // Returns null in solo and whenever nothing in the category is being held.
+  _netAct() {
+    if (!this.net) return null;
+    // Vehicle rope wins: it is the one category-5 tool usable while driving, so it is checked before the
+    // walk-mode tool state (which is stale while seated).
+    if (this._vgrapple) {
+      const a = this._vgrapple.worldB;
+      const act = { k: "vrope", m: 1 };
+      if (a) act.a = [q2(a.x), q2(a.y), q2(a.z)];
+      // The chunk reference is sent only once the chunk is TORN, i.e. once it is a debris body the server
+      // can actually pull. While it is still attached the rope is only a tension gauge for the tear.
+      if (this._vgrapple.torn && this._vgrapple.vol && this._vgrapple.chunk) {
+        act.r = [this._vgrapple.vol.id, this._vgrapple.chunk.id];
+      }
+      return act;
+    }
+    if (this.activeCat < 0) return null;
+    switch (this._activeItem().kind) {
+      case "vacuum": return this.input.lmbDown ? { k: "vac", m: 1 } : null;
+      case "magnet": return this.input.lmbDown ? { k: "mag", m: 1 } : (this.input.rmbDown ? { k: "mag", m: 2 } : null);
+      case "gravitygun": return this.input.lmbDown ? { k: "grav", m: 1 } : null;
+      case "grapple": {
+        // On foot the swing is client-predicted movement, in the same bucket as walking, so this is a
+        // pure visual relay: the anchor lets every peer draw the rope from this player's hand.
+        const gf = this._grappleFoot;
+        if (!gf) return null;
+        return { k: "grap", m: 1, a: [q2(gf.anchor.x), q2(gf.anchor.y), q2(gf.anchor.z)] };
+      }
+      default: return null;
+    }
+  }
+
   // ============================ Phase 7 batch B: Grab & Force ================================
   // Shared cone query over DYNAMIC bodies (debris chunk bodies + local drivable vehicles). Foundation for
   // Wind / Vacuum / Magnet. NEVER touches fixed chunks and never adds anyone to allowedImpactors.
@@ -1470,6 +1606,16 @@ export class Weapons {
     item.state.lastUse = this._time;
     const dir = this._aimDir();
     const apex = this._muzzleWorld(item);
+    // MP: the server owns every body this cone can reach, so it runs the impulse loop (session._fireWind)
+    // and the result comes back on the debris/vstate streams. Applying it locally as well would be a
+    // no-op on the kinematic replicas and a double-shove on the one vehicle this client drives.
+    if (this.net) {
+      this.net.sendForce("wind", dir);
+      this._spawnDust(apex, dir);
+      this.audio.windWhoomp();
+      this._recoilZ += 0.12;
+      return;
+    }
     const cosHalf = Math.cos((wc.halfAngleDeg * Math.PI) / 180);
     const bodies = this._coneBodies(apex, dir, wc.range, cosHalf, { debris: true, vehicles: true });
     for (const b of bodies) {
@@ -1485,7 +1631,6 @@ export class Weapons {
     this._spawnDust(apex, dir);
     this.audio.windWhoomp();
     this._recoilZ += 0.12;
-    // MP note (stub): remote-player knockback + server-owned debris would travel as a "wind" impulse intent.
   }
 
   _spawnDust(apex, dir) {
@@ -1550,6 +1695,10 @@ export class Weapons {
   _tickVacuum(dt, item) {
     const vc = W.vacuum;
     if (!this.input.lmbDown) { this._restoreShrunk(); return; }
+    // MP: the whole suction runs on the server (session._actVacuum) off the `vac` act in the state upload,
+    // including the consume — a chunk swallowed here would vanish for this player only and stay solid for
+    // everyone else. The suck loop audio is still driven locally by _tickGrabForce.
+    if (this.net) return;
     const dir = this._aimDir();
     const muzzle = this._muzzleWorld(item);
     const cosHalf = Math.cos((vc.halfAngleDeg * Math.PI) / 180);
@@ -1633,6 +1782,7 @@ export class Weapons {
     if (h.entry && (h.entry.fading || this.destruction.debris.indexOf(h.entry) < 0)) { this._releaseGrav(); return; }
     if (h.vehicle && this.manager.all.indexOf(h.vehicle) < 0) { this._releaseGrav(); return; }
     if (h.kind === "prop" && !this.propaneTanks.some((t) => t.body === h.body && !t.disposed)) { this._releaseGrav(); return; } // tank exploded while held
+    if (h.kind === "netprop" && (h.netProp.disposed || !this.netProps.has(h.netProp.id))) { this._releaseGrav(); return; }
     const keep = gravityHoldStep(camPos, aim, h.body, cfg, dt);
     if (!keep) { this._gravReleaseT += dt; if (this._gravReleaseT > cfg.releaseTime) this._releaseGrav(); }
     else this._gravReleaseT = 0;
@@ -1648,6 +1798,11 @@ export class Weapons {
     // Propane tanks are grabbable props (a thrown tank explodes on hard impact — the sanctioned destructive gravity-throw).
     const tank = this.findPropByCollider(handle);
     if (tank) { this._gravHeld = { kind: "prop", body: tank.body, mass: tank.body.mass ? tank.body.mass() : 1 }; this._gravReleaseT = 0; return; }
+    // MP: a networked tank's real body is the server's, and the server runs its own acquisition off the
+    // `grav` act. This local hold exists purely so the gun's hum and the release rules behave the same as
+    // they do for debris — every force applied to the kinematic twin is a no-op by construction.
+    const netTank = this.net ? this.findNetPropByCollider(handle) : null;
+    if (netTank) { this._gravHeld = { kind: "netprop", body: netTank.body, netProp: netTank, mass: 1 }; this._gravReleaseT = 0; return; }
     const veh = this.manager ? this.manager.byColliderHandle(handle) : null;
     if (veh && veh.body && veh.V) {
       if (veh === this.manager.driven) return;
@@ -1661,6 +1816,16 @@ export class Weapons {
 
   _throwGrav(aim) {
     const h = this._gravHeld;
+    // MP: the server holds the real body (it acquired its own target on its own raycast), so the throw is
+    // an intent. It is a one-shot rather than an act mode because at 20 Hz a mode that lasts a single
+    // frame is lost about half the time.
+    if (this.net) {
+      this.net.sendForce("gthrow", aim);
+      this.audio.gravityThrow();
+      this._recoilZ += 0.14; this._recoilPitch += 0.1;
+      this._releaseGrav();
+      return;
+    }
     const mass = h.body.mass ? h.body.mass() : h.mass;
     const speed = W.gravityGun.throwSpeed;
     // impulse = mass * speed => a consistent launch velocity along aim regardless of the body's mass.
@@ -1823,6 +1988,9 @@ export class Weapons {
     const dist = delta.length();
     const tension = g.spring * Math.max(0, dist - vg.restLen); // geometric tension estimate
     this._drawRope(worldA, worldB);
+    // MP: hand the live anchor to _netAct so every peer can draw this rope, and (once the chunk is torn)
+    // so the server can drag the real debris body behind the car instead of only the local copy.
+    vg.worldB = worldB;
 
     // Manual spring path (when Rapier's spring joint isn't available): pull the chassis toward the chunk;
     // a torn (dynamic) chunk also gets pulled so it drags behind the car. A live joint does this itself.
@@ -1857,11 +2025,12 @@ export class Weapons {
   }
 
   // ============================ Phase 7 batch C: Strikes + heavy/vehicular ordnance ============
-  // MP note (flag): the ORBITAL carve and the airstrike Penetrator are fully networked now — they go out as
-  // `dmg kind:"carve"` and the server runs the real carveCylinder (see destruction.carveCylinder). What is
-  // still simplified is this shared big-blast helper: the nuke's radius-18 staged collapse and the painted
-  // set forward a cap-fitting radial intent instead, so a replica nuke is smaller than a solo one. Server
-  // owns the detach either way; nothing exceeds the caps. Deliberate, NOT a redesign.
+  // MP note: the Orbital carve and the airstrike Penetrator are fully networked (`dmg kind:"carve"`, the
+  // server runs the real carveCylinder), and as of Phase 8 the airstrike, the painted set, the tanks and
+  // the RC car are server-owned outright. What is still simplified is this shared big-blast helper for the
+  // ONE remaining caller that goes through it online — the Nuke — which forwards a cap-fitting radial
+  // intent instead of its radius-18 staged collapse, so a replica nuke is smaller than a solo one. The
+  // server owns the detach either way and nothing exceeds the caps. Deliberate, NOT a redesign.
   _bigBlast(center, force, radius, budget, staged) {
     if (this.net) {
       const f = Math.min(force, CAPS.radialForceMax), r = Math.min(radius, CAPS.radialRadiusMax);
@@ -1935,28 +2104,49 @@ export class Weapons {
     const r = this.destruction.registry.get(hit.collider.handle);
     if (!r || !r.chunk.active) return;
     const key = r.volume.id + ":" + r.chunk.id;
-    if (this._painted.has(key)) return;
     const point = origin.clone().addScaledVector(dir, hit.toi);
     const normal = new THREE.Vector3(hit.normal.x, hit.normal.y, hit.normal.z);
     if (normal.lengthSq() < 1e-6) normal.set(0, 1, 0); else normal.normalize();
-    const pooled = this._acquireSplat();
-    if (pooled) {
-      pooled.mesh.position.copy(point).addScaledVector(normal, 0.03);
-      pooled.mesh.quaternion.setFromUnitVectors(FWD_Z, normal);
-      pooled.mesh.scale.setScalar(W.blastPainter.splatSize + Math.random() * 0.06);
-      pooled.mesh.visible = true;
+    if (this.net) {
+      // MP: the painted SET is the server's — a delayed blast has to hit the same chunks on every peer, so
+      // the set that fires can't be a local guess. The splat is still placed here at the exact raycast
+      // point (the sprayer is the one looking at it closely); the server's paint_add echo finds it
+      // already present and leaves it alone, and everyone else gets a face-placed copy.
+      const own = this._ownPaintSet();
+      if (own.has(key)) return;
+      own.set(key, { splat: this._placeSplat(point, normal) });
+      this.net.sendPaint(r.volume.id, r.chunk.id);
+      return;
     }
-    this._painted.set(key, { splat: pooled });
+    if (this._painted.has(key)) return;
+    this._painted.set(key, { splat: this._placeSplat(point, normal) });
     while (this._painted.size > W.blastPainter.maxPainted) {
       const oldestKey = this._painted.keys().next().value;
       this._releaseSplat(this._painted.get(oldestKey).splat);
       this._painted.delete(oldestKey);
     }
   }
+
+  // The paint set this client sprayed, inside the shared per-pid map (MP only).
+  _ownPaintSet() {
+    const pid = this.net ? this.net.pid : 0;
+    let set = this._netPainted.get(pid);
+    if (!set) { set = new Map(); this._netPainted.set(pid, set); }
+    return set;
+  }
   _acquireSplat() { for (const e of this._splatPool) if (!e.used) { e.used = true; return e; } return null; }
   _releaseSplat(e) { if (e) { e.used = false; e.mesh.visible = false; } }
 
   _detonatePaint() {
+    if (this.net) {
+      // MP: the server holds the set and stages the blast; paint_clr comes back and drops the splats.
+      if (this._ownPaintSet().size === 0) return;
+      this.audio.armBeep();
+      this.net.sendPaintDet();
+      this.audio.explosion(0);
+      this._recoilZ += 0.1;
+      return;
+    }
     if (this._painted.size === 0) return;
     this.audio.armBeep();
     this.destruction.detonatePainted(new Set(this._painted.keys()), W.blastPainter.force);
@@ -1974,9 +2164,17 @@ export class Weapons {
     if (this._time - item.state.lastUse < W.propane.fireInterval) return;
     item.state.lastUse = this._time;
     const pr = W.propane;
-    while (this.propaneTanks.length >= pr.maxLive) { const old = this.propaneTanks.shift(); this._disposeTank(old); }
     const dir = this._aimDir();
     const origin = this._muzzleWorld(item);
+    // MP: the tank is a real body in the shared world, so the SERVER creates it (session._onProp) and
+    // streams it back on the props array of vstate. Throwing one locally would give this player a tank
+    // nobody else can see, hit or blow up — which is exactly why the Size Ray used to refuse tanks.
+    if (this.net) {
+      this.net.sendProp(origin, dir);
+      this._recoilZ -= 0.05;
+      return;
+    }
+    while (this.propaneTanks.length >= pr.maxLive) { const old = this.propaneTanks.shift(); this._disposeTank(old); }
     const lv = { x: dir.x * pr.throwSpeed, y: dir.y * pr.throwSpeed + pr.upBias, z: dir.z * pr.throwSpeed };
     const bodyDesc = this.RAPIER.RigidBodyDesc.dynamic()
       .setTranslation(origin.x, origin.y, origin.z)
@@ -2283,11 +2481,13 @@ export class Weapons {
   }
 
   // --- 2f. RC Car Bomb: deploy a mini GroundVehicle; control transfers (chase cam, character frozen) --
-  // MP note (flag): "a player controls an entity that is not their character" — same input-routing case as
-  // vehicle driving. Solo drives it via the manager loop; in MP the RC car would be a server-owned vehicle
-  // and the driving input routed like a normal seat (stubbed here: RC car is solo/authoritative only).
+  // MP: "a player controls an entity that is not their character" is the same input-routing case as
+  // driving, so it reuses that machinery instead of inventing anything — the server spawns a real
+  // networked vehicle, this client's WASD goes out on the existing 30 Hz `input` channel (via
+  // net.rcInputProvider) and vstate carries the car to every peer. See applyRcGrant.
   _deployRc(item) {
-    if (this._rc) return; // one alive
+    if (this._rc || this._rcVid != null) return; // one alive
+    if (this.net) { this.net.sendRc("deploy"); void item; return; }
     const feet = this.player.feetPosition();
     const yaw = this._yaw();
     const veh = new GroundVehicle(this.scene, this.world, this.RAPIER, this._rcSpec, this.materials, { x: feet.x, y: feet.y + 0.1, z: feet.z, yaw });
@@ -2308,6 +2508,14 @@ export class Weapons {
       rc.badT += dt;
       if (rc.badT > W.rcCar.autoReturnTime) { this._returnRc(false); return; }
     } else rc.badT = 0;
+    if (rc.net) {
+      // Server-owned car: detonation and return are requests, and the chase camera is the only thing this
+      // client owns outright.
+      if (this.input.consumeLMB() || this.input.consumeRMB()) { this.net.sendRc("det"); this.input.consumeDigits(); this.input.consumeWheel(); return; }
+      this.input.consumeDigits(); this.input.consumeWheel();
+      this._rcChaseCam(rc.veh);
+      return;
+    }
     // RMB or LMB detonates wherever the car is.
     if (this.input.consumeLMB() || this.input.consumeRMB()) { this._detonateRc(); return; }
     this.input.consumeDigits(); this.input.consumeWheel(); // don't switch tools while driving the car
@@ -2331,6 +2539,8 @@ export class Weapons {
   }
   _returnRc() {
     const rc = this._rc;
+    // MP: ask the server to retire the car; applyRcGrant(0) tears the local control state down when it does.
+    if (rc && rc.net && this.net) { this.net.sendRc("ret"); return; }
     this._rc = null;
     if (rc && rc.veh) {
       const veh = rc.veh;
@@ -2343,8 +2553,11 @@ export class Weapons {
   }
 
   // --- 6a. Airstrike Designator: scripted circling plane, R cycles 3 ammo, LMB designate, RMB plane-cam --
-  // MP note (flag): the plane is a server-owned scripted entity in Phase 6; the plane-camera is purely
-  // local (camera attach), only the designation events would sync. Here it is solo/authoritative.
+  // MP: the run is SERVER-OWNED. This client designates, the server accepts (or refuses) the request and
+  // flies the pass on its own clock, dropping the ordnance and doing the damage exactly once; the `air_run`
+  // broadcast then makes every client — the requester included — animate the same pass. So the plane, the
+  // falling bombs, the whistle and the bomblets are presentation on all four machines and the craters come
+  // from one authority. See applyNetAirRun / _tickNetAirRuns below.
   _tickAirstrike(dt, equipped) {
     const item = equipped ? this._activeItem() : null;
     const isAir = !!(item && item.kind === "airstrike");
@@ -2354,7 +2567,7 @@ export class Weapons {
     if (rDown && !this._prevR) { this._airAmmo = (this._airAmmo + 1) % 3; this._showAmmoLabel(); }
     this._prevR = rDown;
     this._airCircleT += dt * W.airstrike.circleSpeed;
-    if (this._airRun) this._stepAirRun(dt); else this._flyCircle();
+    if (this._airRun) { if (this._stepAirRun(dt)) this._airRun = null; } else this._flyCircle();
     this.audio.airPlaneLoop(true);
   }
   _spawnPlane() {
@@ -2380,9 +2593,10 @@ export class Weapons {
     this._airPlane.position.set(x, W.airstrike.altitude, z);
     this._facePlane(new THREE.Vector3(-Math.sin(a), 0, Math.cos(a)));
   }
-  _facePlane(dir) {
+  _facePlane(dir, plane = this._airPlane) {
+    if (!plane) return;
     const d = dir.clone(); if (d.lengthSq() < 1e-6) d.set(0, 0, 1); else d.normalize();
-    this._airPlane.quaternion.setFromUnitVectors(FWD_Z, d);
+    plane.quaternion.setFromUnitVectors(FWD_Z, d);
   }
   _showAmmoLabel() {
     if (!this._label) return;
@@ -2404,46 +2618,98 @@ export class Weapons {
   }
   _airDesignate(target) {
     if (this._airRun || !this._airPlane) return;
-    this._airRun = { target: target.clone(), t: 0, released: false, start: this._airPlane.position.clone() };
+    if (this.net) {
+      // MP: ask, don't act. The pass starts when (and only when) `air_run` comes back, so a refused or
+      // rate-limited request cannot leave this client animating a strike nobody else is having.
+      const over = new THREE.Vector3(target.x, W.airstrike.altitude, target.z);
+      const dir = over.clone().sub(this._airPlane.position); dir.y = 0;
+      if (dir.lengthSq() < 1e-3) dir.set(0, 0, 1); else dir.normalize();
+      this.net.sendAir(target, this._airAmmo, dir);
+      return;
+    }
+    this._airRun = { target: target.clone(), t: 0, released: false, start: this._airPlane.position.clone(), ammo: this._airAmmo };
     this.audio.airFlyby();
   }
-  _stepAirRun(dt) {
-    const run = this._airRun;
+  // Fly one pass. `run.dir` is set for server-driven runs (the heading is on the wire); a solo run derives
+  // it from where the plane happened to be.
+  _stepAirRun(dt, run = this._airRun, plane = this._airPlane) {
     const A = W.airstrike;
     run.t += dt;
     const u = Math.min(1, run.t / A.runTime);
     const over = new THREE.Vector3(run.target.x, A.altitude, run.target.z);
-    const dir = over.clone().sub(run.start); dir.y = 0;
-    if (dir.lengthSq() < 1e-3) dir.set(0, 0, 1); else dir.normalize();
+    let dir = run.dir;
+    if (!dir) {
+      dir = over.clone().sub(run.start); dir.y = 0;
+      if (dir.lengthSq() < 1e-3) dir.set(0, 0, 1); else dir.normalize();
+    }
     const start = over.clone().addScaledVector(dir, -60);
     const end = over.clone().addScaledVector(dir, 60);
-    this._airPlane.position.copy(start).lerp(end, u);
-    this._facePlane(dir);
-    if (!run.released && u >= 0.5) { run.released = true; this._releaseOrdnance(run.target, dir); }
-    if (u >= 1) this._airRun = null; // resume circling
+    plane.position.copy(start).lerp(end, u);
+    this._facePlane(dir, plane);
+    if (!run.released && u >= 0.5) {
+      run.released = true;
+      this._releaseOrdnance(run.target, dir, run.ammo != null ? run.ammo : this._airAmmo, !!run.net, run.seed);
+    }
+    return u >= 1;
   }
-  _releaseOrdnance(target, dir) {
+  // `visual` marks ordnance from a server-driven run: it falls and makes noise but applies no damage,
+  // because the server already dropped its own copy and did the destruction.
+  _releaseOrdnance(target, dir, ammo, visual = false, seed = 0) {
     const A = W.airstrike;
-    if (this._airAmmo === 0) {
+    if (ammo === 0) {
       for (let i = 0; i < A.dropCount; i++) {
         const off = (i - (A.dropCount - 1) / 2) * A.dropSpacing;
         const gx = target.x + dir.x * off, gz = target.z + dir.z * off;
-        this._spawnDrop(new THREE.Vector3(gx, A.altitude, gz), new THREE.Vector3(gx, target.y, gz), "bomb");
+        this._spawnDrop(new THREE.Vector3(gx, A.altitude, gz), new THREE.Vector3(gx, target.y, gz), "bomb", visual, seed + i);
       }
-    } else if (this._airAmmo === 1) {
-      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "pen");
+    } else if (ammo === 1) {
+      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "pen", visual, seed);
     } else {
-      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "cluster");
+      this._spawnDrop(new THREE.Vector3(target.x, A.altitude, target.z), target.clone(), "cluster", visual, seed);
     }
     this.audio.bombWhistle();
   }
-  _spawnDrop(top, impact, type) {
+  _spawnDrop(top, impact, type, visual = false, seed = 0) {
     const mesh = new THREE.Mesh(this._airDropGeo, this.materials);
     mesh.castShadow = false; mesh.position.copy(top);
     this.scene.add(mesh);
     const dir = impact.clone().sub(top);
     if (dir.lengthSq() < 1e-6) dir.set(0, -1, 0); else dir.normalize();
-    this._airDrops.push({ mesh, pos: top.clone(), dir, impact: impact.clone(), type });
+    this._airDrops.push({ mesh, pos: top.clone(), dir, impact: impact.clone(), type, visual, seed });
+  }
+
+  // --- Phase 8 MP: server-driven airstrike passes (called by replication.js) --------------------
+  // One `air_run` = one pass to animate. If it is OUR designation and our plane is out, the existing
+  // circling plane flies it (identical to solo); otherwise a throwaway plane mesh flies it so a peer's
+  // strike is visible even to someone holding a sledgehammer.
+  applyNetAirRun(m) {
+    const A = W.airstrike;
+    const target = new THREE.Vector3(m.p[0], m.p[1], m.p[2]);
+    const dir = new THREE.Vector3(m.d[0], 0, m.d[2]);
+    if (dir.lengthSq() < 1e-6) dir.set(0, 0, 1); else dir.normalize();
+    const ammo = m.a | 0, seed = (m.seed >>> 0) || 0;
+    const mine = this.net && m.pid === this.net.pid;
+    this.audio.airFlyby();
+    if (mine && this._airPlane && !this._airRun) {
+      this._airRun = { target, t: 0, released: false, dir, ammo, seed, net: true };
+      return;
+    }
+    const mesh = new THREE.Mesh(this._planeGeo, this.materials);
+    mesh.castShadow = false; mesh.receiveShadow = false;
+    mesh.scale.setScalar(A.planeScale);
+    this.scene.add(mesh);
+    this._netAirRuns.push({ mesh, run: { target, t: 0, released: false, dir, ammo, seed, net: true } });
+  }
+
+  // Always-on (a peer's strike lands whatever tool this player is holding).
+  _tickNetAirRuns(dt) {
+    if (!this._netAirRuns.length) return;
+    const keep = [];
+    for (const e of this._netAirRuns) {
+      if (this._stepAirRun(dt, e.run, e.mesh)) { this.scene.remove(e.mesh); continue; }
+      keep.push(e);
+    }
+    this._netAirRuns = keep;
   }
   _tickAirDrops(dt) {
     if (this._airDrops.length === 0) return;
@@ -2467,23 +2733,25 @@ export class Weapons {
   _strikeOrdnance(d, point) {
     const A = W.airstrike;
     const cam = this._camPos();
+    // `d.visual` = a server-driven pass: the host already dropped its own copy of this bomb and did the
+    // damage, so here it is only noise and bomblets. Applying damage as well would double every crater.
     if (d.type === "pen") {
-      // Penetrator: carve down through obstacles above/at the target (the "ordnance penetrates" requirement).
-      this.destruction.carveCylinder(point.clone().add(new THREE.Vector3(0, 6, 0)), new THREE.Vector3(0, -1, 0), A.penThrough, A.penRadius, A.penForce, A.penBudget);
+      if (!d.visual) this.destruction.carveCylinder(point.clone().add(new THREE.Vector3(0, 6, 0)), new THREE.Vector3(0, -1, 0), A.penThrough, A.penRadius, A.penForce, A.penBudget);
       this.audio.explosion(cam.distanceTo(point));
     } else if (d.type === "cluster") {
-      this._spawnClusterAt(point, A.clusterSpread);
+      this._spawnClusterAt(point, A.clusterSpread, d.visual, d.seed);
       this.audio.clusterPop();
     } else {
-      this._bigBlast(point, A.bombForce, A.bombRadius, A.bombBudget, true);
+      if (!d.visual) this._bigBlast(point, A.bombForce, A.bombRadius, A.bombBudget, true);
       this.audio.explosion(cam.distanceTo(point));
     }
   }
-  // Reuse the 4c bomblet machinery: seed a cluster already in its "bomblets" phase at `point`.
-  _spawnClusterAt(point, spread) {
+  // Reuse the 4c bomblet machinery: seed a cluster already in its "bomblets" phase at `point`. In MP the
+  // seed comes from the server so these bomblets fly the same arcs the host just damaged along.
+  _spawnClusterAt(point, spread, visual = false, seed = 0) {
     const cl = W.cluster;
-    const rng = mulberry32(((this._ridCounter++ * 2654435761) ^ 0x9e3779b9) >>> 0);
-    const c = { phase: "bomblets", pos: point.clone(), vel: new THREE.Vector3(), mesh: null, bomblets: [], seed: 0 };
+    const rng = mulberry32(seed ? (seed >>> 0) : (((this._ridCounter++ * 2654435761) ^ 0x9e3779b9) >>> 0));
+    const c = { phase: "bomblets", pos: point.clone(), vel: new THREE.Vector3(), mesh: null, bomblets: [], seed: 0, visual };
     for (let i = 0; i < cl.bombletCount; i++) {
       const ang = (i / cl.bombletCount) * Math.PI * 2 + rng() * 0.6;
       const spd = spread * (0.6 + 0.6 * rng());
@@ -2515,7 +2783,7 @@ export class Weapons {
     this._prevR = rDown;
     // Keep the plane flying its circle / run.
     this._airCircleT += dt * A.circleSpeed;
-    if (this._airRun) this._stepAirRun(dt); else this._flyCircle();
+    if (this._airRun) { if (this._stepAirRun(dt)) this._airRun = null; } else this._flyCircle();
     // Nose-mounted camera looking down-forward, with the aim offset applied.
     const pPos = this._airPlane.position.clone();
     const pFwd = new THREE.Vector3(0, 0, 1).applyQuaternion(this._airPlane.quaternion);
@@ -2834,21 +3102,23 @@ export class Weapons {
     if (!hit) { this._sizeRefused("no target"); return; }
     const handle = hit.collider.handle;
     let entry = this.destruction.findDebrisByCollider(handle); // detached (debris) chunk only, never fixed
-    let tank = entry ? null : this.findPropByCollider(handle); // dynamic prop (propane tank)
-    if (!entry && !tank) {
+    let tank = entry ? null : this.findPropByCollider(handle); // dynamic prop (solo propane tank)
+    let netProp = (entry || tank || !this.net) ? null : this.findNetPropByCollider(handle); // MP tank
+    if (!entry && !tank && !netProp) {
       // The hairline ray landed on the ground/wall behind the rubble. Before refusing, take the valid
       // target closest to the aim LINE (never further along it than the surface the ray actually hit).
       const near = this._nearestSizeTarget(origin, dir, hit.toi + SIZE_AIM_RADIUS);
-      entry = near.entry; tank = near.tank;
+      entry = near.entry; tank = near.tank; netProp = near.netProp;
     }
     if (entry) {
       // MP: a debris chunk is `vol:cid`, the one identity that is stable across peers. Send the intent and
       // let the server step and broadcast the scale — applying it here first would fight the broadcast.
-      // The propane tank below is NOT networked at all yet (it is a client-local body in MP), so scaling it
-      // locally is the consistent behaviour until props get replicated.
       if (this.net) { this.net.sendZap(entry.vol.id, entry.chunk.id, grow); return; }
       this._sizeApplyDebris(entry, grow); return;
     }
+    // A networked propane tank is a legal target now that the server owns the body (Phase 8). Same
+    // contract as debris: send grow/shrink, the server steps and clamps the scale and broadcasts it.
+    if (netProp) { this.net.sendZapProp(netProp.id, grow); return; }
     if (tank) { this._sizeApplyProp(tank, grow); return; }
     // Refused: ground / attached structure / vehicle / player.
     this._sizeRefused("debris and loose props only");
@@ -2859,7 +3129,7 @@ export class Weapons {
   // chunk the player was clearly pointing at). Only targets in front of the camera and no further than
   // the surface the ray actually hit are considered, so this never reaches through a wall.
   _nearestSizeTarget(origin, dir, maxAlong) {
-    let entry = null, tank = null, best = SIZE_AIM_RADIUS * SIZE_AIM_RADIUS;
+    let entry = null, tank = null, netProp = null, best = SIZE_AIM_RADIUS * SIZE_AIM_RADIUS;
     const rel = new THREE.Vector3();
     const test = (pos) => {
       rel.copy(pos).sub(origin);
@@ -2870,14 +3140,19 @@ export class Weapons {
     this.destruction.forEachDebris((d) => {
       if (!d.mesh) return;
       const q = test(d.mesh.position);
-      if (q >= 0 && q < best) { best = q; entry = d; tank = null; }
+      if (q >= 0 && q < best) { best = q; entry = d; tank = null; netProp = null; }
     });
     for (const t of this.propaneTanks) {
       if (t.disposed || !t.mesh) continue;
       const q = test(t.mesh.position);
-      if (q >= 0 && q < best) { best = q; tank = t; entry = null; }
+      if (q >= 0 && q < best) { best = q; tank = t; entry = null; netProp = null; }
     }
-    return { entry, tank };
+    for (const t of this.netProps.values()) {
+      if (t.disposed || !t.mesh) continue;
+      const q = test(t.mesh.position);
+      if (q >= 0 && q < best) { best = q; netProp = t; entry = null; tank = null; }
+    }
+    return { entry, tank, netProp };
   }
 
   // A refused zap must be legible: strain wobble + a dud clang + the reason on the tool label.
@@ -2979,6 +3254,260 @@ export class Weapons {
     this._sizeAnims.length = 0;
     this._sizeTracked.length = 0;
     this.audio.foamSpray(false);
+  }
+
+  // ============================ Phase 8 MP: server-owned entities on the client =================
+  // Everything below is the replica half of the last five tools. The rule is the same one the builders
+  // established in Phase 7: if a thing exists in the shared world, the SERVER creates it and this class
+  // only renders what it is told. Nothing here applies damage.
+
+  // --- Propane tanks --------------------------------------------------------------------------
+  // The body is the host's. The client keeps a KINEMATIC twin so the tank is still something you can
+  // look at, walk into and point the Size Ray at — exactly how replica debris works.
+  applyNetProp(id, owner, p, q, scale = 1) {
+    if (this.netProps.has(id)) return;
+    const pr = W.propane;
+    const bodyDesc = this.RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(p[0], p[1], p[2]);
+    if (q) bodyDesc.setRotation({ x: q[0], y: q[1], z: q[2], w: q[3] });
+    const body = this.world.createRigidBody(bodyDesc);
+    const cd = this.RAPIER.ColliderDesc.cylinder(pr.colliderHalf * scale, pr.colliderRadius * scale)
+      .setFriction(0.85).setRestitution(0.2);
+    const collider = this.world.createCollider(cd, body);
+    const mesh = new THREE.Mesh(this._propaneGeo, this.materials);
+    mesh.castShadow = true;
+    mesh.position.set(p[0], p[1], p[2]);
+    if (q) mesh.quaternion.set(q[0], q[1], q[2], q[3]);
+    mesh.scale.setScalar(scale);
+    this.scene.add(mesh);
+    this.netProps.set(id, {
+      id, owner, mesh, body, collider, scale,
+      prevP: p.slice(), prevQ: q ? q.slice() : [0, 0, 0, 1],
+      targetP: p.slice(), targetQ: q ? q.slice() : [0, 0, 0, 1],
+      interpT: NET_INTERP, disposed: false,
+    });
+    this.audio.propaneClonk(this._camPos().distanceTo(new THREE.Vector3(p[0], p[1], p[2])));
+  }
+
+  // From the `props` array on a vstate broadcast: [id, px,py,pz, qx,qy,qz,qw, scale].
+  applyNetPropStream(items) {
+    for (const it of items || []) {
+      const t = this.netProps.get(it[0]);
+      if (!t || t.disposed) continue;
+      t.prevP = t.targetP; t.prevQ = t.targetQ;
+      t.targetP = [it[1], it[2], it[3]];
+      t.targetQ = [it[4], it[5], it[6], it[7]];
+      t.interpT = 0;
+      if (it.length > 8 && Math.abs(it[8] - t.scale) > 1e-3) this.applyNetPropScale(it[0], it[8]);
+    }
+  }
+
+  // Size Ray result for a tank. The scale itself was stepped and clamped on the server; this only makes
+  // the local twin agree with it (and gives the collider the new size so it can be aimed at again).
+  applyNetPropScale(id, s) {
+    const t = this.netProps.get(id);
+    if (!t || t.disposed || Math.abs(s - t.scale) < 1e-3) return;
+    const prev = t.scale;
+    const pr = W.propane;
+    try { this.world.removeCollider(t.collider, true); } catch (e) {}
+    const cd = this.RAPIER.ColliderDesc.cylinder(pr.colliderHalf * s, pr.colliderRadius * s)
+      .setFriction(0.85).setRestitution(0.2);
+    t.collider = this.world.createCollider(cd, t.body);
+    t.scale = s;
+    this._startSizeLerp(t.mesh, s);
+    this.audio[s > prev ? "sizeGrow" : "sizeShrink"](this._camPos().distanceTo(t.mesh.position));
+  }
+
+  removeNetProp(id, boom, p) {
+    const t = this.netProps.get(id);
+    if (t) this._disposeNetProp(t);
+    this.netProps.delete(id);
+    if (boom && p) this.audio.explosion(this._camPos().distanceTo(new THREE.Vector3(p[0], p[1], p[2])));
+  }
+
+  _disposeNetProp(t) {
+    if (!t || t.disposed) return;
+    t.disposed = true;
+    if (t.mesh && t.mesh.parent) t.mesh.parent.remove(t.mesh);
+    try { this.world.removeRigidBody(t.body); } catch (e) {}
+  }
+
+  _tickNetProps(dt) {
+    if (this.netProps.size === 0) return;
+    const q0 = new THREE.Quaternion(), q1 = new THREE.Quaternion();
+    for (const t of this.netProps.values()) {
+      if (t.disposed) continue;
+      t.interpT = Math.min(NET_INTERP, t.interpT + dt);
+      const a = NET_INTERP > 0 ? t.interpT / NET_INTERP : 1;
+      const px = t.prevP[0] + (t.targetP[0] - t.prevP[0]) * a;
+      const py = t.prevP[1] + (t.targetP[1] - t.prevP[1]) * a;
+      const pz = t.prevP[2] + (t.targetP[2] - t.prevP[2]) * a;
+      q0.set(t.prevQ[0], t.prevQ[1], t.prevQ[2], t.prevQ[3]);
+      q1.set(t.targetQ[0], t.targetQ[1], t.targetQ[2], t.targetQ[3]);
+      q0.slerp(q1, a);
+      t.body.setNextKinematicTranslation({ x: px, y: py, z: pz });
+      t.body.setNextKinematicRotation({ x: q0.x, y: q0.y, z: q0.z, w: q0.w });
+      t.mesh.position.set(px, py, pz);
+      t.mesh.quaternion.copy(q0);
+    }
+  }
+
+  // Resolve a collider handle to a networked tank (the MP twin of findPropByCollider).
+  findNetPropByCollider(handle) {
+    for (const t of this.netProps.values()) if (!t.disposed && t.collider.handle === handle) return t;
+    return null;
+  }
+
+  // --- Blast Painter splats -------------------------------------------------------------------
+  // The server owns the painted SET (that is what the delayed blast reads); these are the marks everyone
+  // can see. Our own splats are placed from the local raycast the instant we spray, so the sprayer keeps
+  // pixel-accurate feedback; a peer's splat is placed on the chunk's outward face, which is all the
+  // information the wire carries.
+  applyNetPaint(m) {
+    const pid = m.pid | 0;
+    let set = this._netPainted.get(pid);
+    if (!set) { set = new Map(); this._netPainted.set(pid, set); }
+    const key = (m.vol | 0) + ":" + (m.cid | 0);
+    if (m.rm) { const rec = set.get(key); if (rec) { this._releaseSplat(rec.splat); set.delete(key); } return; }
+    if (set.has(key)) return; // already placed (typically our own, at its exact raycast position)
+    const vol = this.destruction.volumes[m.vol | 0];
+    const chunk = vol && !vol.removed ? vol.chunks[m.cid | 0] : null;
+    if (!chunk) return;
+    const normal = this._chunkOutward(vol, chunk);
+    const point = chunk.centroid.clone().addScaledVector(normal, 0.35);
+    set.set(key, { splat: this._placeSplat(point, normal) });
+  }
+
+  clearNetPaint(pid) {
+    const set = this._netPainted.get(pid);
+    if (!set) return;
+    for (const rec of set.values()) this._releaseSplat(rec.splat);
+    set.clear();
+  }
+
+  _placeSplat(point, normal) {
+    const pooled = this._acquireSplat();
+    if (!pooled) return null;
+    pooled.mesh.position.copy(point).addScaledVector(normal, 0.03);
+    pooled.mesh.quaternion.setFromUnitVectors(FWD_Z, normal);
+    pooled.mesh.scale.setScalar(W.blastPainter.splatSize + Math.random() * 0.06);
+    pooled.mesh.visible = true;
+    return pooled;
+  }
+
+  // Outward direction for a chunk (away from its volume's centre), for placing a relayed splat on a face
+  // rather than inside the block. Mirrors destruction._outwardDir without reaching into it.
+  _chunkOutward(vol, chunk) {
+    const [nx, ny, nz] = vol.dims, [ox, oy, oz] = vol.origin, vs = vol.vs;
+    const v = new THREE.Vector3(
+      chunk.centroid.x - (ox + nx * vs * 0.5),
+      chunk.centroid.y - (oy + ny * vs * 0.5),
+      chunk.centroid.z - (oz + nz * vs * 0.5)
+    );
+    if (v.lengthSq() < 1e-6) return new THREE.Vector3(0, 1, 0);
+    return v.normalize();
+  }
+
+  // --- Relayed projectiles (pipe / sticky / cluster) ------------------------------------------
+  // Visual only. The damage these do already crosses the wire as ordinary dmg intents from the thrower,
+  // so a peer's copy must never explode anything — it flies, it disappears, and the blast the server
+  // authored arrives separately.
+  applyNetProj(m) {
+    if (this.net && m.pid === this.net.pid) return; // my own projectile already exists locally
+    const geo = m.k === "pipe" ? this._pipeGeo : m.k === "cluster" ? this._clusterGeo : this._c4Geo;
+    const mesh = new THREE.Mesh(geo, this.materials);
+    mesh.castShadow = false;
+    mesh.position.set(m.p[0], m.p[1], m.p[2]);
+    if (m.k === "cluster") mesh.scale.setScalar(0.55);
+    this.scene.add(mesh);
+    // Each kind falls with the gravity its own solo simulation uses, so the relayed arc tracks the real
+    // one closely enough to read as the same object. Bounces are NOT reproduced (a pipe bomb's real path
+    // is a Rapier body on the thrower's machine); proj_end snaps the copy away when it actually goes off.
+    const grav = m.k === "pipe" ? 9.81 : m.k === "sticky" ? 9.81 * 0.5 : W.cluster.gravity;
+    this.remoteProjectiles.push({
+      pid: m.pid, id: m.id, kind: m.k, mesh,
+      pos: new THREE.Vector3(m.p[0], m.p[1], m.p[2]),
+      vel: new THREE.Vector3(m.v[0], m.v[1], m.v[2]),
+      grav, age: 0, seed: m.seed >>> 0,
+    });
+  }
+
+  endNetProj(m) {
+    const keep = [];
+    for (const p of this.remoteProjectiles) {
+      if (p.pid === m.pid && p.id === m.id) { if (p.mesh.parent) p.mesh.parent.remove(p.mesh); continue; }
+      keep.push(p);
+    }
+    this.remoteProjectiles = keep;
+  }
+
+  removeNetProjByOwner(pid) {
+    const keep = [];
+    for (const p of this.remoteProjectiles) {
+      if (p.pid === pid) { if (p.mesh.parent) p.mesh.parent.remove(p.mesh); continue; }
+      keep.push(p);
+    }
+    this.remoteProjectiles = keep;
+  }
+
+  _tickRemoteProjectiles(dt) {
+    if (!this.remoteProjectiles.length) return;
+    const keep = [];
+    for (const p of this.remoteProjectiles) {
+      p.age += dt;
+      // Backstop lifetime: if the owner disconnects mid-flight no proj_end ever arrives.
+      if (p.age > 8) { if (p.mesh.parent) p.mesh.parent.remove(p.mesh); continue; }
+      p.vel.y -= p.grav * dt;
+      const step = p.vel.clone().multiplyScalar(dt);
+      const dist = step.length();
+      if (dist > 1e-6) {
+        const dir = step.clone().multiplyScalar(1 / dist);
+        const hit = this.world.castRay(new this.RAPIER.Ray(p.pos, dir), dist, true, undefined, undefined, undefined, this.player.body);
+        if (hit) {
+          // Rest against the surface it met and wait for the owner's proj_end (a sticky sticks, a pipe
+          // bomb would bounce — an approximation deliberately kept cheap; see the report).
+          p.pos.addScaledVector(dir, hit.toi);
+          p.vel.set(0, 0, 0);
+        } else p.pos.add(step);
+      }
+      p.mesh.position.copy(p.pos);
+      keep.push(p);
+    }
+    this.remoteProjectiles = keep;
+  }
+
+  // --- RC Car Bomb (server-owned vehicle) -----------------------------------------------------
+  // The server granted (vid > 0) or revoked (vid === 0) control of an RC car. The car itself is an
+  // ordinary networked vehicle: it arrives through veh_spawn, is interpolated from vstate like any other,
+  // and this client's WASD reaches it over the existing 30 Hz `input` channel. No local prediction —
+  // a 30 cm toy car at 100 ms of latency is fine, and it keeps one authority over the bomb.
+  applyRcGrant(vid) {
+    if (!this.net) return;
+    if (!vid) {
+      this._rc = null;
+      this._rcVid = null;
+      this.net.rcInputProvider = null;
+      this.net.setDriving(null);
+      this.audio.rcMotor(false);
+      return;
+    }
+    const veh = this.manager.byNetId ? this.manager.byNetId(vid) : null;
+    if (!veh) return;
+    this._rc = { veh, badT: 0, net: true };
+    this._rcVid = vid;
+    this.net.rcInputProvider = () => this._rcInput();
+    this.net.setDriving(vid);
+  }
+
+  _rcInput() {
+    if (this._rcVid == null) return null;
+    const ax = this.input.axis();
+    return {
+      vid: this._rcVid, x: ax.x, z: ax.z,
+      sp: this.input.down("Space") ? 1 : 0,
+      sh: (this.input.down("ShiftLeft") || this.input.down("ShiftRight")) ? 1 : 0,
+      kq: this.input.down("KeyQ") ? 1 : 0,
+      ke: this.input.down("KeyE") ? 1 : 0,
+    };
   }
 
   // --- Public hooks for main.js (camera-detached external-entity control) --------------------------

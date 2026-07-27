@@ -13,6 +13,11 @@ const P = CONFIG.player;
 const INTERP = RATES.interpMs / 1000; // seconds of buffered delay
 const NAMETAG_Y = 2.05;               // metres above feet
 const TOOL_IDS = ["sledgehammer", "c4", "shotgun", "rocketLauncher"];
+const FWD_Z = new THREE.Vector3(0, 0, 1);
+// Grapple rope for a remote player: ONE stretched box per remote, not a segment strip. A rope drawn from a
+// hand to an anchor is a straight line, and at 4 players the segmented version would spend 48 draw calls on
+// something nobody is looking at (the render gate is < 300 for the whole frame).
+const ROPE_HAND_Y = 1.35;             // metres above feet: roughly where a held tool's muzzle sits
 
 // Angle-aware lerp (shortest arc), radians.
 function lerpAngle(a, b, t) {
@@ -79,10 +84,19 @@ export class RemotePlayers {
     nametag.visible = false;
     this.scene.add(nametag);
 
+    // Grapple rope (shared geometry + material across every remote; one mesh each).
+    if (!this._ropeGeo) {
+      this._ropeGeo = new THREE.BoxGeometry(1, 1, 1);
+      this._ropeMat = new THREE.MeshBasicMaterial({ color: 0x23262b });
+    }
+    const rope = new THREE.Mesh(this._ropeGeo, this._ropeMat);
+    rope.castShadow = false; rope.receiveShadow = false; rope.visible = false;
+    this.scene.add(rope);
+
     this.remotes.set(pid, {
-      pid, nick, group, parts, decoded, toolHolder, toolMeshes, nametag,
+      pid, nick, group, parts, decoded, toolHolder, toolMeshes, nametag, rope,
       buf: [],            // interpolation samples { t, p:[x,y,z], yaw, pitch }
-      seat: null, tool: null,
+      seat: null, tool: null, act: null,
       phase: 0, lastFeet: null,
     });
   }
@@ -92,6 +106,7 @@ export class RemotePlayers {
     if (!r) return;
     this.scene.remove(r.group);
     this.scene.remove(r.nametag);
+    if (r.rope) this.scene.remove(r.rope); // geometry + material are shared: never disposed here
     // Per-part avatar geometries are unique to this remote (meshModelPart allocates fresh); dispose them.
     // Held-tool meshes share this._toolGeo, so skip those.
     for (const name of Object.keys(r.parts)) {
@@ -118,6 +133,10 @@ export class RemotePlayers {
       while (r.buf.length > 2 && r.buf[1].t < now - INTERP - 0.5) r.buf.shift();
       r.seat = (s.seat === null || s.seat === undefined) ? null : s.seat;
       r.tool = s.tool || null;
+      // Phase 8: the sender's live Grab & Force intent. Only the grapple kinds carry an anchor, and that
+      // anchor is the only thing this class does anything with — everything else those tools do is
+      // physics, and physics belongs to the server.
+      r.act = s.act || null;
     }
   }
 
@@ -157,8 +176,9 @@ export class RemotePlayers {
       r.group.rotation.set(0, sample.yaw, 0);
       this._walkLimbs(r, feet, dt);
     }
-    if (!feet) { r.group.visible = false; r.nametag.visible = false; return; }
+    if (!feet) { r.group.visible = false; r.nametag.visible = false; if (r.rope) r.rope.visible = false; return; }
     r.group.visible = true;
+    this._updateRope(r, feet);
 
     // Tool visibility: show the current held tool, hide the rest.
     for (const id of TOOL_IDS) {
@@ -170,6 +190,27 @@ export class RemotePlayers {
     r.nametag.position.set(feet.x, feet.y + NAMETAG_Y, feet.z);
     const dist = camPos.distanceTo(r.nametag.position);
     r.nametag.visible = dist < this.fogFar;
+  }
+
+  // Grapple rope: one stretched box from this remote's hand (or the vehicle they are driving) to the
+  // anchor the server relayed. Purely presentational — the swing itself is the remote's own predicted
+  // movement and already arrives as ordinary position samples.
+  _updateRope(r, feet) {
+    const rope = r.rope;
+    if (!rope) return;
+    const act = r.act;
+    if (!act || !act.a || (act.k !== "grap" && act.k !== "vrope")) { rope.visible = false; return; }
+    const to = new THREE.Vector3(act.a[0], act.a[1], act.a[2]);
+    const from = act.k === "vrope"
+      ? (this.getVehicle(r.seat) ? this.getVehicle(r.seat).centerWorld() : new THREE.Vector3(feet.x, feet.y + ROPE_HAND_Y, feet.z))
+      : new THREE.Vector3(feet.x, feet.y + ROPE_HAND_Y, feet.z);
+    const ab = to.clone().sub(from);
+    const len = ab.length();
+    if (len < 1e-3) { rope.visible = false; return; }
+    rope.position.copy(from).add(to).multiplyScalar(0.5);
+    rope.quaternion.setFromUnitVectors(FWD_Z, ab.multiplyScalar(1 / len));
+    rope.scale.set(CONFIG.weapons.grapple.thickness, CONFIG.weapons.grapple.thickness, len);
+    rope.visible = true;
   }
 
   // Interpolate p/yaw/pitch at renderT from the sample buffer. Clamp to endpoints outside the window.

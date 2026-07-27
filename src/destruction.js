@@ -536,7 +536,10 @@ export class Destruction {
   // per-frame list queue when the set is large (>40) so a facade-sized blast ripples instead of popping.
   detonatePainted(keys, forcePerChunk) {
     if (this.mode === "replica") {
-      // MP stub (flagged): forward each painted chunk as a point-dmg intent so the server detaches it.
+      // Phase 8: unreachable from the Blast Painter, which now keeps its painted SET on the server and
+      // fires it with one `paint_det` — the whole point being that a DELAYED blast must hit the same
+      // chunks on every peer, which a per-client set cannot guarantee. Kept as the safe fallback for any
+      // future caller: forward each chunk as a point-dmg intent (clamped) and let the server detach it.
       if (this.onDamageIntent) {
         for (const key of keys) {
           const i = key.indexOf(":"); if (i < 0) continue;

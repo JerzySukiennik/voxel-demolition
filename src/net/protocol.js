@@ -24,9 +24,32 @@ export const C2S = {
   FX: "fx",             // kind:"swing"|"clang"|"gunshot", p  (fx with no other message)
   RESET: "reset",       // -                                  (ESC Reset)
   FOAM: "foam",         // o:[gx,gy,gz], d:[nx,ny,nz], bits   (hardened foam blob -> server authors the volume)
-  ZAP: "zap",           // vol, cid, g                        (Size Ray on a debris chunk; g=1 grow, 0 shrink)
+  ZAP: "zap",           // vol, cid, g   OR  prop, g          (Size Ray; the `prop` form targets a networked prop)
   REBUILD: "rebuild",   // p                                  (Rebuild Gun aim point, sent at the tool's rate)
+  // --- Phase 8: the remaining tools ------------------------------------------------------------
+  // Continuous Grab & Force tools do NOT get a channel of their own. `state` already runs at 20 Hz and
+  // already carries p/yaw/pitch — i.e. the whole aim ray — so the only missing bit is WHICH tool is
+  // pressed and how. That rides along as the optional `act` field (see ACT_KINDS), and being a repeated
+  // level (not an edge) it is self-healing: a dropped packet cannot leave a force stuck on.
+  FORCE: "force",       // k:"wind"|"gthrow", d:[x,y,z]       (one-shot impulses: Wind Cannon, Gravity throw)
+  AIR: "air",           // p:[x,y,z], a:0|1|2, d:[x,y,z]      (Airstrike designation -> server flies the run)
+  PAINT: "paint",       // vol, cid                           (Blast Painter marks one chunk)
+  PAINT_DET: "paint_det", // -                                (Blast Painter detonates this player's set)
+  PROP: "prop",         // p:[x,y,z], d:[x,y,z]               (throw a Propane Tank; server owns the body)
+  RC: "rc",             // a:"deploy"|"det"|"ret"             (RC Car Bomb lifecycle; driving reuses `input`)
+  PROJ: "proj",         // id, k:"pipe"|"sticky"|"cluster", p, v, seed  (projectile VISUAL relay only)
+  PROJ_END: "proj_end", // id, p                              (that projectile is gone — burst/stuck/expired)
 };
+
+// Values `state.act.k` may take. Anything else is dropped server-side.
+//   grav  — Gravity Gun hold (m:1 hold). The server owns acquisition, the spring and the release.
+//   mag   — Magnet Gun (m:1 attract, m:2 repel).
+//   vac   — Debris Vacuum (m:1 sucking).
+//   grap  — on-foot grapple rope. VISUAL relay only: the swing itself is client-predicted movement,
+//           exactly like walking, so the server carries the anchor `a` for the peers' rope and nothing else.
+//   vrope — vehicle grapple rope anchored to chunk `r`:[vol,cid]. The server pulls that chunk toward the
+//           roped vehicle so the drag is real for everyone; the tear still travels as a normal dmg intent.
+export const ACT_KINDS = ["grav", "mag", "vac", "grap", "vrope"];
 
 // Server -> Client.
 export const S2C = {
@@ -58,8 +81,19 @@ export const S2C = {
   WARN: "warn",         // msg
   FOAM_ADD: "foam_add", // vol, o:[gx,gy,gz], d:[nx,ny,nz], bits   (server-assigned volume index — see below)
   FOAM_RM: "foam_rm",   // vol                                     (live-foam cap eviction / reset)
-  SCALE: "scale",       // vol, cid, s                             (Size Ray result, one float per body)
+  SCALE: "scale",       // vol, cid, s   OR  prop, s               (Size Ray result, one float per body)
   REATTACH: "reattach", // events:[[vol,cid],...]                  (Rebuild Gun — the mirror of `detach`)
+  // --- Phase 8 -----------------------------------------------------------------------------------
+  // `pstate` entries gained an optional `act` (the sender's live Grab & Force intent) and `vstate` gained
+  // an optional `props` array — both additive fields on existing messages, so no new state channel exists.
+  AIR_RUN: "air_run",   // pid, p:[target], a:ammo, d:[runDir], seed  (server accepted and is flying a strike)
+  PAINT_ADD: "paint_add", // pid, vol, cid, rm?                    (a chunk entered — or, with rm, left — a set)
+  PAINT_CLR: "paint_clr", // pid                                   (that set fired or was dropped)
+  PROP_ADD: "prop_add", // id, owner, p, q                         (server spawned a networked propane tank)
+  PROP_RM: "prop_rm",   // id, boom, p                             (tank gone; boom=1 => it exploded at p)
+  PROJ: "proj",         // pid, id, k, p, v, seed                  (relay)
+  PROJ_END: "proj_end", // pid, id, p                              (relay)
+  RC_GRANT: "rc_grant", // vid, pid                                (you now drive this RC car; 0 = returned)
 };
 
 // Flat list of every distinct wire type (rocket/rocket_end/fx/reset are shared C2S<->S2C). Used by the
@@ -71,6 +105,9 @@ export const MESSAGE_TYPES = [
   "debris_rm", "veh_spawn", "veh_rm", "seat", "c4_add", "c4_boom", "warn",
   // Phase 7 batch D builders, added without restructuring any existing message.
   "foam", "zap", "rebuild", "foam_add", "foam_rm", "scale", "reattach",
+  // Phase 8: Grab & Force, Airstrike, RC Car, Blast Painter, Propane Tank, projectile relays.
+  "force", "air", "paint", "paint_det", "prop", "rc", "proj", "proj_end",
+  "air_run", "paint_add", "paint_clr", "prop_add", "prop_rm", "rc_grant",
 ];
 
 // Server->client snapshot types: every message of these types fully supersedes the previous one, so a
@@ -183,6 +220,33 @@ export const CAPS = {
   // Client streams its aim point while LMB is held; the server picks the chunk (oldest damage first).
   rebuildMinIntervalSec: 0.2, // weapons.rebuild.rate is 4/s
   rebuildWithinSenderM: 45,   // weapons.rebuild.aimRange is 40
+
+  // --- Phase 8 -----------------------------------------------------------------------------------
+  // Grab & Force. The CONTINUOUS tools carry no numbers at all: `state.act` is a tool code plus a mode,
+  // and the server reads range/force/speed straight out of CONFIG.weapons and the ray straight out of the
+  // sender's own (already teleport-clamped) position + yaw/pitch. So the only thing a lying client can do
+  // is aim. These caps therefore only fence the ONE-SHOT impulses and the act's freshness.
+  actStaleSec: 0.4,           // no fresh `state` for this long => the act is dropped (and any grab released)
+  forceMinIntervalSec: 0.5,   // weapons.windCannon.cooldown is 0.7; gravity throws share this clock
+  // Airstrike. One run per player at a time (server state, not a cap) plus a floor between designations.
+  // 300 m is the designator's own raycast reach and every map fits well inside it; _posValid still clamps
+  // the point to the map AABB first, so this is the second fence.
+  airMinIntervalSec: 2.0,     // weapons.airstrike.runTime is 4 s, cooldown 1.5
+  airWithinSenderM: 300,
+  // Blast Painter. The painted set lives on the SERVER so a delayed blast hits the same chunks everywhere.
+  paintMinIntervalSec: 0.04,  // weapons.blastPainter.tickInterval is 0.05
+  paintWithinSenderM: 12,     // weapons.blastPainter.range is 6 (plus slop for the aim point vs the eye)
+  paintDetMinIntervalSec: 0.3,
+  // Propane tanks are real server-owned dynamic bodies, so their count is the thing worth fencing.
+  propMinIntervalSec: 0.4,    // weapons.propane.fireInterval is 0.45
+  propMaxPerPlayer: 8,        // = weapons.propane.maxLive
+  propWithinSenderM: 6,       // a tank is thrown from the muzzle, i.e. from the sender. The throw SPEED is
+                              // never read off the wire: the server derives it from CONFIG.weapons.propane.
+  // RC Car Bomb. Deploy/detonate/return edges; the driving itself reuses the validated `input` channel.
+  rcMinIntervalSec: 0.4,
+  // Projectile relays are PURE VISUALS — they never touch the sim — so they only need a flood gate.
+  projMinIntervalSec: 0.12,
+  projSpeedMax: 60,           // fastest relayed projectile is the sticky at 34 m/s
 };
 
 // Reconciliation thresholds for the driver's own vehicle (brief section 1).

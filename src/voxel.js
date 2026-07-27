@@ -23,6 +23,27 @@ export function jitteredColor(base, x, y, z, out) {
   return out;
 }
 
+// Uniformly resize a model without touching its voxel data. Everything that carries metres — voxelSize,
+// part origins/pivots and anchors — scales; `size` and `data` are voxel counts and stay put. Used so a
+// small vehicle can reuse a big vehicle's model: the wheel anchors are what a ground vehicle casts its
+// suspension rays from, so a full-size model on a small chassis puts the hardpoints out of ray range and
+// the wheels can never touch the ground (this is exactly what left the RC Car undrivable).
+export function scaleModel(model, s) {
+  return {
+    ...model,
+    name: `${model.name}@${s}`,
+    voxelSize: model.voxelSize * s,
+    parts: model.parts.map((p) => ({
+      ...p,
+      originOffset: p.originOffset.map((v) => v * s),
+      pivot: (p.pivot || [0, 0, 0]).map((v) => v * s),
+    })),
+    anchors: Object.fromEntries(
+      Object.entries(model.anchors || {}).map(([k, v]) => [k, v.map((n) => n * s)])
+    ),
+  };
+}
+
 export function decodeModel(model) {
   const palette = model.palette.map((p) => ({
     color: new THREE.Color().setStyle(p.color),
