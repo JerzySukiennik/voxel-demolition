@@ -478,10 +478,24 @@ async function startGame({ mapId, avatar, nick }, lobby, opts = {}) {
 
   requestAnimationFrame(frame);
 
-  // Hand off to the click-to-enter gesture: hide the lobby (if any), show the dimmed enter overlay.
-  if (lobby) lobby.hide();
-  const joining = mp && opts.wantMap && opts.wantMap !== mapId;
-  showEnterGesture(map.name, enter, joining);
+  // ?demo=1 — for the screenshot tool. requestPointerLock() needs a real user
+  // gesture and never resolves in an automated browser, so a driven capture would
+  // otherwise land on the "Couldn't grab the mouse" pause panel, which redraws
+  // every frame and can't be hidden. This skips the gesture and the lock entirely
+  // instead — normal play is untouched.
+  if (new URLSearchParams(location.search).has("demo")) {
+    if (lobby) lobby.hide();
+    const eo = document.getElementById("enter-overlay");
+    if (eo) eo.style.display = "none";
+    entered = true;
+    input.locked = true;
+    try { audio.resume(); } catch (e) {}
+  } else {
+    // Hand off to the click-to-enter gesture: hide the lobby (if any), show the dimmed enter overlay.
+    if (lobby) lobby.hide();
+    const joining = mp && opts.wantMap && opts.wantMap !== mapId;
+    showEnterGesture(map.name, enter, joining);
+  }
 }
 
 // Persistent HUD tag + document title. `offline` appends a small OFFLINE marker (single-player).
